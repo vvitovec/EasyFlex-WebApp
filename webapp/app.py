@@ -567,6 +567,16 @@ def create_app() -> Flask:
 					message = f"Uživatel {username} vytvořen."
 		users = User.query.order_by(User.username.asc()).all()
 		return render_template("users.html", users=users, message=message, error=error)
+		
+    with app.app_context():
+        admin = User.query.filter_by(is_admin=True).first()
+        if admin is None:
+            password = os.environ.get("EASYFLEX_ADMIN_PASSWORD")
+            if password:
+                admin = User(username="admin", is_admin=True)
+                admin.set_password(password)
+                db.session.add(admin)
+                db.session.commit()
 
 	return app
 
