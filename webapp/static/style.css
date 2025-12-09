@@ -146,6 +146,24 @@ input[type="file"] {
 	background: #f1f3f7;
 }
 
+.table-scroll thead th {
+	position: sticky;
+	top: 0;
+	z-index: 2;
+	box-shadow: 0 1px 0 #d6d8dd;
+}
+
+.results th.sortable {
+	cursor: pointer;
+	user-select: none;
+}
+
+.results th .sort-indicator {
+	margin-left: 6px;
+	font-size: 11px;
+	opacity: 0.55;
+}
+
 .row-error {
 	background: #ffecec;
 }

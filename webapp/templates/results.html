@@ -41,6 +41,9 @@
 				</select>
 			</div>
 			<div class="context-actions">
+				{% if allow_import %}
+					<button type="button" class="secondary" id="toggle-all-import">Označit vše</button>
+				{% endif %}
 				<button type="submit" class="secondary" formmethod="get" formaction="{{ url_for('view_results', batch_id=batch.id) }}">Aktualizovat výběr</button>
 				<button type="submit">Importovat označené do ABRA</button>
 			</div>
@@ -52,9 +55,15 @@
 						{% if allow_import %}<th>Import</th>{% endif %}
 						<th>Akce</th>
 						{% for col in columns %}
-							<th>{{ column_labels.get(col, col) }}</th>
+							<th class="sortable" data-col="{{ col }}" aria-sort="none">
+								{{ column_labels.get(col, col) }}
+								<span class="sort-indicator" aria-hidden="true">↕</span>
+							</th>
 						{% endfor %}
-						<th>Stav / Chyba</th>
+						<th class="sortable" data-col="status" aria-sort="none">
+							Stav / Chyba
+							<span class="sort-indicator" aria-hidden="true">↕</span>
+						</th>
 					</tr>
 				</thead>
 				<tbody>
@@ -135,11 +144,13 @@
 		const docTypeCompanySelect = document.getElementById('new_doc_type_company');
 		const docTypeDirectionSelect = document.getElementById('new_doc_type_direction');
 		const contextRefreshUrl = "{{ url_for('view_results', batch_id=batch.id) }}";
+		const toggleAllBtn = document.getElementById('toggle-all-import');
+		const importCheckboxSelector = 'input[name="import_row_ids"]';
 
 		function syncCompanyFormContext() {
 			if (!companyForm) return;
-			const directionField = companyForm.querySelector('input[name=\"direction\"]');
-			const docTypeField = companyForm.querySelector('input[name=\"doc_type_code\"]');
+			const directionField = companyForm.querySelector('input[name="direction"]');
+			const docTypeField = companyForm.querySelector('input[name="doc_type_code"]');
 			if (directionField && directionSelect) {
 				directionField.value = directionSelect.value || "";
 			}
@@ -184,6 +195,114 @@
 			refreshContext({ resetDocType: true });
 		});
 		if (docTypeSelect) docTypeSelect.addEventListener('change', syncCompanyFormContext);
+
+		function getImportCheckboxes() {
+			return Array.from(document.querySelectorAll(importCheckboxSelector)).filter(cb => !cb.disabled);
+		}
+
+		function updateToggleLabel() {
+			if (!toggleAllBtn) return;
+			const boxes = getImportCheckboxes();
+			const allChecked = boxes.length > 0 && boxes.every(cb => cb.checked);
+			toggleAllBtn.textContent = allChecked ? "Odoznačit vše" : "Označit vše";
+		}
+
+		if (toggleAllBtn) {
+			toggleAllBtn.addEventListener('click', () => {
+				const boxes = getImportCheckboxes();
+				const shouldCheck = boxes.some(cb => !cb.checked);
+				boxes.forEach(cb => { cb.checked = shouldCheck; });
+				updateToggleLabel();
+			});
+			getImportCheckboxes().forEach(cb => cb.addEventListener('change', updateToggleLabel));
+			updateToggleLabel();
+		}
+
+		const dateColumns = new Set(["datum_vystaveni", "datum_duzp", "datum_splatnosti"]);
+		const numberColumns = new Set([
+			"zaklad_dane",
+			"zaklad_dane_0",
+			"zaklad_dane_12",
+			"zaklad_dane_21",
+			"vyse_dph",
+			"vyse_dph_12",
+			"vyse_dph_21",
+			"celkova_cena",
+		]);
+
+		function detectType(colKey) {
+			if (dateColumns.has(colKey)) return "date";
+			if (numberColumns.has(colKey)) return "number";
+			return "text";
+		}
+
+		function parseValue(rawText, type) {
+			const text = (rawText || "").trim();
+			if (!text) return null;
+			if (type === "date") {
+				const ts = Date.parse(text);
+				return Number.isNaN(ts) ? null : ts;
+			}
+			if (type === "number") {
+				const normalized = text
+					.replace(/[\s\u00A0\u202F]/g, "")
+					.replace(/(?<=\d)\.(?=\d{3}(?:\D|$))/g, "")
+					.replace(",", ".");
+				const num = parseFloat(normalized);
+				return Number.isNaN(num) ? null : num;
+			}
+			return text.toLowerCase();
+		}
+
+		function compareRows(a, b, cellIndex, type, direction) {
+			const aval = parseValue(a.cells[cellIndex]?.textContent || "", type);
+			const bval = parseValue(b.cells[cellIndex]?.textContent || "", type);
+			const dirMultiplier = direction === "asc" ? 1 : -1;
+			if (aval === null && bval === null) return 0;
+			if (aval === null) return 1;
+			if (bval === null) return -1;
+			if (type === "text") {
+				return aval.localeCompare(bval, "cs", { sensitivity: "base" }) * dirMultiplier;
+			}
+			const diff = aval - bval;
+			return diff === 0 ? 0 : diff > 0 ? dirMultiplier : -dirMultiplier;
+		}
+
+		const resultsTable = document.querySelector(".results");
+		if (resultsTable) {
+			const tbody = resultsTable.querySelector("tbody");
+			const headerCells = Array.from(resultsTable.querySelectorAll("thead th"));
+			let sortState = null;
+
+			function updateIndicators(activeIndex, direction) {
+				headerCells.forEach((th, idx) => {
+					const indicator = th.querySelector(".sort-indicator");
+					const isActive = idx === activeIndex;
+					th.setAttribute("aria-sort", isActive ? (direction === "asc" ? "ascending" : "descending") : "none");
+					if (indicator) {
+						indicator.textContent = isActive ? (direction === "asc" ? "▲" : "▼") : "↕";
+						indicator.style.opacity = isActive ? "0.85" : "0.55";
+					}
+				});
+			}
+
+			headerCells.forEach((th) => {
+				if (!th.classList.contains("sortable")) return;
+				const colKey = th.dataset.col;
+				const cellIndex = headerCells.indexOf(th);
+				th.addEventListener("click", () => {
+					const type = detectType(colKey);
+					const nextDir = sortState && sortState.index === cellIndex && sortState.direction === "desc" ? "asc" : "desc";
+					const rows = Array.from(tbody.querySelectorAll("tr"));
+					rows.sort((a, b) => compareRows(a, b, cellIndex, type, nextDir));
+					rows.forEach((row) => tbody.appendChild(row));
+					sortState = { index: cellIndex, direction: nextDir };
+					updateIndicators(cellIndex, nextDir);
+				});
+			});
+
+			updateIndicators(-1, "asc");
+		}
 	})();
 </script>
 {% endblock %}
