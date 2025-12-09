@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card">
+	<h2>Správa uživatelů</h2>
+	<p>Přidávejte další uživatele s přístupem do webového rozhraní. Noví uživatelé nejsou administrátoři.</p>
+	{% if error %}
+		<div class="flash danger">{{ error }}</div>
+	{% endif %}
+	{% if message %}
+		<div class="flash success">{{ message }}</div>
+	{% endif %}
+	<form method="post" class="form inline">
+		<label for="username">Uživatelské jméno</label>
+		<input id="username" name="username" type="text" required>
+		<label for="password">Heslo</label>
+		<div class="input-with-eye">
+			<input id="password" name="password" type="password" required>
+			<button type="button" class="eye-toggle" data-target="password" aria-label="Zobrazit heslo">&#128065;</button>
+		</div>
+		<button type="submit">Vytvořit</button>
+	</form>
+	<table class="results">
+		<thead>
+			<tr>
+				<th>Uživatel</th>
+				<th>Admin</th>
+				<th>Akce</th>
+			</tr>
+		</thead>
+		<tbody>
+			{% for user in users %}
+				<tr>
+					<td>{{ user.username }}</td>
+					<td>{{ "Ano" if user.is_admin else "Ne" }}</td>
+					<td>
+						{% if user.id != current_user.id %}
+						<form method="post" onsubmit="return confirm('Opravdu smazat uživatele {{ user.username }}?');">
+							<input type="hidden" name="action" value="delete">
+							<input type="hidden" name="user_id" value="{{ user.id }}">
+							<button type="submit" class="button small secondary">Smazat</button>
+						</form>
+						{% else %}
+							—
+						{% endif %}
+					</td>
+				</tr>
+			{% endfor %}
+		</tbody>
+	</table>
+</div>
+{% endblock %}

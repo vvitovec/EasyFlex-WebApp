@@ -1,0 +1,432 @@
+• 1. Přehled projektu
+
+  - Desktopová aplikace pro Windows/macOS určená k extrakci dat z PDF faktur pomocí OpenAI Vision nebo načtení faktur z
+    tabulek (CSV/XLSX/XML), jejich úpravě v tabulce a importu do ABRA Flexi; doplňky pro export CSV a log konzoli.
+  - Struktura: kořen obsahuje dokumentaci (README*.md, DISTRIBUTION.md, instructions.txt, improvements_table.txt), build
+    specifikace PyInstalleru (EasyFlex.spec, platformní .spec), assets (ikony), složku EasyFlex/ s aplikací, tests/
+    s unit testy, vzorové errors/*.json, přibalený Poppler (poppler-25.07.0 + binární/headers/share data), pycache
+    (artefakty).
+  - Hlavní kód: EasyFlex/main.py spouští Tkinter GUI (EasyFlex/gui.py), které orchestruje extrakci (extractor.py),
+    CSV import (csv_processor.py), postprocessing (invoice_processor.py), import do ABRA (abra.py), práci s modely
+    (models.py), daty a nastaveními (config.py, date_helpers.py, invoice_warnings.py).
+
+  2. Tok programu
+
+  - Entry point EasyFlex/main.py:main(); nastaví logging, načte konfiguraci, inicializuje skryté okno Tk, kontroluje
+    závislosti, lazy importuje AppGUI, upozorní na chybějící OpenAI klíč, vytvoří AppGUI, asynchronně inicializuje
+    InvoiceExtractor v threadu, poté root.mainloop().
+  - GUI tok: tlačítka pro výběr PDF/složky/CSV spouští InvoiceExtractor.extract_auto() nebo
+    CSVProcessor.process_table_file(), výsledky se zobrazí v ttk.Treeview; uživatel může řádky editovat/dovypínat
+    import. Import do ABRA se spouští manuálně (_manual_import_to_abra) nebo automaticky po extrakci/načtení podle
+    příznaku. Nastavení otevírá SettingsDialog s perzistencí do INI.
+  - Moduly navazují: main → gui → (lazy) extractor/csv_processor → invoice_processor/date_helpers/invoice_warnings →
+    abra → config pro načtení hodnot. models poskytují datové struktury pro všechny kroky.
+
+  3. Moduly a soubory
+
+  - EasyFlex/__init__.py: prázdný marker balíčku.
+  - EasyFlex/config.py: načítání .env/INI/env proměnných do AppConfig; log buffer; cesty pro settings/cache/errors;
+    helpery pro firmy a typy dokladů v INI; detekce přibaleného Poppleru; cache konfigurace.
+  - EasyFlex/models.py: Pydantic (fallback vlastní BaseModel) modely InvoiceData, InvoiceItem, VATSummary, enum VATRate;
+    extra nastavení pro extra="allow".
+  - EasyFlex/date_helpers.py: parsování/normalizace dat, domyšlení chybějících datumů s varováními; export konstant
+    názvů a přátelských labelů.
+  - EasyFlex/extractor.py: asynchronní extrakce PDF pomocí pdf2image + OpenAI Vision structured outputs; cache výsledků;
+    volitelné dvoufázové segmentování více faktur; validace datumů a částek; uložení/preview/export do CSV; pomocné
+    throttling/backoff. Dataclass ExtractResult, SegmentInfo.
+  - EasyFlex/invoice_processor.py: zjednodušené zpracování faktur bez položek; staví souhrny DPH z top-level částek;
+    zakazuje výpočty/dorovnávání.
+  - EasyFlex/csv_processor.py: načtení CSV/XLSX/XML (vč. fallback parserů), mapování sloupců heuristikami a volitelným
+    LLM, převod řádků na InvoiceData, domyšlení datumů, připnutí varování; normalizace čísel.
+  - EasyFlex/abra.py: REST integrace na ABRA Flexi; tvorba winstrom JSON, retry/backoff, hledání firmy/partnera v
+    adresáři, generování položek z částek (nebo z položek, aktuálně vypnuto), serializace chyb do errors/.
+  - EasyFlex/invoice_warnings.py: jednotná manipulace s polem upozorneni napříč dict/modely (nastavení, slučování,
+    čtení).
+  - EasyFlex/gui.py: Tkinter UI (AppGUI, SettingsDialog, InvoiceEditDialog), tabulka s editací a tříděním, volba zdroje
+    dat, ABRA kontext, auto/manual import, progress, log konzole; lazy načítání těžkých modulů.
+  - EasyFlex/main.py: bootstrap GUI, hlášení chybějících závislostí, start extractor threadu.
+  - EasyFlex/settings.ini: výchozí konfigurace (placeholdery); sekce abra/extractor/extraction/csv.
+  - EasyFlex/requirements.txt: runtime závislosti (openai, pdf2image, Pillow, pandas, pydantic, dotenv, tqdm, requests,
+    charset-normalizer, pytest, openpyxl).
+  - EasyFlex.spec, EasyFlex-windows.spec, EasyFlex-macos.spec: PyInstaller specifikace; bundlují assets, settings,
+    poppler, hidden imports; Windows verze přidává .ico, macOS konvertuje na .icns a vytváří bundle.
+  - assets/app_icon.ico, assets/autoflexi.ico: ikony pro build/UI.
+  - errors/*.json: ukázkové/uložené chybové dumpy ABRA požadavků.
+  - tests/test_csv_processor.py, tests/test_abra_mapping.py, tests/test_date_helpers.py: unit testy parsování CSV/XML/
+    XLSX, mapování a domyšlení datumů, ABRA mapování payloadu; helper _write_sample_xlsx.
+  - README.md, README-admin.md: uživatelská a admin dokumentace; shrnutí architektury.
+  - DISTRIBUTION.md, instructions.txt: build kroky pro PyInstaller; platformní instrukce.
+  - improvements_table.txt: seznam nápadů na zlepšení LLM mapování CSV.
+  - poppler-25.07.0/...: přibalené binárky/knihovny/poppler data pro pdf2image; velký třetí-party obsah, bez aplikační
+    logiky.
+  - EasyFlex/__pycache__/*: zkompilované Python soubory (artefakty).
+
+  4. Funkce a metody
+
+  - config.py:
+      - _parse_date_order(value): převod textu na bool day-first; vstup str/None, výstup bool; rozhodovací řetězec s
+        default True.
+      - AppConfig: dataclass držící veškeré konfigurační hodnoty (OpenAI, Poppler, concurrency, ABRA, extrakční volby,
+        CSV LLM).
+      - _InMemoryLogHandler.__init__(capacity): připraví deque logů; _lock.
+      - _InMemoryLogHandler.emit(record): formátuje log, ukládá do bufferu thread-safe.
+      - _InMemoryLogHandler.get_messages(limit): vrací list logů (posledních N).
+      - _InMemoryLogHandler.clear(): vymaže buffer.
+      - _install_exception_hooks(): přesměruje sys.excepthook a threading.excepthook do logu; chrání proti opakované
+        instalaci.
+      - setup_logging(): nastavení základního logování, přidání in-memory handleru, instalace hooků.
+      - get_log_messages(limit): přístup k bufferu.
+      - _default_settings_path(): cesta k baleným defaultům INI.
+      - _user_config_dir(): platformně závislá cesta k uživatelské konfig složce (EasyFlex).
+      - _settings_path(): plná cesta k user-writable settings.ini.
+      - _snapshot_env(): tuple vybraných env proměnných pro invalidaci cache.
+      - _snapshot_config_state(): tuple mtimů user/default/.env a env snapshot pro cache kontrolu.
+      - invalidate_config_cache(): resetuje cache _CONFIG_CACHE.
+      - _detect_bundled_poppler(): hledá pdftoppm ve známých místech (frozen/dev), vrací path nebo None.
+      - get_errors_dir(): určí zapisovatelný adresář chyb (AppData/Library nebo projekt/errors).
+      - get_cache_dir(): vrací (vytváří) cache dir v uživ. konfiguraci.
+      - read_settings(): načte defaultní INI + user overrides, vynechá companies/doc_types, opravuje neplatný INI
+        přejmenováním.
+      - write_settings(cp): zapíše INI a invaliduje cache.
+      - get_companies_from_settings(): načte [(code,name)] z [companies] seřazené jménem.
+      - add_company_to_settings(code,name): přidá/aktualizuje do INI.
+      - _doc_types_key(company,direction): složí klíč "company|direction".
+      - get_doc_types(company,direction): načte JSON list typů dokladů, normalizuje položky.
+      - add_doc_type(company,direction,name,code): přidá/aktualizuje JSON list v INI.
+      - _load_config_uncached(): načte .env, INI, env, detekuje Poppler, sestaví AppConfig (přetypování, defaulty),
+        nastaví alias use_issue_date_as_due_date.
+      - load_config(force_reload): cache wrapper, invalidace při změně mtim/env.
+  - models.py:
+      - Vlastní fallback BaseModel: konstruktor přetypuje podle anotací (list/Union/Enum), model_dump vrací dict,
+        model_validate ověří dict, model_copy klonuje.
+      - VATRate enum 0/12/21.
+      - InvoiceItem: pole nazvy, množství/ceny/DPH/mena; defaulty None/1.0.
+      - VATSummary: sazba_dph, zaklad_dane, vyse_dph, celkova_cena, pocet_polozek.
+      - InvoiceData: hlavní model faktury; stará pole (identifikace, dodavatel/odběratel, datumy, částky), rozšířená
+        pole pro sazby, položky (položky None), souhrny_dph, mena, upozorneni; Pydantic config extra=allow.
+  - date_helpers.py:
+      - _active_day_first(): čte config.date_day_first s default True.
+      - _parse_date(value, day_first): akceptuje date/datetime/str, normalize separators, vyzkouší formáty (ISO, den/
+        měsíc pořadí podle flagu), vrací date nebo None.
+      - _format_date(date): ISO string.
+      - parse_invoice_date(value): public wrapper na _parse_date s aktivním pořadím, vrací str/None.
+      - domysleni_chybejicich_datumu(payload): doplní chybějící datumy (DUZP nejdřívější, splatnost nejpozdější,
+        vystavení mezi), vrací aktualizovaný dict + seznam varování.
+  - extractor.py:
+      - Dataclass ExtractResult(file_path,data,error,warnings);
+        SegmentInfo(page_index,is_invoice_page,role,doc_key,confidence).
+      - InvoiceExtractor.__init__(...): načte config (s možností override parametrů), nastaví model/teplotu/top_p/
+        reasoning, limity stran/tokenů, Poppler path, retries/backoff/request delay, cache dir, logging; uchovává flagy
+        overridů.
+      - update_config(config): obnoví runtime nastavení s respektováním overridů; resetuje klient při změně klíče.
+      - extract_auto(pdf_path): dle configu přepne na multi-segment nebo single extrakci; vrací list ExtractResult.
+      - _get_cache_key(pdf_path): hash z cesty+velikost+mtime (fallback cesta).
+      - _get_cached_result(pdf_path): načte z in-memory/disk cache (json), vrátí payload+warnings nebo None;
+        kompatibilita se starým formátem.
+      - _load_cache_entry(cache_key): čte {key}.json z cache_dir, vrací dict/None.
+      - _cache_result(pdf_path,payload,warnings): uloží do paměti i na disk.
+      - _get_client(): lazy vytvoří OpenAI klient s API klíčem (z config/env), jinak RuntimeError.
+      - extract_from_pdf(pdf_path): log, použije cache; konvertuje PDF→obrázky (_pdf_to_images), omezuje počet stran,
+        převod na base64, _run_vision_extraction, aplikuje volby (variabilní symbol = číslo dokladu, domyšlení datumů),
+        validuje InvoiceData, uloží do cache, provede process_invoice_data, vrací ExtractResult nebo chybu.
+      - batch_extract(pdf_folder,on_progress): seřadí PDF ve složce, paralelizuje s Semaphore(concurrency) volání
+        extract_auto, sbírá výsledky, volá on_progress, řadí výstup.
+      - extract_from_pdf_multi_segmented(pdf_path): konverze PDF, _segment_images, _build_groups_from_segments, pro
+        každou skupinu _extract_from_images; fallback na single extrakci při chybě/bez skupin.
+      - _extract_from_images(images,pdf_path): jako extract_from_pdf bez konverze/uložení do cache; aplikuje volby,
+        vrací ExtractResult.
+      - _build_segmentation_schema(): JSON schema pro stránkovou segmentaci (is_invoice_page, role, doc_key,
+        confidence).
+      - _call_openai_segment_page(image_b64): OpenAI volání s response_format schema, retry/backoff, fallback model;
+        vrací parsed dict nebo parsuje content.
+      - _segment_images(images): base64 list, paralelní segmentace s concurrency semaforem, vrací list SegmentInfo
+        (zachovává indexy).
+      - _build_groups_from_segments(segments): heuristika na spojování start/middle/end/single/unknown do rozsahů
+        (start,end,doc_key), filtruje neplatné.
+      - batch_extract_with_tqdm(pdf_folder): CLI batch s tqdm, retry failed files; respektuje segmentaci dle configu.
+      - save_to_csv(data,output_file): normalizuje data na řádky, uloží pandas DataFrame do CSV, vyhazuje při prázdnu/
+        chybě.
+      - preview_results(data): vrací pandas DataFrame z _results_to_rows.
+      - _results_to_rows(data): iteruje položky, používá _result_item_to_row, skip None.
+      - _result_item_to_row(item): ExtractResult→dict (soubor, upozornění), InvoiceData→dict (doplní upozornění z
+        get_warning), dict→doplní default upozornění; loguje neznámé typy.
+      - _pdf_to_images(pdf_path): pdf2image.convert_from_path v threadu, používá dpi/poppler_path, mapuje
+        PDFInfoNotInstalledError na RuntimeError; vrací list PIL Images.
+      - _pil_image_to_base64(image): volitelný resize na image_max_width, konverze na RGB, uloží JPEG s kvalitou/jinak
+        PNG, vrátí base64.
+      - _run_vision_extraction(images_b64): zavolá _call_openai, postprocess, normalizace dat (_postprocess_payload,
+        _normalize_dates, _check_amount_consistency), při problémech opakuje s stricter flags, sestaví warnings (datumy/
+        částky), vrací payload+warnings.
+      - _postprocess_payload(payload): přejmenuje polozky→položky, vyplní defaulty částek nulou.
+      - _ensure_zero_amount_defaults(payload): pro ZERO_DEFAULT_FIELDS nastaví 0.0 při None/nečíselném obsahu.
+      - _normalize_dates(payload): parsuje datumy přes _parse_date_field, vrací payload+list
+        invalid_fields+suspect_fields (neobvyklé rozdíly).
+      - _parse_date_field(value): čistí text, zkouší formáty dle day_first, validuje rok, vrací (normalized,status
+        parsed/invalid/empty).
+      - _find_suspect_dates(parsed): označí datumy vzdálené >7 dní od vystavení nebo rok mimo majoritní rok ±1.
+      - _assemble_date_warnings(invalid_fields,suspect_fields): tvoří textové varování s přátelskými názvy.
+      - _check_amount_consistency(payload): kontrola součtů základů/DPH/celkem s tolerancí 0.5; vrací (True/False,
+        warnings list).
+      - _build_json_schema(): schema pro structured output InvoiceData (položky fixně null).
+      - _try_parse_json_payload(content): více strategií parsování JSONu z textu (přímé, fenced, balanced braces);
+        vyhazuje JSONDecodeError.
+      - _call_openai(images_b64, strict_dates, strict_amounts): hlavní OpenAI chat volání se systémovým promptem,
+        response_format schema, retry/backoff/throttle, zvyšuje max_tokens při truncation, fallback model, parsuje
+        structured output nebo content; respektuje reasoning_effort pro gpt-5.
+      - _extract_retry_after(error_message): regex na "try again in Xms" apod., vrací sekundy (min 1).
+      - _throttle_request(): lokální i globální rate-limit dle request_delay, thread-safe lock _global_rate_lock.
+      - _calculate_backoff_delay(attempt): exponenciální backoff s jitterem a max_delay.
+  - invoice_processor.py:
+      - process_invoice_data(invoice_data): loguje, kopíruje model, vynuluje položky, nastaví souhrny_dph z top-level
+        částek, vrátí upravenou fakturu.
+      - _are_items_usable(items): vždy False (historie).
+      - _complete_missing_values(items,invoice_currency): vrací prázdný list (zakázáno).
+      - _complete_item_calculations(item): noop.
+      - _build_vat_summaries_from_totals(inv): sestaví VATSummary pro 21/12/0 pokud pole nejsou None; bez výpočtů, DPH0
+        vyse_dph=0; try/except na bezpečí.
+      - _validate_totals(items,vat_summaries,invoice_data): vždy True.
+      - _adjust_rounding_differences(vat_summaries,invoice_data): vrací vstup bez změny.
+      - should_use_items_logic(invoice_data): vždy False (položky vypnuté).
+  - csv_processor.py (CSVProcessor):
+      - __init__(): nastaví logger, slovník FIELD_SPECS, očekávané hlavičky, mapy label→target, prázdný column_map.
+      - process_csv_file(csv_path): alias na process_table_file.
+      - process_table_file(table_path): načte soubor (_load_table), zpracuje DataFrame, loguje chyby.
+      - _process_dataframe(df,source_label): vyrovná MultiIndex hlavičky, zjistí mapování sloupců (_infer_column_map),
+        iteruje řádky -> _map_row_to_invoice_data, sbírá faktury.
+      - _load_table(path): router na CSV/Excel/XML podle přípony, jinak ValueError.
+      - _load_csv(path): detekce kódování charset-normalizer, pd.read_csv sep=None engine=python.
+      - _load_excel(path): primárně pd.read_excel, fallback parser při chybě/missing openpyxl.
+      - _is_missing_openpyxl(exc): detekuje chybějící openpyxl dle typu/obsahu.
+      - _load_xml(path): zkusí pd.read_xml, jinak ruční parse ElementTree, _extract_xml_rows.
+      - _load_excel_fallback(path): manuální rozbalení XLSX přes ZipFile, načtení sharedStrings, určení sheetu
+        (_first_sheet_path), čtení buněk (_read_sheet_rows), skládání tabulky + hlaviček, trimming textů.
+      - _read_shared_strings(archive): načte sharedStrings.xml, složí list textů.
+      - _first_sheet_path(archive): prozkoumá workbook.rels a workbook.xml, najde první sheet target.
+      - _read_sheet_rows(archive,sheet_path,shared_strings): parse sheetData, buněčné reference→index
+        (_excel_ref_to_index), převod buněk (_parse_excel_cell), vrací list map column->value pro každý řádek.
+      - _excel_ref_to_index(ref): převod Excel adresy (A1) na 0-based index; validuje písmena.
+      - _parse_excel_cell(cell,shared_strings): čte typy inlineStr/shared strings/bool/number, vrací str/None.
+      - _extract_xml_rows(root): heuristicky hledá opakované děti (nejčastější tag), jinak bere děti root; využívá
+        _xml_row_to_record.
+      - _xml_row_to_record(element): sestaví dict z elementu (atributy jako key@attr), text/listy; volá
+        _xml_child_to_record.
+      - _xml_child_to_record(element,prefix): rekurzivně ploché mapování s prefixy a atributy; text pro listy/leaf.
+      - _normalize_xml_key(key): trim/replace -,_, whitespace→single space; fallback "hodnota".
+      - _map_row_to_invoice_data(row,row_number): vytvoří InvoiceData; načte identifikaci/dodavatel/odběratel, parse
+        datumů (parse_invoice_date), sestaví adresu s PSČ+město, převod částek _safe_float, nastaví položky None, měnu
+        "CZK"; domýšlí datumy (domysleni_chybejicich_datumu), připojí varování (append_warnings), loguje náhled.
+      - _safe_float(value): strip měnových symbolů a mezer, čárka→tečka, odstraní tisícovky, zachová minus, vrací float/
+        None.
+      - _safe_get(row,column_name): získá hodnotu přímo nebo přes mapování target→hlavička; vrací trimmed str/None při
+        NaN/"".
+      - _infer_column_map(df): pipeline mapování: 1) přímé shody, 2) heuristika _heuristic_match (keywords + typ
+        skóre), 3) volitelně LLM (cfg.csv_enable_llm_mapping + API key) _ask_llm_for_mapping + _sanitize_llm_mapping, 4)
+        fallback synonyma (_apply_synonym_fallback).
+      - _normalize(s): odstranění BOM, lower, diakritika pryč (NFKD), normalizace mezer.
+      - _heuristic_match(target,norm_cols,df): hledá nejvyšší token_score (keywords) + type_score, vrací kandidátní
+        hlavičku.
+      - _fallback_synonym_match(target,norm_cols,used_headers): prohledá FALLBACK_SYNONYMS substringy.
+      - _apply_synonym_fallback(mapping,df,used_headers): doplní chybějící cíle podle synonym, loguje počet.
+      - _type_match_score(series,expected_type): heuristika typu (head hodnot); čísla/datumy vrací skóre 2/1/-1.
+      - _best_header_fuzzy(reported,cols): normalizace a hledání shody/startswith/contains.
+      - _column_summaries(df): vrací metadata sloupců (name, normalized, inferred kind, samples).
+      - _sample_values(series,limit): vybere až 3 unikátní trimmed hodnoty.
+      - _infer_series_kind(series): heuristika kind: number-like/date-like/code/id/text.
+      - _target_header_score(target,header,df): (token_score,type_score,priority) pro rozřešení duplicity LLM.
+      - _pick_best_target_for_header(header,targets,df): vybere target s nejlepší score.
+      - _sanitize_llm_mapping(llm_map,df,reserved_headers): validuje dict, řeší duplicity, fuzzy match, heuristika pro
+        zbylé.
+      - _ask_llm_for_mapping(df): připraví prompt (popisy FIELD_SPECS, ukázkové řádky/hlavičky), response_format
+        schema; volá OpenAI, parsuje parsed/content/json, zachytává RateLimit/Timeout/Connection -> prázdný dict;
+        max_completion_tokens dle modelu.
+  - abra.py:
+      - _build_base_url(server,port): https URL s volitelným portem.
+      - _normalize_companies_payload(payload): normalizace různých struktur na list dictů firem.
+      - _extract_winstrom_entries(payload,keys): vytáhne list dictů z winstrom obálky nebo přímo.
+      - _wrap_winstrom(doc_endpoint,entry): zabalí jediný záznam do {"winstrom":{endpoint:[entry]}}.
+      - _normalize_country_reference(value): mapování názvů/ISO2/ISO3 na code:XX nebo None.
+      - _normalize_ico(value): digit-only IČO nebo None.
+      - _normalize_dic(value): uppercase, odstraní prefixy DIČ/VAT a mezery.
+      - _split_address_components(address): heuristické rozdělení na (ulice, psc, město), hledá PSČ patterny, čistí
+        labely.
+      - _infer_vat_code(faktura): odhad sazby high/low/none z poměru vyse_dph/zaklad nebo celkem.
+      - _build_positions_from_totals(faktura): generuje syntetické položky z explicitních základů 0/12/21 (mnozMj=1,
+        cenaMj=zaklad, typSzbDphK kód); chyby → [].
+      - _build_positions_from_items(invoice_data): (nepoužito v current flow) vytváří položky z položky s minimem
+        výpočtů (cenaMj z zaklad_dane/cena_mj/celkova_cena u DPH 0), sazba z položky nebo odhadu faktury; default
+        typSzbDphK dphNul.
+      - _map_vat_rate_to_code(vat_rate): map enum → typSzbDph kódy.
+      - _request_with_retry(method,url,auth,timeout_s,json_body,verify): HTTP request s backoff ([0,0.5,1,2,4]s),
+        speciální logika pro DNS/timeout/5xx/429/408/425/423, respektuje Retry-After; úspěch vrací Response, jinak
+        RuntimeError.
+      - _ensure_company_id(base_url,auth,timeout_s,verify,company_hint,faktura): vrací kód firmy (hint nebo GET /
+        c.json), vybírá shodu podle ICO/názvu, jinak první; mapuje HTTP chyby.
+      - _ensure_partner_ext_id(base_url,auth,timeout_s,company_code,faktura,verify,partner_rel_code): načte adresář
+        (limit=0, detail custom), normalizuje záznamy, hledá shodu ICO/DIČ/název v pořadí, vrací referenci code:/id:,
+        nebo RuntimeError s instrukcí vytvořit adresu.
+      - _map_invoice_json(faktura,series_map,cfg): převod InvoiceData/dict na dict pro ABRA (cisDosle/varSym/datVyst/
+        duzpPuv/datSplat), volitelné domyšlení datumů dle cfg.infer_missing_dates, warningy jen pro UI, aplikace
+        series_map JSON (rada).
+      - import_to_abra(faktura_data): hlavní import; načte config, pokud chybí server/user/pass → skip; připraví
+        base URL, proběhne probe GET; konvertuje InvoiceData→dict, zjistí company_code, partner_ref, sestaví body
+        (map_invoice_json, typDokl defaulty dle směru, kod pro vydané), rozhodne položky podle should_use_items_logic
+        (False → _build_positions_from_totals), přidá firma=partner_ref, obalí winstrom, POST (retry helper), při 409
+        PUT; úspěch vrací JSON, neúspěch loguje/dumpuje errors/abra_error<cislo>.json.
+  - invoice_warnings.py:
+      - _normalize(text): trim, default "bez problému" → None.
+      - _set_on_object(obj,value), _set_via_object_setattr, _set_in_dict: různé způsoby nastavení atributu/dict klíče
+        upozorneni, vrací bool úspěchu.
+      - set_warning(invoice,value): nastaví/maže upozornění (dict nebo objekt).
+      - clear_warning(invoice): volá set_warning(None).
+      - get_warning(invoice,default): načte upozornění z dict/atributu/dict, default pokud None.
+      - append_warnings(invoice,warnings): sjednotí existující a nové varování (odstraní duplikáty/default text),
+        nastaví nebo smaže.
+  - gui.py:
+      - InvoiceEditDialog: konstruktor vytvoří Toplevel s editačními poli; _build() staví sekce, _add_entry přidá řádek,
+        _initial_value formátuje výchozí hodnotu (float bez zbytečných nul), _on_save sebere hodnoty (_collect_values
+        validuje datumy/čísla, převádí na None/float/parsed date), _on_cancel zavře, _parse_float sdílí číselnou logiku.
+      - AppGUI.__init__(root, extractor): nastaví stav/flags/import mapy ABRA, načte kontext z settings, vytvoří labely
+        sloupců, inicializuje Treeview a ovládací prvky; lazy pandas/csv processor; tlačítka pro PDF/složku/CSV/export/
+        clear/edit/nastavení/import; progress/status; tree s tříděním.
+      - set_extractor, notify_extractor_error, _on_extractor_ready_ui, _show_startup_error, _ensure_extractor_ready:
+        správa asynchronního initu extractoru.
+      - _get_csv_processor(), _ensure_pandas(): lazy import.
+      - _build_widgets(): kompletní UI layout + bindingy + stylování; volá _setup_tree_context_menu.
+      - _setup_tree_context_menu(): bindy na right-click (platform aware) → _on_right_click.
+      - _on_column_sort(column): toggle třídění při kliku na heading, uchová selection.
+      - _perform_sort(column,ascending): vypočítá pořadí (_compute_sort_order) a aplikuje (_apply_sorted_order),
+        aktualizuje headingy.
+      - _compute_sort_order(column,ascending): připraví pořadí z _prepare_sort_values (present/missing), setřídí,
+        invertuje dle ascending.
+      - _prepare_sort_values(column,pd): pro DF řádky generuje sort klíče (_build_sort_key) nebo missing.
+      - _is_missing_value(value,pd): True pro None/""/NaN.
+      - _build_sort_key(column,value): special cases importovat/date/numeric, jinak natural sort key.
+      - _is_marked_for_import(value): interpretace ✓/boolean.
+      - _coerce_to_float(value): parse číslo s odstraněním mezer/čárek/tisícovek.
+      - _natural_sort_key(text): rozdělení na čísla/alfanum pro přirozené třídění.
+      - _apply_sorted_order(order,selected_indices): přeuspořádá df/results/invoices/import_flags dle pořadí, obnoví
+        tree, selection.
+      - _refresh_tree_from_df(): smaže tree, vloží DF řádky, nastaví import flags.
+      - _restore_selection(old_indices,order): mapuje selection na nové indexy.
+      - _apply_heading_labels(sorted_column,ascending): přidá šipky na headingy.
+      - _reset_sort_state(), _resort_after_data_change(): správa stavu třídění.
+      - _row_to_invoice_dict(row_index): z aktuálního df vrátí dict faktury bez UI sloupců, NaN→None, upozorneni default
+        odstraní.
+      - _has_minimal_invoice_data(inv): kontrola minimálních polí pro import.
+      - _load_initial_context(): načte firmy/typy/směr z config/settings do comboboxů.
+      - _format_company_display, _parse_company_display, _format_doc_type_display, _parse_doc_type_display: formátování
+        hodnot comboboxů.
+      - _refresh_company_values(): naplní combobox firmy vč. „Nová firma…“, default volba.
+      - _refresh_doc_type_values(): načte typy dle firmy+směru, přidá „Nový typ…“.
+      - _get_selected_company_code_and_name(): vrátí (code,name) ze zobrazení.
+      - _on_company_changed(), _on_direction_changed(), _on_doc_type_selected(): reakce na výběry, volitelné dialogy pro
+        nové záznamy, persist kontext.
+      - _prompt_new_company(): dialog askstring pro název/kód, uloží do settings, refresh UI.
+      - _prompt_new_doc_type(): dialog pro nový typ, uloží do settings, refresh UI.
+      - _persist_abra_context(company,doc_endpoint,doc_type_code): zapisuje do INI pomocí read/write_settings.
+      - _open_settings(): otevře SettingsDialog s callbackem; _on_settings_saved() reloaduje config/comboboxy, updatne
+        extractor config, povolí tlačítka.
+      - _set_progress(current,total,last_file): aktualizuje progress/status.
+      - _fill_table(): naplní tree z self.results (ExtractResult), inicializuje import_flags, sestaví df.
+      - _build_invoice_rows(invoices,src_label): vytvoří seznam dictů z InvoiceData pro CSV import režim (doplní
+        upozornění).
+      - _fill_table_from_invoices(invoices,src_label,prebuilt_rows): naplní tree/df z faktur, nastaví flags.
+      - _edit_selected_invoice(): otevře InvoiceEditDialog pro vybraný řádek (results nebo invoices), aplikuje změny,
+        přepočítá datumy (domyšlení), aktualizuje warnings a tree.
+      - _apply_invoice_updates(invoice,updates): setattr na invoice.
+      - _recompute_invoice_dates(invoice): volá domysleni_chybejicich_datumu, nastaví datumy, vrací warnings.
+      - _update_result_warnings(result,inferred_warnings): sloučí warnings (bez dup inference textů).
+      - _update_tree_row(index): obnoví tree/df řádek podle current view, respektuje flags/upozornení.
+      - _choose_pdf(), _choose_folder(), _choose_table(): otevřou dialogy, spustí async/threads _extract_single,
+        _extract_folder, _process_table_file.
+      - _extract_single(file_path): async, nastaví status, použije extractor.extract_auto, naplní tabulku, volitelně
+        auto-import (iteruje df/import_flags → import_to_abra), nastaví hotovo.
+      - _choose_folder→_extract_folder(folder): batch extrakce s progress callback, auto-import obdobně.
+      - _process_table_file(file_path): běží v threadu, zpracuje CSVProcessor, naplní invoices/results/df/tree, auto-
+        import pokud zapnuto, chytá chyby do messagebox.
+      - _export_csv(): uloží df nebo results→csv (via extractor.save_to_csv) v threadu, hlásí hotovo/chybu.
+      - _clear(): reset UI/data.
+      - _on_cell_double_click(event): otevře inline editor hodnoty buňky, aktualizuje tree/df a resortuje.
+      - _on_tree_click(event): toggling importovat sloupce při kliknutí.
+      - _run_async(coro): spustí coroutine v daemon threadu s asyncio.run, chyby do messagebox.
+      - _run_in_thread(func): obecný thread wrapper s error handlingem.
+      - _ensure_abra_context_for_import(): před importem perzistuje aktuální combobox volby do settings.
+      - _show_abra_error(msg): messagebox s volitelným otevřením nastavení.
+      - _manual_import_to_abra(): kontrola dat, volá _perform_manual_import.
+      - _perform_manual_import(): iteruje df podle import_flags, validuje minima, volá import_to_abra, sčítá úspěchy/
+        chyby/skip, zobrazuje sumář.
+      - _on_right_click(event): zobrazí context menu pro označení/odznačení importu.
+      - _toggle_import_flag(row_index), _mark_all_for_import(), _unmark_all_for_import(), _refresh_import_display():
+        správa hromadného označení importu + sync df/tree.
+  - main.py:
+      - _recommended_pip_command(): vrátí pip příkaz s aktuálním pythonem.
+      - _format_missing_dependency(exc): sestaví hlášku pro chybějící modul.
+      - _handle_missing_dependency(root,exc): messagebox error.
+      - _import_app_gui(root): runtime import AppGUI, zachytí ModuleNotFoundError.
+      - _check_core_dependencies(root): find_spec pro klíčové moduly, zobrazí seznam chybějících + doporučení, vrací
+        bool.
+      - _build_extractor(cfg): lazy import InvoiceExtractor, vytvoří instanci s configem.
+      - main(): viz tok výše; vytvoří GUI, spustí init_extractor thread (try/except
+        ModuleNotFoundError→notify_extractor_error s formátovanou zprávou, jinak notify).
+  - Testy:
+      - tests/test_csv_processor.py: _sample_dataframe, _assert_sample_invoice, _write_sample_xlsx
+        helpery; testy test_csv_row_mapping_infers_due_date_and_warnings (domyšlení
+        splatnosti + warning), test_process_table_file_reads_csv/xlsx/xml (load a mapování),
+        test_column_mapping_handles_supplier_customer_synonyms (heuristiky mapování).
+      - tests/test_abra_mapping.py: _make_config helper tvoří AppConfig;
+        test_map_invoice_json_infers_due_date_and_warnings ověřuje domyšlení splatnosti v mapování.
+      - tests/test_date_helpers.py: testy parse_invoice_date day-first/month-first, domyšlení splatnosti varování;
+        používají invalidate_config_cache + monkeypatch env.
+
+  5. Třídy a datové struktury
+
+  - AppConfig (config.py): agregace konfig hodnot; používá se v extractor/abra/gui pro runtime nastavení.
+  - _InMemoryLogHandler: log handler s deque, thread-safe; používá GUI log konzole.
+  - VATRate enum; InvoiceItem položka faktury (aktuálně nevyužito v toku); VATSummary souhrn DPH; InvoiceData hlavní
+    datový model (legacy + rozšířená pole, položky/souhrny/mena/upozorneni).
+  - ExtractResult: výsledek extrakce (cesta, InvoiceData nebo chyba, warnings).
+  - SegmentInfo: metadata stránky pro segmentaci více faktur.
+  - InvoiceExtractor: orchestr OpenAI extrakce; spravuje klienta, cache, throttling, segmentaci, validaci, export.
+  - CSVProcessor: pipeline načtení tabulek, mapování hlaviček (heuristika/LLM), tvorba InvoiceData; uchovává column_map.
+  - SettingsDialog: UI pro editaci configu; drží Tk variably (OpenAI, ABRA, extrakce, auto-import).
+  - InvoiceEditDialog: Toplevel pro editaci jedné faktury; validace čísel/datumů.
+  - AppGUI: hlavní UI + workflow (výběr souborů, tabulka, třídění, importy, nastavení, auto-import, progress).
+  - Main modul neobsahuje třídy, jen util funkce.
+  - Spec soubory definují helper funkce _extend_package_resources, _ensure_icns a PyInstaller objekty Analysis/PYZ/
+    EXE/BUNDLE.
+  - Test helpery _make_config, _sample_dataframe, _assert_sample_invoice, _write_sample_xlsx tvoří syntetická data.
+
+  6. Konfigurace, I/O a externí závislosti
+
+  - Konfigurace: settings.ini (dev) nebo uživatelský profil (AppData/Roaming/EasyFlex/settings.ini či ~/Library/
+    Application Support/EasyFlex), sekce extractor/abra/extraction/csv + [companies]/[doc_types]; env proměnné mají
+    přednost (OPENAI_, POPPLER_PATH, ABRA_, EXTRACTION_DATE_ORDER, CSV_ENABLE_LLM_MAPPING…); .env v cwd nebo balíčku
+    se načte.
+  - I/O: čtení/zápis INI (read_settings/write_settings), error JSON do errors/ (dev nebo user path), cache extrakcí do
+    user cache dir; PDF konverze používá pdf2image + Poppler (binárky přibalené); CSV/XLSX/XML čtení přes pandas/Zip/
+    ElementTree; CSV export pandas.DataFrame.to_csv.
+  - API: OpenAI Chat Completions (structured JSON schema) pro extrakci a volitelně mapování CSV; requests k ABRA Flexi
+    REST (HTTPS, retry/backoff, verify TLS volitelný).
+  - Frameworky/knihovny: Tkinter (GUI), pandas, pdf2image, Pillow, pydantic (nebo fallback), openai SDK, dotenv,
+    charset-normalizer, tqdm (batch CLI), requests, configparser, dataclasses.
+  - Poppler: binární distribuovaný adresář poppler-25.07.0 s exe/dll/headers/share daty (externí, nezasahovat).
+
+  7. Speciální chování a “triky”
+
+  - Agresivní cache konfigurace (mtime + env snapshot) a výsledků extrakce (hash cesty/velikosti) pro rychlé opakování.
+  - Globální i instance throttle pro OpenAI požadavky, sdílený lock _global_rate_lock, backoff s jitterem a detekce
+    Retry-After; fallback model při problémech se structured output.
+  - Validace extrahovaných datumů (formáty, rok, podezřelé delty) a částek (součty základů/DPH/celkem) s re-ask na
+    strict režim.
+  - Dvoufázová segmentace vícestránkových PDF (klasifikace stran → skupiny), volitelná v configu.
+  - GUI třídění nad Treeview implementované na úrovni pandas DataFrame (vlastní natural sort, číselné/datumové parsing),
+    zachování výběru a import flagů.
+  - Auto-import do ABRA používá aktuální (i ručně upravená) data z tabulky, nikoliv původní extrakt; importování
+    respektuje import_flags ✓/✗.
+  - ABRA integrace nevytváří nové adresy, přísně hledá existující partnera podle IČO/DIČ/názvu; při neúspěchu selže
+    s chybou.
+  - Přibalený Poppler auto-detekován z více cest (dev, frozen, _MEIPASS), takže není nutné nastavovat POPPLER_PATH,
+    pokud je složka v balíčku.
+  - V testech se resetuje config cache (invalidate_config_cache) při manipulaci s env, aby se projevil formát dat.
+  - Spec soubory bundlují data pro závislosti (collect_all) a kopírují assets/settings do balíčku; macOS spec
+    generuje .icns z .ico na build-time.

@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card narrow">
+	<h2>Přihlášení</h2>
+	{% if error %}
+		<div class="flash danger">{{ error }}</div>
+	{% endif %}
+	<form method="post" class="form">
+		<label for="username">Uživatelské jméno</label>
+		<input id="username" name="username" type="text" required autofocus>
+		<label for="password">Heslo</label>
+		<div class="input-with-eye">
+			<input id="password" name="password" type="password" required>
+			<button type="button" class="eye-toggle" data-target="password" aria-label="Zobrazit heslo">&#128065;</button>
+		</div>
+		<button type="submit">Přihlásit</button>
+	</form>
+</div>
+{% endblock %}

@@ -1,0 +1,236 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card">
+	<h2>Moje nastavení</h2>
+	<p class="muted">Hodnoty se ukládají pouze k vašemu webovému účtu a přepisují výchozí konfiguraci aplikace.</p>
+	{% if error %}
+		<div class="flash danger">{{ error }}</div>
+	{% endif %}
+	<div class="tabs">
+		<div class="tab-headers">
+			<button type="button" data-tab="abra" class="{% if active_tab == 'abra' %}active{% endif %}">ABRA</button>
+			<button type="button" data-tab="extractor" class="{% if active_tab == 'extractor' %}active{% endif %}">Extractor</button>
+			<button type="button" data-tab="extraction" class="{% if active_tab == 'extraction' %}active{% endif %}">Extrakce</button>
+			<button type="button" data-tab="import" class="{% if active_tab == 'import' %}active{% endif %}">Import do ABRA</button>
+		</div>
+		<form method="post">
+			<input type="hidden" id="active_tab" name="active_tab" value="{{ active_tab }}">
+			<div class="tab-content {% if active_tab == 'abra' %}active{% endif %}" id="tab-abra">
+				<label for="abra_server">ABRA server</label>
+				<input id="abra_server" name="abra_server" type="text" value="{{ settings.abra_server or '' }}">
+
+				<label for="abra_port">ABRA port</label>
+				<input id="abra_port" name="abra_port" type="number" value="{{ settings.abra_port or '' }}">
+
+				<label for="abra_username">ABRA uživatel</label>
+				<input id="abra_username" name="abra_username" type="text" value="{{ settings.abra_username or '' }}">
+
+				<label for="abra_password">ABRA heslo</label>
+				<div class="input-with-eye">
+					<input id="abra_password" name="abra_password" type="password" value="{{ settings.abra_password or '' }}">
+					<button type="button" class="eye-toggle" data-target="abra_password" aria-label="Zobrazit ABRA heslo">&#128065;</button>
+				</div>
+
+				<label class="checkbox-row">
+					<input type="checkbox" name="abra_verify_tls" value="1" {% if settings.abra_verify_tls %}checked{% endif %}>
+					Ověřovat TLS certifikát
+				</label>
+			</div>
+
+			<div class="tab-content {% if active_tab == 'extractor' %}active{% endif %}" id="tab-extractor">
+				<label for="openai_api_key">OpenAI API Key</label>
+				<div class="input-with-eye">
+					<input id="openai_api_key" name="openai_api_key" type="password" value="{{ settings.openai_api_key or '' }}">
+					<button type="button" class="eye-toggle" data-target="openai_api_key" aria-label="Zobrazit OpenAI klíč">&#128065;</button>
+				</div>
+
+				<label for="openai_model">Model</label>
+				<input id="openai_model" name="openai_model" type="text" value="{{ cfg.openai_model }}">
+
+				<label for="concurrency">Concurrency</label>
+				<input id="concurrency" name="concurrency" type="number" value="{{ cfg.concurrency }}">
+
+				<label for="max_tokens">Max Tokens</label>
+				<input id="max_tokens" name="max_tokens" type="number" value="{{ cfg.max_tokens }}">
+
+				<label for="pdf_dpi">PDF DPI</label>
+				<input id="pdf_dpi" name="pdf_dpi" type="number" value="{{ cfg.dpi }}">
+
+				<label for="max_pages">Max Pages</label>
+				<input id="max_pages" name="max_pages" type="number" value="{{ cfg.max_pages }}">
+
+				<label for="request_delay">Request Delay (s)</label>
+				<input id="request_delay" name="request_delay" type="number" step="0.1" value="{{ cfg.openai_request_delay }}">
+
+				<label for="max_retries">Max Retries</label>
+				<input id="max_retries" name="max_retries" type="number" value="{{ cfg.openai_max_retries }}">
+
+				<label for="image_max_width">Max šířka obrázků (px)</label>
+				<input id="image_max_width" name="image_max_width" type="number" value="{{ cfg.image_max_width }}">
+
+				<label for="image_jpeg_quality">JPEG kvalita (50-100)</label>
+				<input id="image_jpeg_quality" name="image_jpeg_quality" type="number" value="{{ cfg.image_jpeg_quality }}">
+			</div>
+
+			<div class="tab-content {% if active_tab == 'extraction' %}active{% endif %}" id="tab-extraction">
+				<label class="checkbox-row">
+					<input type="checkbox" name="use_doc_number_as_variable_symbol" value="1" {% if cfg.use_doc_number_as_variable_symbol %}checked{% endif %}>
+					Použít číslo dokladu jako variabilní symbol
+				</label>
+
+				<label class="checkbox-row">
+					<input type="checkbox" name="infer_missing_dates" value="1" {% if cfg.infer_missing_dates %}checked{% endif %}>
+					Domyšlení chybějících datumů
+				</label>
+
+				<label class="checkbox-row">
+					<input type="checkbox" name="enable_multi_invoice_segmentation" value="1" {% if cfg.enable_multi_invoice_segmentation %}checked{% endif %}>
+					Povolit segmentaci více faktur v jednom PDF
+				</label>
+
+				<label class="checkbox-row">
+					<input type="checkbox" name="csv_enable_llm_mapping" value="1" {% if cfg.csv_enable_llm_mapping %}checked{% endif %}>
+					Povolit LLM mapování CSV sloupců (odesílá ukázková data)
+				</label>
+
+				<fieldset>
+					<legend>Formát dne a měsíce</legend>
+					<label class="checkbox-row">
+						<input type="radio" name="date_order" value="dd-mm" {% if cfg.date_day_first %}checked{% endif %}>
+						Den–Měsíc (DD-MM)
+					</label>
+					<label class="checkbox-row">
+						<input type="radio" name="date_order" value="mm-dd" {% if not cfg.date_day_first %}checked{% endif %}>
+						Měsíc–Den (MM-DD)
+					</label>
+				</fieldset>
+
+				<label class="checkbox-row">
+					<input type="checkbox" name="auto_import" value="1" {% if cfg.auto_import %}checked{% endif %}>
+					Auto-importovat po extrakci / načtení tabulky
+				</label>
+			</div>
+
+			<div class="form-actions {% if active_tab == 'import' %}hidden{% endif %}">
+				<button type="submit">Uložit</button>
+			</div>
+		</form>
+		<div class="tab-content {% if active_tab == 'import' %}active{% endif %}" id="tab-import">
+			<h3>Firmy pro ABRA</h3>
+			<form method="post" class="form inline">
+				<input type="hidden" name="action" value="add_company">
+				<input type="hidden" name="active_tab" value="import">
+				<label for="company_name">Název</label>
+				<input id="company_name" name="company_name" type="text" placeholder="Název firmy">
+				<label for="company_code">Kód</label>
+				<input id="company_code" name="company_code" type="text" placeholder="Kód firmy" required>
+				<button type="submit" class="secondary">Přidat firmu</button>
+			</form>
+			<table class="results">
+				<thead>
+					<tr><th>Název</th><th>Kód</th><th>Akce</th></tr>
+				</thead>
+				<tbody>
+					{% for company in companies %}
+					<tr>
+						<td>{{ company.name }}</td>
+						<td>{{ company.code }}</td>
+						<td>
+							<form method="post" onsubmit="return confirm('Smazat firmu {{ company.name }}?');">
+								<input type="hidden" name="action" value="delete_company">
+								<input type="hidden" name="company_id" value="{{ company.id }}">
+								<input type="hidden" name="active_tab" value="import">
+								<button type="submit" class="button small secondary">Smazat</button>
+							</form>
+						</td>
+					</tr>
+					{% endfor %}
+				</tbody>
+			</table>
+			<h3>Typy dokladů</h3>
+			<form method="post" class="form inline">
+				<input type="hidden" name="action" value="add_doc_type">
+				<input type="hidden" name="active_tab" value="import">
+				<label for="dt_company_code">Firma</label>
+				<select id="dt_company_code" name="dt_company_code" required>
+					<option value="">Vyberte</option>
+					{% for company in companies %}
+						<option value="{{ company.code }}">{{ company.name }} ({{ company.code }})</option>
+					{% endfor %}
+				</select>
+				<label for="dt_direction">Směr</label>
+				<select id="dt_direction" name="dt_direction">
+					<option value="faktura-prijata">Přijatá</option>
+					<option value="faktura-vydana">Vydaná</option>
+				</select>
+				<label for="dt_name">Název</label>
+				<input id="dt_name" name="dt_name" type="text" placeholder="Název typu" required>
+				<label for="dt_code">Kód</label>
+				<input id="dt_code" name="dt_code" type="text" placeholder="Kód typu" required>
+				<button type="submit" class="secondary">Přidat typ</button>
+			</form>
+			<table class="results">
+				<thead>
+					<tr><th>Firma</th><th>Směr</th><th>Název</th><th>Kód</th><th>Akce</th></tr>
+				</thead>
+				<tbody>
+					{% for dt in doc_types_all %}
+					<tr>
+						<td>{{ dt.company_code }}</td>
+						<td>{{ "Přijatá" if dt.direction == "faktura-prijata" else "Vydaná" }}</td>
+						<td>{{ dt.name }}</td>
+						<td>{{ dt.code }}</td>
+						<td>
+							<form method="post" onsubmit="return confirm('Smazat typ {{ dt.name }}?');">
+								<input type="hidden" name="action" value="delete_doc_type">
+								<input type="hidden" name="doc_type_id" value="{{ dt.id }}">
+								<input type="hidden" name="active_tab" value="import">
+								<button type="submit" class="button small secondary">Smazat</button>
+							</form>
+						</td>
+					</tr>
+					{% endfor %}
+				</tbody>
+			</table>
+		</div>
+	</div>
+</div>
+<script>
+	(function() {
+		const tabs = document.querySelectorAll('.tab-headers button');
+		const panes = document.querySelectorAll('.tab-content');
+		const activeInput = document.getElementById('active_tab');
+		const formActions = document.querySelector('.form-actions');
+
+		const flashContainer = document.querySelector('.flash-container');
+
+		function setActive(tab, opts) {
+			const clearFlash = opts && opts.clearFlash;
+			const targetId = `tab-${tab}`;
+			tabs.forEach(btn => {
+				btn.classList.toggle('active', btn.dataset.tab === tab);
+			});
+			panes.forEach(pane => {
+				pane.classList.toggle('active', pane.id === targetId);
+			});
+			if (activeInput) activeInput.value = tab;
+			if (formActions) formActions.classList.toggle('hidden', tab === 'import');
+			if (clearFlash && flashContainer) {
+				flashContainer.remove();
+			}
+		}
+
+		const initial = (activeInput && activeInput.value) || 'abra';
+		setActive(initial);
+
+		if (tabs.length) {
+			tabs.forEach(btn => {
+				btn.addEventListener('click', () => {
+					setActive(btn.dataset.tab, { clearFlash: true });
+				});
+			});
+		}
+	})();
+</script>
+{% endblock %}

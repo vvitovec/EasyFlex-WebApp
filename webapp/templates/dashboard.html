@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card">
+	<h2>Vítejte, {{ current_user.username }}</h2>
+	<p>Zvolte akci:</p>
+	<div class="actions">
+		<a class="button" href="{{ url_for('upload_pdf') }}">Nahrát PDF</a>
+		<a class="button" href="{{ url_for('upload_table') }}">Nahrát tabulku</a>
+		{% if current_user.is_admin %}
+			<a class="button secondary" href="{{ url_for('manage_users') }}">Správa uživatelů</a>
+		{% endif %}
+	</div>
+</div>
+{% endblock %}

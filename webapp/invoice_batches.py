@@ -1,0 +1,230 @@
+"""Invoice batch helpers for storing, displaying, and updating extracted data."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
+
+from sqlalchemy.orm import joinedload
+
+from EasyFlex.date_helpers import domysleni_chybejicich_datumu
+from EasyFlex.invoice_warnings import get_warning, set_warning
+
+from .models import InvoiceBatch, InvoiceRow, User, db
+
+
+DISPLAY_COLUMNS: List[str] = [
+	"soubor",
+	"cislo_dokladu",
+	"variabilni_symbol",
+	"dodavatel_jmeno",
+	"dodavatel_ic",
+	"dodavatel_dic",
+	"dodavatel_adresa",
+	"dodavatel_stat",
+	"odberatel_jmeno",
+	"odberatel_ic",
+	"odberatel_dic",
+	"odberatel_adresa",
+	"odberatel_stat",
+	"datum_vystaveni",
+	"datum_duzp",
+	"datum_splatnosti",
+	"zaklad_dane_0",
+	"zaklad_dane_12",
+	"zaklad_dane_21",
+	"vyse_dph_12",
+	"vyse_dph_21",
+	"zaklad_dane",
+	"vyse_dph",
+	"celkova_cena",
+	"mena",
+	"upozorneni",
+]
+
+COLUMN_LABELS: Dict[str, str] = {
+	"soubor": "Soubor",
+	"cislo_dokladu": "Číslo dokladu",
+	"variabilni_symbol": "Variabilní symbol",
+	"dodavatel_jmeno": "Dodavatel – název",
+	"dodavatel_adresa": "Dodavatel – adresa",
+	"dodavatel_stat": "Dodavatel – stát",
+	"dodavatel_ic": "Dodavatel – IČ",
+	"dodavatel_dic": "Dodavatel – DIČ",
+	"odberatel_jmeno": "Odběratel – název",
+	"odberatel_adresa": "Odběratel – adresa",
+	"odberatel_stat": "Odběratel – stát",
+	"odberatel_ic": "Odběratel – IČ",
+	"odberatel_dic": "Odběratel – DIČ",
+	"datum_vystaveni": "Datum vystavení",
+	"datum_duzp": "Datum DUZP",
+	"datum_splatnosti": "Datum splatnosti",
+	"zaklad_dane_0": "Základ daně 0 %",
+	"zaklad_dane_12": "Základ daně 12 %",
+	"zaklad_dane_21": "Základ daně 21 %",
+	"vyse_dph_12": "DPH 12 %",
+	"vyse_dph_21": "DPH 21 %",
+	"zaklad_dane": "Základ daně (celkem)",
+	"vyse_dph": "DPH celkem",
+	"celkova_cena": "Celkem k úhradě",
+	"mena": "Měna",
+	"upozorneni": "Upozornění",
+}
+
+
+def _serialize_invoice(invoice: Any) -> dict:
+	"""Convert InvoiceData or dict-like to plain dict for templates/storage."""
+	if invoice is None:
+		return {}
+	if isinstance(invoice, dict):
+		return dict(invoice)
+	dump_func = getattr(invoice, "model_dump", None)
+	if callable(dump_func):
+		try:
+			return dump_func()
+		except Exception:
+			return {}
+	try:
+		return dict(invoice)
+	except Exception:
+		return {}
+
+
+def _normalize_warning_text(warning: Optional[str]) -> Optional[str]:
+	if not warning:
+		return None
+	text = str(warning).strip()
+	return text or None
+
+
+def _combine_warnings(invoice_obj: Any, extra: Iterable[str] | None = None) -> Optional[str]:
+	"""Merge warnings from invoice object and provided list into one string."""
+	warnings: list[str] = []
+	raw = get_warning(invoice_obj)
+	if raw:
+		warnings.extend(part.strip() for part in str(raw).split("|") if part.strip())
+	for item in extra or []:
+		text = str(item).strip()
+		if text and text not in warnings:
+			warnings.append(text)
+	joined = " | ".join(warnings)
+	return joined or None
+
+
+def create_batch_from_results(user: User, results: List[Any], source_label: str, source_type: str = "pdf") -> InvoiceBatch:
+	"""Persist ExtractResult objects as a batch."""
+	batch = InvoiceBatch(user=user, source_label=source_label, source_type=source_type)
+	db.session.add(batch)
+	db.session.flush()
+	for idx, res in enumerate(results):
+		invoice_dict = _serialize_invoice(getattr(res, "data", None))
+		warning_text = _combine_warnings(getattr(res, "data", None), getattr(res, "warnings", None))
+		if warning_text:
+			set_warning(invoice_dict, warning_text)
+		source_name = ""
+		if getattr(res, "file_path", None):
+			source_name = Path(getattr(res, "file_path")).name
+		row = InvoiceRow(
+			batch=batch,
+			row_index=idx,
+			source=source_name or source_label,
+			invoice_data=invoice_dict,
+			warning=warning_text,
+			error=getattr(res, "error", None),
+			marked_for_import=True,
+		)
+		db.session.add(row)
+	db.session.commit()
+	return batch
+
+
+def create_batch_from_invoices(user: User, invoices: List[Any], source_label: str, source_type: str = "table") -> InvoiceBatch:
+	"""Persist InvoiceData list (from CSV/XLSX/XML) as a batch."""
+	batch = InvoiceBatch(user=user, source_label=source_label, source_type=source_type)
+	db.session.add(batch)
+	db.session.flush()
+	for idx, inv in enumerate(invoices):
+		invoice_dict = _serialize_invoice(inv)
+		warning_text = _combine_warnings(inv, None)
+		if warning_text:
+			set_warning(invoice_dict, warning_text)
+		row = InvoiceRow(
+			batch=batch,
+			row_index=idx,
+			source=f"{source_label} #{idx + 1}",
+			invoice_data=invoice_dict,
+			warning=warning_text,
+			error=None,
+			marked_for_import=True,
+		)
+		db.session.add(row)
+	db.session.commit()
+	return batch
+
+
+def load_batch_for_user(batch_id: int, user: User) -> Optional[InvoiceBatch]:
+	return (
+		InvoiceBatch.query.filter_by(id=batch_id, user_id=user.id)
+		.options(joinedload(InvoiceBatch.rows))
+		.first()
+	)
+
+
+def rows_for_display(batch: InvoiceBatch) -> list[dict]:
+	rows: list[dict] = []
+	for row in sorted(batch.rows, key=lambda r: r.row_index):
+		invoice_dict = dict(row.invoice_data or {})
+		warning_text = _normalize_warning_text(row.warning) or _normalize_warning_text(invoice_dict.get("upozorneni"))
+		if warning_text:
+			set_warning(invoice_dict, warning_text)
+		rows.append({
+			"id": row.id,
+			"index": row.row_index,
+			"source": row.source or batch.source_label or "",
+			"invoice": invoice_dict,
+			"warning": warning_text or "bez problému",
+			"error": row.error,
+			"status": row.status,
+			"marked_for_import": bool(row.marked_for_import),
+		})
+	return rows
+
+
+def _merge_inference_warnings(original: Optional[str], inferred: Iterable[str]) -> Optional[str]:
+	def _is_inference(text: str) -> bool:
+		lower = text.lower()
+		return "dopln" in lower or "dopoč" in lower
+
+	parts: list[str] = []
+	for chunk in (original or "").split("|"):
+		val = chunk.strip()
+		if val and not _is_inference(val):
+			if val not in parts:
+				parts.append(val)
+	for new in inferred:
+		val = str(new).strip()
+		if val and val not in parts:
+			parts.append(val)
+	return " | ".join(parts) if parts else None
+
+
+def apply_invoice_updates(row: InvoiceRow, updates: Dict[str, Any], *, day_first: Optional[bool] = None) -> None:
+	"""Update stored invoice payload and refresh warnings/dates."""
+	invoice = dict(row.invoice_data or {})
+	for key, value in updates.items():
+		invoice[key] = value
+
+	# Recompute missing dates and inference warnings
+	date_payload = {
+		"datum_vystaveni": invoice.get("datum_vystaveni"),
+		"datum_splatnosti": invoice.get("datum_splatnosti"),
+		"datum_duzp": invoice.get("datum_duzp"),
+	}
+	date_payload, inferred_warnings = domysleni_chybejicich_datumu(date_payload, day_first=day_first)
+	invoice.update(date_payload)
+
+	merged_warning = _merge_inference_warnings(row.warning or invoice.get("upozorneni"), inferred_warnings)
+	if merged_warning:
+		set_warning(invoice, merged_warning)
+	row.invoice_data = invoice
+	row.warning = merged_warning
+	db.session.commit()

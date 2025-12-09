@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="cs">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>EasyFlex Web</title>
+	<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+	<nav class="topbar">
+		<div class="brand">EasyFlex Web</div>
+		<div class="nav-links">
+			{% if current_user.is_authenticated %}
+				<a href="{{ url_for('dashboard') }}">Dashboard</a>
+				<a href="{{ url_for('upload_pdf') }}">Nahrát PDF</a>
+				<a href="{{ url_for('upload_table') }}">Nahrát tabulku</a>
+				<a href="{{ url_for('user_settings') }}">Nastavení</a>
+				{% if current_user.is_admin %}
+					<a href="{{ url_for('manage_users') }}">Uživatelé</a>
+				{% endif %}
+				<a href="{{ url_for('auth.logout') }}">Odhlásit se</a>
+			{% else %}
+				<a href="{{ url_for('auth.login') }}">Přihlášení</a>
+			{% endif %}
+		</div>
+	</nav>
+	<main class="content">
+		{% with messages = get_flashed_messages(with_categories=true) %}
+			{% if messages %}
+				<div class="flash-container">
+					{% for category, msg in messages %}
+						<div class="flash {{ category }}">{{ msg }}</div>
+					{% endfor %}
+				</div>
+			{% endif %}
+		{% endwith %}
+		{% block content %}{% endblock %}
+	</main>
+	<div id="loading-overlay" class="loading-overlay hidden" aria-live="polite">
+		<div class="loading-card">
+			<div class="loader-bar">
+				<div class="loader-bar-fill"></div>
+			</div>
+			<p id="loading-text">Zpracovávám… prosím nezavírejte okno.</p>
+		</div>
+	</div>
+	<script>
+		document.addEventListener('click', function(e) {
+			const btn = e.target.closest('.eye-toggle');
+			if (!btn) return;
+			const targetId = btn.dataset.target;
+			if (!targetId) return;
+			const input = document.getElementById(targetId);
+			if (!input) return;
+			input.type = input.type === 'password' ? 'text' : 'password';
+		});
+		// Show loading overlay on long-running submissions
+		document.addEventListener('submit', function(e) {
+			const form = e.target;
+			if (!form.classList.contains('show-loading')) return;
+			const overlay = document.getElementById('loading-overlay');
+			if (!overlay) return;
+			const textEl = document.getElementById('loading-text');
+			const msg = form.dataset.loadingMessage || "Zpracovávám… prosím nezavírejte okno.";
+			if (textEl) textEl.textContent = msg;
+			overlay.classList.remove('hidden');
+		});
+	</script>
+</body>
+</html>

@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card">
+	<h2>Upravit fakturu</h2>
+	<p class="muted">Změny se uloží do aktuální dávky a použijí se při importu do ABRA.</p>
+	{% if error %}
+		<div class="flash danger">{{ error }}</div>
+	{% endif %}
+	{% set general = ['cislo_dokladu','variabilni_symbol','dodavatel_jmeno','dodavatel_ic','dodavatel_dic','odberatel_jmeno','mena'] %}
+	{% set dates = ['datum_vystaveni','datum_duzp','datum_splatnosti'] %}
+	{% set amounts = ['zaklad_dane','vyse_dph','celkova_cena','zaklad_dane_0','zaklad_dane_12','zaklad_dane_21','vyse_dph_12','vyse_dph_21'] %}
+	<form method="post" class="form">
+		<fieldset>
+			<legend>Obecné</legend>
+			{% for field in general %}
+				<label for="{{ field }}">{{ dict(fields)[field] }}</label>
+				<input id="{{ field }}" name="{{ field }}" type="text" value="{{ invoice.get(field, '') }}">
+			{% endfor %}
+		</fieldset>
+		<fieldset>
+			<legend>Datumy</legend>
+			{% for field in dates %}
+				<label for="{{ field }}">{{ dict(fields)[field] }}</label>
+				<input id="{{ field }}" name="{{ field }}" type="text" value="{{ invoice.get(field, '') }}">
+			{% endfor %}
+		</fieldset>
+		<fieldset>
+			<legend>Částky</legend>
+			{% for field in amounts %}
+				<label for="{{ field }}">{{ dict(fields)[field] }}</label>
+				<input id="{{ field }}" name="{{ field }}" type="text" value="{{ invoice.get(field, '') }}">
+			{% endfor %}
+		</fieldset>
+		<div class="form-actions">
+			<a class="button secondary" href="{{ url_for('view_results', batch_id=row.batch_id) }}">Zpět</a>
+			<button type="submit">Uložit změny</button>
+		</div>
+	</form>
+</div>
+{% endblock %}

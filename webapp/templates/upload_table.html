@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card">
+	<h2>Nahrát tabulku s fakturami</h2>
+	<p>Podporované formáty: CSV, XLSX/XLS, XML.</p>
+	<p class="muted">Během zpracování prosím nezavírejte okno.</p>
+	{% if error %}
+		<div class="flash danger">{{ error }}</div>
+	{% endif %}
+	<form method="post" enctype="multipart/form-data" class="form show-loading" data-loading-message="Zpracovávám tabulku… prosím nezavírejte okno.">
+		<label for="table">Tabulkový soubor</label>
+		<input id="table" name="table" type="file" accept=".csv,.xlsx,.xls,.xml" required>
+		<button type="submit">Odeslat</button>
+	</form>
+</div>
+{% endblock %}

@@ -1,0 +1,22 @@
+{
+  "request": {
+    "winstrom": {
+      "@version": "1.0",
+      "faktura-vydana": [
+        {
+          "typDokl": {
+            "code": "PRIJATA"
+          },
+          "cisDosle": "20250323",
+          "varSym": "20250323",
+          "datVyst": "2025-07-31",
+          "duzpPuv": "2025-07-31",
+          "datSplat": "2025-08-07",
+          "withoutPosition": true
+        }
+      ]
+    }
+  },
+  "response_status": 400,
+  "response_text": "{\"winstrom\":{\"@version\":\"1.0\",\"success\":\"false\",\"stats\":{\"created\":\"0\",\"updated\":\"0\",\"deleted\":\"0\",\"skipped\":\"0\",\"failed\":\"1\"},\"results\":[{\"errors\":[{\"message\":\"Pole 'Interní číslo' musí být vyplněno. [DoklFak -1]\",\"for\":\"kod\",\"path\":\"faktura-vydana[temporary-id=null].kod\",\"code\":\"INVALID\",\"messageCode\":\"validace.notNull\"}]}]}}"
+}
