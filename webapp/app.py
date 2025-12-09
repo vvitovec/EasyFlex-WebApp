@@ -565,28 +565,29 @@ def create_app() -> Flask:
 					db.session.add(user)
 					db.session.commit()
 					message = f"Uživatel {username} vytvořen."
-	users = User.query.order_by(User.username.asc()).all()
-	return render_template("users.html", users=users, message=message, error=error)
-	
-	with app.app_context():
-		password = os.environ.get("EASYFLEX_ADMIN_PASSWORD")
-		if password:
-			# snaž se najít uživatele 'admin'
-			admin = User.query.filter_by(username="admin").first()
-			if admin is None:
-				# neexistuje → vytvoř
-				admin = User(username="admin", is_admin=True)
-				admin.set_password(password)
-				db.session.add(admin)
-			else:
-				# existuje → ujisti se, že je admin a aktualizuj heslo
-				admin.is_admin = True
-				admin.set_password(password)
+		users = User.query.order_by(User.username.asc()).all()
+		return render_template("users.html", users=users, message=message, error=error)
 
-			db.session.commit()
+	@app.before_first_request
+	def ensure_admin_user():
+		"""Create or update the admin user from EASYFLEX_ADMIN_PASSWORD."""
+		password = os.environ.get("EASYFLEX_ADMIN_PASSWORD")
+		if not password:
+			# Bez hesla v env neřešíme nic
+			return
+
+		admin = User.query.filter_by(username="admin").first()
+		if admin is None:
+			admin = User(username="admin", is_admin=True)
+			admin.set_password(password)
+			db.session.add(admin)
+		else:
+			admin.is_admin = True
+			admin.set_password(password)
+
+		db.session.commit()
 
 	return app
-
 
 app = create_app()
 
