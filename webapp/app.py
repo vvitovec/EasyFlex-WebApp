@@ -568,30 +568,42 @@ def create_app() -> Flask:
 		users = User.query.order_by(User.username.asc()).all()
 		return render_template("users.html", users=users, message=message, error=error)
 
-		def ensure_admin_user():
-			"""Create or update the admin user from EASYFLEX_ADMIN_PASSWORD."""
-			password = os.environ.get("EASYFLEX_ADMIN_PASSWORD")
-			if not password:
-				return
 
-			admin = User.query.filter_by(username="admin").first()
-			if admin is None:
-				admin = User(username="admin", is_admin=True)
-				admin.set_password(password)
-				db.session.add(admin)
-			else:
-				admin.is_admin = True
-				admin.set_password(password)
+	def ensure_admin_user():
+		"""Create or update the admin user from EASYFLEX_ADMIN_PASSWORD."""
+		password = os.environ.get("EASYFLEX_ADMIN_PASSWORD")
 
-			db.session.commit()
+		# Logování – ať v Render logu vidíme, jestli heslo je / není
+		app.logger.info(
+			"ensure_admin_user: password env is %s",
+			"SET" if password else "MISSING",
+		)
+		if not password:
+			return
 
-		@app.before_request
-		def _run_admin_init_once():
-			# zajistí, že ensure_admin_user proběhne jen jednou na proces
-			if not app.config.get("_ADMIN_INITIALIZED", False):
-				ensure_admin_user()
-				app.config["_ADMIN_INITIALIZED"] = True
+		admin = User.query.filter_by(username="admin").first()
+		if admin is None:
+			app.logger.info("ensure_admin_user: creating new admin user 'admin'")
+			admin = User(username="admin", is_admin=True)
+			admin.set_password(password)
+			db.session.add(admin)
+		else:
+			app.logger.info(
+				"ensure_admin_user: updating existing admin user id=%s", admin.id
+			)
+			admin.is_admin = True
+			admin.set_password(password)
 
+		db.session.commit()
+		app.logger.info("ensure_admin_user: admin user saved")
+
+	@app.before_request
+	def _run_admin_init_once():
+		"""Run ensure_admin_user() exactly once per process."""
+		if not app.config.get("_ADMIN_INITIALIZED", False):
+			ensure_admin_user()
+			app.config["_ADMIN_INITIALIZED"] = True
+			
 	return app
 
 app = create_app()
