@@ -160,7 +160,17 @@ def create_app() -> Flask:
 	db_path = base_dir / "easyflex_web.db"
 
 	app.config["SECRET_KEY"] = os.getenv("EASYFLEX_SECRET_KEY", "dev-secret-key")
-	app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
+
+		# Pokud je nastaveno DATABASE_URL (např. z Render Postgres), použij ho,
+		# jinak fallback na lokální SQLite soubor easyflex_web.db
+	db_url = os.getenv("DATABASE_URL")
+	if db_url:
+    	# Render dává URL ve tvaru "postgres://", SQLAlchemy očekává "postgresql://"
+		if db_url.startswith("postgres://"):
+			db_url = db_url.replace("postgres://", "postgresql://", 1)
+		app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+	else:
+		app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
 	app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 	# Load shared EasyFlex configuration (per-user overrides are applied later)
