@@ -25,7 +25,7 @@ from openai import OpenAI, RateLimitError, APITimeoutError, APIConnectionError
 
 from .models import InvoiceData
 from .invoice_warnings import append_warnings
-from .config import DEFAULT_OPENAI_MODEL, load_config, AppConfig
+from .config import DEFAULT_OPENAI_MODEL, load_config, AppConfig, model_supports_sampling_params
 from .date_helpers import parse_invoice_date, domysleni_chybejicich_datumu
 from charset_normalizer import from_path as cn_from_path
 
@@ -1023,10 +1023,11 @@ class CSVProcessor:
 				"model": model_name,
 				"messages": messages,
 				"response_format": response_format,
-				"temperature": float(getattr(cfg, "openai_temperature", 0.0)),
-				"top_p": float(getattr(cfg, "openai_top_p", 0.15)),
 				"timeout": getattr(cfg, 'openai_timeout_s', 30),
 			}
+			if model_supports_sampling_params(model_name):
+				request_kwargs["temperature"] = float(getattr(cfg, "openai_temperature", 0.0))
+				request_kwargs["top_p"] = float(getattr(cfg, "openai_top_p", 0.15))
 			token_param = "max_completion_tokens" if "gpt-5" in str(model_name) else "max_tokens"
 			request_kwargs[token_param] = max_out_tokens
 			if getattr(cfg, "openai_reasoning_effort", None) and "gpt-5" in str(model_name):

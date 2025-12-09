@@ -24,7 +24,7 @@ from openai import OpenAI, RateLimitError, APITimeoutError, APIConnectionError
 import pandas as pd
 
 from .models import InvoiceData, InvoiceItem, VATSummary, VATRate
-from .config import AppConfig, DEFAULT_OPENAI_MODEL, load_config, get_cache_dir
+from .config import AppConfig, DEFAULT_OPENAI_MODEL, load_config, get_cache_dir, model_supports_sampling_params
 from .invoice_processor import process_invoice_data
 from .date_helpers import DATE_FIELDS, DATE_FRIENDLY, domysleni_chybejicich_datumu
 from .invoice_warnings import get_warning
@@ -478,11 +478,12 @@ class InvoiceExtractor:
 				request_kwargs = {
 					"model": current_model,
 					"messages": messages,
-					"temperature": 0,
-					"top_p": self.top_p,
 					"response_format": response_format,
 					"timeout": self.timeout_s,
 				}
+				if model_supports_sampling_params(current_model):
+					request_kwargs["temperature"] = 0
+					request_kwargs["top_p"] = self.top_p
 				if self.reasoning_effort and "gpt-5" in str(current_model):
 					request_kwargs["reasoning_effort"] = self.reasoning_effort
 				request_kwargs[token_param] = min(128, self.max_tokens)
@@ -1086,11 +1087,12 @@ class InvoiceExtractor:
 				request_kwargs = {
 					"model": current_model,
 					"messages": messages,
-					"temperature": self.temperature,
-					"top_p": self.top_p,
 					"response_format": response_format,
 					"timeout": self.timeout_s,
 				}
+				if model_supports_sampling_params(current_model):
+					request_kwargs["temperature"] = self.temperature
+					request_kwargs["top_p"] = self.top_p
 				if self.reasoning_effort and "gpt-5" in str(current_model):
 					request_kwargs["reasoning_effort"] = self.reasoning_effort
 				request_kwargs[token_param] = current_max_tokens

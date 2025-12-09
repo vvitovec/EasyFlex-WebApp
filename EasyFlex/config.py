@@ -83,6 +83,15 @@ def _parse_date_order(value: Optional[str]) -> bool:
 	return True
 
 
+def model_supports_sampling_params(model_name: Optional[str]) -> bool:
+	"""Return True if the model allows custom sampling settings (temperature/top_p)."""
+	if not model_name:
+		return True
+	model_lower = str(model_name).lower()
+	# Reasoning models (o1/o3) currently force the default temperature/top_p
+	return not (model_lower.startswith("o1") or model_lower.startswith("o3"))
+
+
 @dataclass
 class AppConfig:
 	openai_api_key: Optional[str]
