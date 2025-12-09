@@ -568,24 +568,29 @@ def create_app() -> Flask:
 		users = User.query.order_by(User.username.asc()).all()
 		return render_template("users.html", users=users, message=message, error=error)
 
-	@app.before_first_request
-	def ensure_admin_user():
-		"""Create or update the admin user from EASYFLEX_ADMIN_PASSWORD."""
-		password = os.environ.get("EASYFLEX_ADMIN_PASSWORD")
-		if not password:
-			# Bez hesla v env neřešíme nic
-			return
+		def ensure_admin_user():
+			"""Create or update the admin user from EASYFLEX_ADMIN_PASSWORD."""
+			password = os.environ.get("EASYFLEX_ADMIN_PASSWORD")
+			if not password:
+				return
 
-		admin = User.query.filter_by(username="admin").first()
-		if admin is None:
-			admin = User(username="admin", is_admin=True)
-			admin.set_password(password)
-			db.session.add(admin)
-		else:
-			admin.is_admin = True
-			admin.set_password(password)
+			admin = User.query.filter_by(username="admin").first()
+			if admin is None:
+				admin = User(username="admin", is_admin=True)
+				admin.set_password(password)
+				db.session.add(admin)
+			else:
+				admin.is_admin = True
+				admin.set_password(password)
 
-		db.session.commit()
+			db.session.commit()
+
+		@app.before_request
+		def _run_admin_init_once():
+			# zajistí, že ensure_admin_user proběhne jen jednou na proces
+			if not app.config.get("_ADMIN_INITIALIZED", False):
+				ensure_admin_user()
+				app.config["_ADMIN_INITIALIZED"] = True
 
 	return app
 
