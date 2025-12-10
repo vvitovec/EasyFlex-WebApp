@@ -137,8 +137,25 @@ def _import_batch(batch: InvoiceBatch, cfg: Any, selected_ids: Optional[List[int
 			payload = InvoiceData.model_validate(inv_dict)
 		except Exception:
 			payload = inv_dict
+
+		# Pro import chceme používat stejný tvar jako desktop (plain dict) a mít jasno,
+		# jaká data o odběrateli posíláme.
 		try:
-			resp = import_to_abra(payload, cfg=cfg)
+			if isinstance(payload, InvoiceData):
+				payload_dict: Dict[str, Any] = payload.model_dump()
+			else:
+				payload_dict = dict(payload)
+		except Exception:
+			payload_dict = inv_dict
+
+		partner_preview = {
+			"odberatel_jmeno": payload_dict.get("odberatel_jmeno"),
+			"odberatel_ic": payload_dict.get("odberatel_ic"),
+			"odberatel_dic": payload_dict.get("odberatel_dic"),
+		}
+		logger.info("Import ABRA řádek %s – odběratel %s", row.row_index, partner_preview)
+		try:
+			resp = import_to_abra(payload_dict, cfg=cfg)
 			if resp is None:
 				raise RuntimeError("Import se nepodařil (zkontrolujte logy).")
 			row.status = "Importováno"
