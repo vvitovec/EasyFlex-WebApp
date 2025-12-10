@@ -8,7 +8,6 @@ from sqlalchemy.orm import joinedload
 
 from EasyFlex.date_helpers import domysleni_chybejicich_datumu
 from EasyFlex.invoice_warnings import get_warning, set_warning
-from EasyFlex.models import InvoiceData
 
 from .models import InvoiceBatch, InvoiceRow, User, db
 
@@ -73,25 +72,15 @@ COLUMN_LABELS: Dict[str, str] = {
 
 
 def _serialize_invoice(invoice: Any) -> dict:
-	"""Convert invoice-like object to normalized dict for templates/storage."""
+	"""Convert InvoiceData or dict-like to plain dict for templates/storage."""
 	if invoice is None:
 		return {}
-
-	# Normalize through InvoiceData to ensure we keep all buyer/supplier fields with stable keys
-	try:
-		normalized = InvoiceData.model_validate(invoice)
-	except Exception:
-		normalized = None
-	if normalized is not None:
-		try:
-			return normalized.model_dump()
-		except Exception:
-			return {}
-
-	# Fallbacks for unexpected inputs
 	if isinstance(invoice, dict):
+		return dict(invoice)
+	dump_func = getattr(invoice, "model_dump", None)
+	if callable(dump_func):
 		try:
-			return dict(invoice)
+			return dump_func()
 		except Exception:
 			return {}
 	try:

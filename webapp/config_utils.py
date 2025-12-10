@@ -43,9 +43,6 @@ def get_user_config() -> AppConfig:
 	cfg.openai_api_key = settings.openai_api_key or None
 	cfg.abra_server = settings.abra_server or None
 	cfg.abra_port = settings.abra_port if settings.abra_port is not None else None
-	# Použij uloženou firmu, pokud ji má uživatel nastavenou (jinak ponecháme hodnotu ze základní konfigurace)
-	if settings.abra_company:
-		cfg.abra_company = settings.abra_company
 	cfg.abra_username = settings.abra_username or None
 	cfg.abra_password = settings.abra_password or None
 	if settings.abra_verify_tls is not None:
