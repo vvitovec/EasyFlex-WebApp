@@ -40,15 +40,15 @@ def _make_config(**overrides) -> AppConfig:
 		abra_timeout_s=10,
 		abra_series_map=None,
 		abra_doc_endpoint="faktura-prijata",
-	abra_doc_type_code=None,
-	abra_partner_rel_code=None,
-	abra_verify_tls=True,
-	abra_use_kod=True,
-	abra_duplicate_kod_strategy="safe_update",
-	use_doc_number_as_variable_symbol=False,
-	infer_missing_dates=True,
-	enable_multi_invoice_segmentation=False,
-	csv_enable_llm_mapping=False,
+		abra_doc_type_code=None,
+		abra_partner_rel_code=None,
+		abra_verify_tls=True,
+		abra_use_kod=True,
+		abra_duplicate_kod_strategy="safe_update",
+		use_doc_number_as_variable_symbol=False,
+		infer_missing_dates=True,
+		enable_multi_invoice_segmentation=False,
+		csv_enable_llm_mapping=False,
 	)
 	for key, value in overrides.items():
 		setattr(cfg, key, value)
@@ -225,7 +225,9 @@ def test_import_to_abra_logs_ext_id_without_nameerror(monkeypatch, caplog) -> No
 	invoice = {"cislo_dokladu": "TEST-123", "odberatel_jmeno": "Test s.r.o."}
 	with caplog.at_level("INFO"):
 		result = import_to_abra(invoice, cfg)
-	assert result == {"id": "RID-1"}
+	assert isinstance(result, dict)
+	assert result.get("id") == "RID-1"
+	assert result.get("__status") == "created"
 	assert captured_payloads, "import_to_abra should send payload"
 	entry = captured_payloads[0]["winstrom"]["faktura-vydana"][0]
 	assert entry.get("kod") == "TEST-123"
@@ -310,3 +312,107 @@ def test_duplicate_kod_strategy_skip(monkeypatch) -> None:
 	result = import_to_abra(invoice, cfg)
 	assert isinstance(result, dict)
 	assert result.get("__status") == "skipped-duplicate"
+
+
+def test_payload_kod_changes_with_input() -> None:
+	cfg = _make_config(abra_doc_endpoint="faktura-vydana")
+	inv1 = {"cislo_dokladu": "KOD-1"}
+	inv2 = {"cislo_dokladu": "KOD-2"}
+	p1 = _build_invoice_payload(inv1, cfg, None, "faktura-vydana")
+	p2 = _build_invoice_payload(inv2, cfg, None, "faktura-vydana")
+	k1 = p1["winstrom"]["faktura-vydana"][0].get("kod")
+	k2 = p2["winstrom"]["faktura-vydana"][0].get("kod")
+	assert k1 != k2
+
+
+def test_foreign_skip_only_with_proof(monkeypatch) -> None:
+	class _DummyResponse:
+		def __init__(self, payload, status_code: int):
+			self._payload = payload
+			self.status_code = status_code
+			self.text = ""
+			self.headers = {}
+
+		def json(self):
+			return self._payload
+
+	def _fake_request(method, url, auth, timeout_s, json_body=None, verify=True):
+		if method == "GET" and url.endswith("/c.json"):
+			return _DummyResponse([{"ico": "1", "firma": "demo"}], 200)
+		if method == "GET" and "/faktura-vydana.json" in url:
+			return _DummyResponse({"winstrom": {"faktura-vydana": [{"id": "999"}]}}, 200)
+		if method == "GET" and "/faktura-vydana/999" in url:
+			return _DummyResponse({"winstrom": {"faktura-vydana": [{"id": "999", "externalIds": ["ext:other"]}]}}, 200)
+		if method == "POST":
+			err = {"winstrom": {"results": [{"errors": [{"messageCode": "dokladNeniUnikatniKod"}]}]}}
+			return _DummyResponse(err, 400)
+		return _DummyResponse({}, 200)
+
+	monkeypatch.setattr("EasyFlex.abra._request_with_retry", _fake_request)
+	cfg = _make_config(abra_doc_endpoint="faktura-vydana")
+	invoice = {"cislo_dokladu": "COLLIDE", "odberatel_jmeno": "Test s.r.o."}
+	result = import_to_abra(invoice, cfg)
+	assert isinstance(result, dict)
+	assert result.get("__status") == "skipped-duplicate-foreign"
+
+
+def test_no_false_foreign_when_search_empty(monkeypatch) -> None:
+	class _DummyResponse:
+		def __init__(self, payload, status_code: int):
+			self._payload = payload
+			self.status_code = status_code
+			self.text = ""
+			self.headers = {}
+
+		def json(self):
+			return self._payload
+
+	def _fake_request(method, url, auth, timeout_s, json_body=None, verify=True):
+		if method == "GET" and url.endswith("/c.json"):
+			return _DummyResponse([{"ico": "1", "firma": "demo"}], 200)
+		if method == "GET" and "/faktura-vydana.json" in url:
+			return _DummyResponse({"winstrom": {"faktura-vydana": []}}, 200)
+		if method == "POST":
+			err = {"winstrom": {"results": [{"errors": [{"messageCode": "dokladNeniUnikatniKod"}]}]}}
+			return _DummyResponse(err, 400)
+		return _DummyResponse({}, 200)
+
+	monkeypatch.setattr("EasyFlex.abra._request_with_retry", _fake_request)
+	cfg = _make_config(abra_doc_endpoint="faktura-vydana")
+	invoice = {"cislo_dokladu": "COLLIDE2", "odberatel_jmeno": "Test s.r.o."}
+	result = import_to_abra(invoice, cfg)
+	assert isinstance(result, dict)
+	assert result.get("__status") == "failed-duplicate-not-found"
+
+
+def test_unverifiable_extid_not_claimed_foreign(monkeypatch) -> None:
+	class _DummyResponse:
+		def __init__(self, payload, status_code: int):
+			self._payload = payload
+			self.status_code = status_code
+			self.text = ""
+			self.headers = {}
+
+		def json(self):
+			return self._payload
+
+	def _fake_request(method, url, auth, timeout_s, json_body=None, verify=True):
+		if method == "GET" and url.endswith("/c.json"):
+			return _DummyResponse([{"ico": "1", "firma": "demo"}], 200)
+		if method == "GET" and "/faktura-vydana.json" in url:
+			return _DummyResponse({"winstrom": {"faktura-vydana": [{"id": "500"}]}}, 200)
+		if method == "GET" and "/faktura-vydana/500" in url:
+			return _DummyResponse({"winstrom": {"faktura-vydana": [{"id": "500"}]}}, 200)  # no ext
+		if method == "GET" and "/faktura-vydana/ext%3A" in url:
+			return _DummyResponse({"winstrom": {"faktura-vydana": []}}, 404)
+		if method == "POST":
+			err = {"winstrom": {"results": [{"errors": [{"messageCode": "dokladNeniUnikatniKod"}]}]}}
+			return _DummyResponse(err, 400)
+		return _DummyResponse({}, 200)
+
+	monkeypatch.setattr("EasyFlex.abra._request_with_retry", _fake_request)
+	cfg = _make_config(abra_doc_endpoint="faktura-vydana")
+	invoice = {"cislo_dokladu": "COLLIDE3", "odberatel_jmeno": "Test s.r.o."}
+	result = import_to_abra(invoice, cfg)
+	assert isinstance(result, dict)
+	assert result.get("__status") == "failed-duplicate-unverifiable"

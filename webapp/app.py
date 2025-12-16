@@ -166,9 +166,27 @@ def _import_batch(batch: InvoiceBatch, cfg: Any, selected_ids: Optional[List[int
 				row.error = None
 				skipped += 1
 				continue
+			if isinstance(resp, dict) and resp.get("__status") == "failed-duplicate-not-found":
+				row.status = None
+				row.error = "Duplicitní kód – ABRA nenašla doklad podle kódu."
+				error += 1
+				continue
+			if isinstance(resp, dict) and resp.get("__status") == "failed-duplicate-unverifiable":
+				row.status = None
+				row.error = "Duplicitní kód – nelze ověřit ext-id, doklad neimportován."
+				error += 1
+				continue
+			if isinstance(resp, dict) and resp.get("__status") == "failed-duplicate-update":
+				row.status = None
+				row.error = "Duplicitní kód – update selhal."
+				error += 1
+				continue
 			if resp is None:
 				raise RuntimeError("Import se nepodařil (zkontrolujte logy).")
-			row.status = "Importováno" if not (isinstance(resp, dict) and resp.get("__status") == "updated") else "Importováno (aktualizováno)"
+			if isinstance(resp, dict) and resp.get("__status") == "updated":
+				row.status = "Importováno (aktualizováno)"
+			else:
+				row.status = "Importováno"
 			row.error = None
 			success += 1
 		except Exception as exc:  # noqa: BLE001

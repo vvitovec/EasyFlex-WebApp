@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, Tuple
 import re
 import unicodedata
 import hashlib
@@ -496,31 +496,30 @@ def _is_duplicate_kod_error(resp: requests.Response) -> bool:
 	return False
 
 
-def _find_invoice_id_by_kod(base_url: str, auth: tuple[str, str], timeout_s: int, company_code: str, doc_endpoint: str, kod: str, verify: bool) -> Optional[str]:
+def _find_invoice_id_by_kod(base_url: str, auth: tuple[str, str], timeout_s: int, company_code: str, doc_endpoint: str, kod: str, verify: bool) -> tuple[Optional[str], int, str]:
 	if not kod:
-		return None
-	filter_param = requests.utils.quote(f"kod eq '{kod}'")
+		return None, 0, ""
+	filter_param = requests.utils.quote(f"kod eq '{kod}'", safe="'")
 	url = f"{base_url}/c/{company_code}/{doc_endpoint}.json?limit=5&detail=custom:id,kod&filter={filter_param}"
 	try:
 		resp = _request_with_retry("GET", url, auth=auth, timeout_s=timeout_s, verify=verify)
 	except Exception as exc:
 		logger.warning("ABRA: nepodařilo se načíst kandidáty pro update (kod=%s): %s", kod, exc)
-		return None
+		return None, 0, url
 	if resp.status_code >= 400:
 		logger.warning("ABRA hledání dokladu podle kódu selhalo (%s): %s", resp.status_code, resp.text)
-		return None
+		return None, 0, url
 	try:
 		raw = resp.json()
 		items = _extract_winstrom_entries(raw, (doc_endpoint, "items", "data", "result"))
 		if not items:
-			return None
-		# Vracíme první id; detail se načte následně
-		entry = items[0]
+			return None, 0, url
+		entry = items[0] if isinstance(items[0], dict) else None
 		if isinstance(entry, dict):
-			return entry.get("id") or entry.get("@id")
+			return entry.get("id") or entry.get("@id"), len(items), url
 	except Exception as exc:
 		logger.warning("ABRA: nelze parsovat odpověď při hledání dokladu: %s", exc)
-	return None
+	return None, 0, url
 
 
 
@@ -888,12 +887,37 @@ def _get_invoice_detail(base_url: str, auth: tuple[str, str], timeout_s: int, co
 	return None
 
 
+def _get_invoice_by_ext(base_url: str, auth: tuple[str, str], timeout_s: int, company_code: str, doc_endpoint: str, ext_id: str, verify: bool) -> Optional[Dict[str, Any]]:
+	if not ext_id:
+		return None
+	ext_encoded = requests.utils.quote(ext_id, safe="")
+	url = f"{base_url}/c/{company_code}/{doc_endpoint}/{ext_encoded}.json?detail=full"
+	try:
+		resp = _request_with_retry("GET", url, auth=auth, timeout_s=timeout_s, verify=verify)
+	except Exception as exc:
+		logger.warning("ABRA: dotaz na doklad podle ext-id selhal: %s", exc)
+		return None
+	if resp.status_code >= 400:
+		return None
+	try:
+		raw = resp.json()
+		entries = _extract_winstrom_entries(raw, (doc_endpoint,))
+		if entries and isinstance(entries[0], dict):
+			return entries[0]
+	except Exception:
+		return None
+	return None
+
+
 def _compute_ext_id(faktura: Dict[str, Any], doc_endpoint: str) -> str:
 	"""Return stable ext identifier for invoice to make import idempotent."""
 	candidates = [
 		faktura.get("external_id"),
 		faktura.get("cislo_dokladu"),
 		faktura.get("variabilni_symbol"),
+		faktura.get("cisDokl"),
+		faktura.get("cisDosle"),
+		faktura.get("kod"),
 	]
 
 	def _sanitize(value: str) -> str:
@@ -946,7 +970,10 @@ def _build_invoice_payload(
 			internal_code = body.pop("cisDosle", None) or faktura_data.get("cislo_dokladu") or faktura_data.get("variabilni_symbol")
 		if cfg.abra_use_kod and internal_code:
 			body["kod"] = str(internal_code)
-		elif "kod" in body:
+		elif cfg.abra_use_kod and not internal_code:
+			logger.warning("ABRA: abra_use_kod=true, ale kod chybí – nebude odeslán.")
+			body.pop("kod", None)
+		else:
 			body.pop("kod", None)
 	# Rozhodování mezi původní a novou logikou podle instrukcí
 	if isinstance(faktura_data, InvoiceData) and should_use_items_logic(faktura_data):
@@ -1078,6 +1105,8 @@ def import_to_abra(faktura_data: Union[Dict[str, Any], InvoiceData], cfg: Option
 		logger.debug("ABRA payload faktura (repr): %s", payload)
 	ext_identifier = _extract_ext_identifier(payload, doc_endpoint)
 	kod_value = _extract_entry_value(payload, doc_endpoint, "kod")
+	typ_dokl = _extract_entry_value(payload, doc_endpoint, "typDokl")
+	logger.info("ABRA send doc=%s typ=%s ext_id=%s kod=%s", doc_endpoint, typ_dokl, ext_identifier, kod_value)
 
 	# Try POST first
 	url = f"{base_url}/c/{company_code}/{doc_endpoint}.json"
@@ -1085,9 +1114,10 @@ def import_to_abra(faktura_data: Union[Dict[str, Any], InvoiceData], cfg: Option
 	if resp.status_code in (200, 201):
 		data = resp.json()
 		logger.info("ABRA import OK ext=%s id=%s", ext_identifier, data.get("id"))
+		data["__status"] = "created"
 		return data
 	elif resp.status_code == 409 or _is_duplicate_kod_error(resp):
-		logger.warning("ABRA hlásí duplicitní kód dokladu (kod=%s, ext=%s)", kod_value, ext_identifier)
+		logger.warning("ABRA hlásí duplicitní kód dokladu (kod=%s, ext=%s) resp=%s", kod_value, ext_identifier, resp.text)
 		if cfg.abra_duplicate_kod_strategy == "skip":
 			logger.info("Strategie duplicate_kod=skip – doklad přeskočen.")
 			return {"__status": "skipped-duplicate", "kod": kod_value, "ext": ext_identifier}
@@ -1095,23 +1125,44 @@ def import_to_abra(faktura_data: Union[Dict[str, Any], InvoiceData], cfg: Option
 		if not kod_value:
 			logger.error("Safe update podle kódu nelze – kod chybí, doklad přeskočen.")
 			return {"__status": "skipped-duplicate", "kod": kod_value, "ext": ext_identifier}
-		target_id = _find_invoice_id_by_kod(base_url, auth, cfg.abra_timeout_s, company_code, doc_endpoint, kod_value, cfg.abra_verify_tls)
-		if target_id:
-			detail = _get_invoice_detail(base_url, auth, cfg.abra_timeout_s, company_code, doc_endpoint, str(target_id), cfg.abra_verify_tls)
-			detail_ext = _extract_ext_id_from_invoice_detail(detail or {})
-			if detail_ext and detail_ext == ext_identifier:
-				update_url = f"{base_url}/c/{company_code}/{doc_endpoint}/{target_id}.json"
-				resp2 = _request_with_retry("PUT", update_url, auth=auth, timeout_s=cfg.abra_timeout_s, json_body=payload, verify=cfg.abra_verify_tls)
-				if resp2.status_code in (200, 201):
-					data = resp2.json()
-					logger.info("ABRA update OK ext=%s id=%s", ext_identifier, data.get("id"))
-					return data
-				logger.error("ABRA update po duplicitě selhala (%s): %s", resp2.status_code, resp2.text)
-			else:
-				logger.warning("Kod=%s patří jiné faktuře (ext=%s), doklad přeskočen.", kod_value, detail_ext)
-		else:
-			logger.warning("Duplicitní kód, ale existující doklad nenalezen – doklad bude přeskočen.")
-		return {"__status": "skipped-duplicate-foreign", "kod": kod_value, "ext": ext_identifier}
+		target_id, count, search_url = _find_invoice_id_by_kod(base_url, auth, cfg.abra_timeout_s, company_code, doc_endpoint, kod_value, cfg.abra_verify_tls)
+		logger.info("Duplicate search kod=%s -> candidates=%s url=%s", kod_value, count, search_url)
+		if not target_id:
+			logger.error("ABRA tvrdí duplicitu, ale hledání kod=%s nenašlo doklad. Import ukončen pro tento řádek.", kod_value)
+			return {"__status": "failed-duplicate-not-found", "kod": kod_value, "ext": ext_identifier, "search_url": search_url}
+		detail = _get_invoice_detail(base_url, auth, cfg.abra_timeout_s, company_code, doc_endpoint, str(target_id), cfg.abra_verify_tls)
+		detail_ext = _extract_ext_id_from_invoice_detail(detail or {})
+		logger.info("Duplicate detail id=%s ext=%s", target_id, detail_ext)
+		if detail_ext and detail_ext == ext_identifier:
+			update_url = f"{base_url}/c/{company_code}/{doc_endpoint}/{target_id}.json"
+			resp2 = _request_with_retry("PUT", update_url, auth=auth, timeout_s=cfg.abra_timeout_s, json_body=payload, verify=cfg.abra_verify_tls)
+			if resp2.status_code in (200, 201):
+				data = resp2.json()
+				logger.info("ABRA update OK ext=%s id=%s", ext_identifier, data.get("id"))
+				data["__status"] = "updated"
+				return data
+			logger.error("ABRA update po duplicitě selhala (%s): %s", resp2.status_code, resp2.text)
+			return {"__status": "failed-duplicate-update", "kod": kod_value, "ext": ext_identifier, "id": target_id, "resp_status": resp2.status_code, "resp_text": resp2.text}
+		if detail_ext and detail_ext != ext_identifier:
+			logger.warning("Kod=%s patří jiné faktuře (ext=%s), doklad přeskočen.", kod_value, detail_ext)
+			return {"__status": "skipped-duplicate-foreign", "kod": kod_value, "ext": ext_identifier, "found_ext": detail_ext}
+
+		# detail_ext missing -> fallback check by ext-id directly
+		ext_detail = _get_invoice_by_ext(base_url, auth, cfg.abra_timeout_s, company_code, doc_endpoint, ext_identifier or "", cfg.abra_verify_tls)
+		ext_detail_id = ext_detail.get("id") if isinstance(ext_detail, dict) else None
+		if ext_detail_id:
+			update_url = f"{base_url}/c/{company_code}/{doc_endpoint}/{ext_detail_id}.json"
+			resp2 = _request_with_retry("PUT", update_url, auth=auth, timeout_s=cfg.abra_timeout_s, json_body=payload, verify=cfg.abra_verify_tls)
+			if resp2.status_code in (200, 201):
+				data = resp2.json()
+				logger.info("ABRA update OK dle ext-id ext=%s id=%s", ext_identifier, data.get("id"))
+				data["__status"] = "updated"
+				return data
+			logger.error("ABRA update dle ext-id selhala (%s): %s", resp2.status_code, resp2.text)
+			return {"__status": "failed-duplicate-update", "kod": kod_value, "ext": ext_identifier, "id": ext_detail_id, "resp_status": resp2.status_code, "resp_text": resp2.text}
+
+		logger.warning("Kod duplicita nelze ověřit ext-id (žádné ext v detailu), doklad neimportován.")
+		return {"__status": "failed-duplicate-unverifiable", "kod": kod_value, "ext": ext_identifier}
 	else:
 		logger.error("ABRA POST failed: %s %s", resp.status_code, resp.text)
 
