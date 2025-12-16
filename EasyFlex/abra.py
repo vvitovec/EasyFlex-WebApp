@@ -4,6 +4,7 @@ import os
 import time
 from typing import Any, Dict, Optional, Union
 import re
+import unicodedata
 
 import requests
 
@@ -76,6 +77,8 @@ def _normalize_country_reference(value: Optional[str]) -> Optional[str]:
 	if not value:
 		return None
 	val = str(value).strip()
+	if val.lower().startswith(("code:", "id:", "ext:")):
+		return val
 	# Common name → code mapping (can be extended)
 	name_to_code = {
 		"česká republika": "CZ",
@@ -180,6 +183,100 @@ def _split_address_components(address: Optional[str]) -> tuple[Optional[str], Op
 		street = re.sub(r"^(ULICE)\s*:\s*", "", street, flags=re.IGNORECASE).strip()
 
 	return street or None, psc or None, city or None
+
+
+def _normalize_company_name(value: Optional[str]) -> Optional[str]:
+	"""Normalize company name for matching (lowercase, stripped, remove diacritics and legal suffixes)."""
+	if not value:
+		return None
+	text = unicodedata.normalize("NFKD", str(value))
+	text = "".join(ch for ch in text if not unicodedata.combining(ch))
+	text = re.sub(r"[.,;/]", " ", text)
+	text = re.sub(
+		r"\b(spol\.?\s*s\.?\s*r\.?\s*o\.?|s\.?\s*r\.?\s*o\.?|sro|s r o|a\.?\s*s\.?|as|a\.?\s*s\.?)\b",
+		"",
+		text,
+		flags=re.IGNORECASE,
+	)
+	text = re.sub(r"\b(ltd|llc|gmbh)\b", "", text, flags=re.IGNORECASE)
+	text = re.sub(r"\s+", " ", text).strip().lower()
+	return text or None
+
+
+def _normalize_city(value: Optional[str]) -> Optional[str]:
+	if not value:
+		return None
+	text = unicodedata.normalize("NFKD", str(value))
+	text = "".join(ch for ch in text if not unicodedata.combining(ch))
+	text = re.sub(r"\s+", " ", text).strip().lower()
+	return text or None
+
+
+def _normalize_psc(value: Optional[str]) -> Optional[str]:
+	if not value:
+		return None
+	digits = "".join(ch for ch in str(value) if ch.isdigit())
+	if len(digits) >= 5:
+		return digits[:5]
+	if len(digits) == 4:  # tolerate missing leading zero in matching only
+		return digits
+	return None
+
+
+def _extract_buyer_details(faktura: Dict[str, Any]) -> Dict[str, Optional[str]]:
+	"""Extract and normalize buyer (odběratel) details from invoice data."""
+	customer_name = faktura.get("odberatel_jmeno")
+	match_name = customer_name or faktura.get("dodavatel_jmeno")
+
+	customer_address = faktura.get("odberatel_adresa")
+	match_address = customer_address or faktura.get("dodavatel_adresa")
+
+	customer_psc_field = faktura.get("odberatel_psc")
+	customer_city_field = faktura.get("odberatel_mesto")
+	match_psc_field = customer_psc_field or faktura.get("dodavatel_psc")
+	match_city_field = customer_city_field or faktura.get("dodavatel_mesto")
+
+	customer_state_raw = faktura.get("odberatel_stat")
+	match_state_raw = customer_state_raw or faktura.get("dodavatel_stat")
+
+	customer_ico_raw = faktura.get("odberatel_ic")
+	match_ico_raw = customer_ico_raw or faktura.get("dodavatel_ic")
+
+	customer_dic_raw = faktura.get("odberatel_dic")
+	match_dic_raw = customer_dic_raw or faktura.get("dodavatel_dic")
+
+	match_street, match_psc, match_city = _split_address_components(match_address)
+	customer_street, customer_psc, customer_city = _split_address_components(customer_address)
+	customer_street = customer_street or faktura.get("odberatel_ulice")
+	if customer_psc_field:
+		customer_psc = customer_psc_field
+	if customer_city_field:
+		customer_city = customer_city_field
+	if match_psc_field:
+		match_psc = match_psc or match_psc_field
+	if match_city_field:
+		match_city = match_city or match_city_field
+
+	return {
+		"name_raw": str(match_name).strip() if match_name else None,
+		"name_norm": _normalize_company_name(match_name),
+		"street": match_street or (faktura.get("odberatel_ulice") or None),
+		"psc_raw": match_psc or None,
+		"psc_norm": _normalize_psc(match_psc),
+		"city_raw": match_city or None,
+		"city_norm": _normalize_city(match_city),
+		"state": _normalize_country_reference(match_state_raw),
+		"ico": _normalize_ico(match_ico_raw),
+		"dic": _normalize_dic(match_dic_raw),
+		"customer_name": str(customer_name).strip() if customer_name else None,
+		"customer_street": customer_street or None,
+		"customer_psc": _normalize_psc(customer_psc),
+		"customer_city": customer_city or None,
+		"customer_city_norm": _normalize_city(customer_city),
+		"customer_state": _normalize_country_reference(customer_state_raw),
+		"customer_ico": _normalize_ico(customer_ico_raw),
+		"customer_dic": _normalize_dic(customer_dic_raw),
+	}
 
 
 def _infer_vat_code(faktura: Dict[str, Any]) -> str:
@@ -326,6 +423,8 @@ def _map_vat_rate_to_code(vat_rate: VATRate) -> str:
 
 
 def _request_with_retry(method: str, url: str, *, auth: tuple[str, str], timeout_s: int, json_body: Optional[Dict] = None, verify: bool = True) -> requests.Response:
+	if "/adresar" in url and method.upper() in {"POST", "PUT", "PATCH"}:
+		raise RuntimeError(f"ABRA guard: blokován {method} na /adresar ({url})")
 	retries = [0.5, 1.0, 2.0, 4.0]
 	last_exc: Optional[Exception] = None
 	for attempt, backoff in enumerate([0.0] + retries, start=1):
@@ -428,10 +527,6 @@ def _ensure_partner_ext_id(base_url: str, auth: tuple[str, str], timeout_s: int,
 	"""
 	# typVztahuK (partner_rel_code) se zde nepoužívá, protože adresář pouze čteme
 	_ = partner_rel_code
-	def _normalize_name(value: Optional[str]) -> Optional[str]:
-		if not value:
-			return None
-		return re.sub(r"\s+", " ", str(value)).strip().lower() or None
 
 	def _extract_partner_reference(entry: Dict[str, Any]) -> Optional[str]:
 		"""Pick usable reference (kod/zkratka/id) and prefix as code:/id: when needed."""
@@ -449,18 +544,20 @@ def _ensure_partner_ext_id(base_url: str, auth: tuple[str, str], timeout_s: int,
 				return ref if ref.startswith(("code:", "id:", "ext:")) else f"id:{ref}"
 		return None
 
-	# Prefer odběratel; pokud chybí, zkusíme dodavatele z faktury
-	nazev_raw = faktura.get("odberatel_jmeno") or faktura.get("dodavatel_jmeno")
-	ico = _normalize_ico(faktura.get("odberatel_ic") or faktura.get("dodavatel_ic"))
-	dic = _normalize_dic(faktura.get("odberatel_dic") or faktura.get("dodavatel_dic"))
-	nazev_norm = _normalize_name(nazev_raw)
+	buyer = _extract_buyer_details(faktura)
+	nazev_raw = buyer["name_raw"]
+	ico = buyer["ico"]
+	dic = buyer["dic"]
+	nazev_norm = buyer["name_norm"]
+	psc_norm = buyer["psc_norm"]
+	city_norm = buyer["city_norm"]
 
 	if not any((ico, dic, nazev_norm)):
 		logger.info("ABRA: faktura postrádá IČO/DIČ/název pro přiřazení firmy, import pokračuje bez vazby.")
 		return None
 
 	# Načti celý adresář s omezeným detailem a hledej lokálně shody
-	detail_fields = "id,kod,zkratka,nazev,ic,ico,dic"
+	detail_fields = "id,kod,zkratka,nazev,ic,ico,dic,psc,obec,mesto,ulice,stat,statK"
 	url = f"{base_url}/c/{company_code}/adresar.json?limit=0&detail=custom:{detail_fields}"
 	try:
 		resp = _request_with_retry("GET", url, auth=auth, timeout_s=timeout_s, verify=verify)
@@ -502,39 +599,200 @@ def _ensure_partner_ext_id(base_url: str, auth: tuple[str, str], timeout_s: int,
 			continue
 		entry_ico = _normalize_ico(entry.get("ic") or entry.get("ico"))
 		entry_dic = _normalize_dic(entry.get("dic"))
-		entry_name = _normalize_name(entry.get("nazev") or entry.get("firma") or entry.get("obchNazev") or entry.get("jmeno"))
-		candidates.append({"ref": ref, "ico": entry_ico, "dic": entry_dic, "name": entry_name})
+		entry_name = _normalize_company_name(entry.get("nazev") or entry.get("firma") or entry.get("obchNazev") or entry.get("jmeno"))
+		entry_psc = _normalize_psc(entry.get("psc"))
+		entry_city = _normalize_city(entry.get("obec") or entry.get("mesto") or entry.get("city"))
+		candidates.append({"ref": ref, "ico": entry_ico, "dic": entry_dic, "name": entry_name, "psc": entry_psc, "city": entry_city})
 
-	def _pick_by(predicate) -> Optional[str]:
-		for cand in candidates:
-			if predicate(cand):
-				return cand["ref"]
-		return None
+	def _score_candidate(cand: Dict[str, Optional[str]]) -> int:
+		score = 0
+		if ico and cand.get("ico") == ico:
+			score += 5
+		if dic and cand.get("dic") == dic:
+			score += 3
+		if nazev_norm and cand.get("name") == nazev_norm:
+			score += 2
+		if psc_norm and cand.get("psc") == psc_norm:
+			score += 2
+		if city_norm and cand.get("city") == city_norm:
+			score += 1
+		return score
 
-	# Priorita: shoda ICO+DIČ → IČO → DIČ → název
+	def _choose_best(cands: list[Dict[str, Optional[str]]], reason: str) -> Optional[str]:
+		if not cands:
+			return None
+		if len(cands) == 1:
+			return cands[0]["ref"]
+		scored = sorted(((_score_candidate(c), c) for c in cands), key=lambda t: t[0], reverse=True)
+		best_score, best = scored[0]
+		if len(scored) > 1 and best_score == scored[1][0]:
+			logger.warning("ABRA: více shod v adresáři pro %s, vybírám první: %s", reason, best["ref"])
+		else:
+			logger.info("ABRA: více shod v adresáři pro %s, vybrána nejlepší shoda: %s", reason, best["ref"])
+		return best["ref"]
+
+	# Priorita: shoda IČO/DIČ, pak IČO, DIČ, název s PSČ/městem
 	if ico and dic:
-		ref = _pick_by(lambda c: c["ico"] == ico and c["dic"] == dic)
-		if ref:
-			logger.info("ABRA: nalezena firma v adresáři dle IČO a DIČ: %s", ref)
-			return ref
+		ic_dic_matches = [c for c in candidates if c["ico"] == ico and c["dic"] == dic]
+		if ic_dic_matches:
+			ref = _choose_best(ic_dic_matches, "IČO+DIČ")
+			if ref:
+				logger.info("ABRA: nalezena firma v adresáři dle IČO a DIČ: %s", ref)
+				return ref
 	if ico:
-		ref = _pick_by(lambda c: c["ico"] == ico)
-		if ref:
-			logger.info("ABRA: nalezena firma v adresáři dle IČO: %s", ref)
-			return ref
+		ico_matches = [c for c in candidates if c["ico"] == ico]
+		if ico_matches:
+			ref = _choose_best(ico_matches, "IČO")
+			if ref:
+				logger.info("ABRA: nalezena firma v adresáři dle IČO: %s", ref)
+				return ref
 	if dic:
-		ref = _pick_by(lambda c: c["dic"] == dic)
-		if ref:
-			logger.info("ABRA: nalezena firma v adresáři dle DIČ: %s", ref)
-			return ref
+		dic_matches = [c for c in candidates if c["dic"] == dic]
+		if dic_matches:
+			ref = _choose_best(dic_matches, "DIČ")
+			if ref:
+				logger.info("ABRA: nalezena firma v adresáři dle DIČ: %s", ref)
+				return ref
 	if nazev_norm:
-		ref = _pick_by(lambda c: c["name"] == nazev_norm)
-		if ref:
-			logger.info("ABRA: nalezena firma v adresáři dle názvu: %s", ref)
-			return ref
+		name_matches = [c for c in candidates if c["name"] == nazev_norm]
+		if psc_norm:
+			psc_matches = [c for c in name_matches if c["psc"] == psc_norm]
+			if psc_matches:
+				name_matches = psc_matches
+		if city_norm and name_matches:
+			city_matches = [c for c in name_matches if c["city"] == city_norm]
+			if city_matches:
+				name_matches = city_matches
+		if name_matches:
+			ref = _choose_best(name_matches, "název/PSČ")
+			if ref:
+				logger.info("ABRA: nalezena firma v adresáři dle názvu%s: %s", " a PSČ" if psc_norm else "", ref)
+				return ref
 
-	logger.info("ABRA: žádná shoda v adresáři (ico=%s, dic=%s, nazev=%s). Import pokračuje bez vazby na firmu.", ico, dic, nazev_raw)
+	logger.info(
+		"ABRA: žádná shoda v adresáři (ico=%s, dic=%s, nazev=%s, psc=%s, mesto=%s). Import pokračuje bez vazby na firmu.",
+		ico,
+		dic,
+		nazev_raw,
+		psc_norm,
+		city_norm,
+	)
 	return None
+
+
+def _prepare_buyer_section(faktura: Dict[str, Any], partner_ref: Optional[str]) -> Dict[str, Any]:
+	"""Return ABRA payload fields for buyer snapshot and optional firma reference."""
+	buyer = _extract_buyer_details(faktura)
+	body: Dict[str, Any] = {}
+
+	name_for_payload = buyer.get("customer_name") or buyer.get("name_raw")
+	street = buyer.get("customer_street") or buyer.get("street")
+	psc_value = buyer.get("customer_psc") or buyer.get("psc_norm")
+	city_value = buyer.get("customer_city") or buyer.get("city_raw")
+	state_value = buyer.get("customer_state") or buyer.get("state")
+	ico_value = buyer.get("customer_ico") or buyer.get("ico")
+	dic_value = buyer.get("customer_dic") or buyer.get("dic")
+
+	def _set_if_present(key: str, value: Optional[str]) -> None:
+		if value:
+			body[key] = value
+
+	if partner_ref:
+		body["firma"] = partner_ref
+		logger.info("ABRA: faktura bude navázána na existující adresář: %s", partner_ref)
+	else:
+		logger.info("ABRA: faktura bude importována bez vazby na adresář (firma).")
+
+	_set_if_present("nazFirmy", name_for_payload)
+	_set_if_present("ulice", street)
+	_set_if_present("psc", psc_value)
+	_set_if_present("mesto", city_value)
+	_set_if_present("stat", state_value)
+	_set_if_present("ic", ico_value)
+	_set_if_present("dic", dic_value)
+	return body
+
+
+def _validate_winstrom_payload(payload: Dict[str, Any], *, partner_ref: Optional[str]) -> None:
+	"""Fail fast when payload violates safety invariants."""
+	def _walk(obj: Any, path: str = "") -> None:
+		if isinstance(obj, dict):
+			for k, v in obj.items():
+				key_path = f"{path}.{k}" if path else k
+				if k.lower().endswith("if-not-found") and str(v).lower() == "create":
+					raise ValueError(f"Zakázaná kombinace if-not-found (create) v payloadu ({key_path})")
+				_walk(v, key_path)
+		elif isinstance(obj, list):
+			for idx, item in enumerate(obj):
+				_walk(item, f"{path}[{idx}]")
+
+	_walk(payload)
+
+	winstrom = payload.get("winstrom") if isinstance(payload, dict) else None
+	if not isinstance(winstrom, dict):
+		return
+	doc_entries = None
+	for val in winstrom.values():
+		if isinstance(val, list):
+			doc_entries = val
+			break
+	if not doc_entries:
+		return
+
+	for entry in doc_entries:
+		if not isinstance(entry, dict):
+			continue
+		has_firma = "firma" in entry
+		if partner_ref:
+			if not has_firma:
+				raise ValueError("Očekáváme vazbu na existující firmu, ale payload neobsahuje klíč 'firma'.")
+		else:
+			if has_firma:
+				raise ValueError("Bez shody v adresáři nesmí být v payloadu klíč 'firma'.")
+			for key in ("nazFirmy", "ulice", "mesto", "psc", "stat", "ic", "dic"):
+				if key in entry and (entry[key] is None or entry[key] == ""):
+					raise ValueError(f"Payload obsahuje prázdnou hodnotu pro {key}.")
+
+
+def _build_invoice_payload(
+	faktura_data: Union[Dict[str, Any], InvoiceData],
+	cfg: AppConfig,
+	partner_ref: Optional[str],
+	doc_endpoint: str,
+) -> Dict[str, Any]:
+	"""Assemble winstrom payload for faktura with guardrails."""
+	# Convert InvoiceData to dict for compatibility with existing functions
+	if isinstance(faktura_data, InvoiceData):
+		faktura_dict = faktura_data.model_dump()
+	else:
+		faktura_dict = faktura_data
+
+	body = _map_invoice_json(faktura_data, cfg.abra_series_map, cfg)
+	# Set typDokl as coded value string expected by FlexiBee
+	if cfg.abra_doc_type_code:
+		body["typDokl"] = f"code:{cfg.abra_doc_type_code}"
+	else:
+		# Defaults: issued invoice → FAKTURA, received invoice → FAKTP
+		body["typDokl"] = "code:FAKTURA" if doc_endpoint == "faktura-vydana" else "code:FAKTP"
+	# For issued invoices, ABRA requires internal code 'kod'
+	if doc_endpoint == "faktura-vydana":
+		if isinstance(faktura_data, InvoiceData):
+			internal_code = body.pop("cisDosle", None) or faktura_data.cislo_dokladu or faktura_data.variabilni_symbol or f"AI-{int(time.time())}"
+		else:
+			internal_code = body.pop("cisDosle", None) or faktura_data.get("cislo_dokladu") or faktura_data.get("variabilni_symbol") or f"AI-{int(time.time())}"
+		body["kod"] = str(internal_code)
+	# Rozhodování mezi původní a novou logikou podle instrukcí
+	if isinstance(faktura_data, InvoiceData) and should_use_items_logic(faktura_data):
+		logger.info("Používám novou logiku s položkami pro ABRA export")
+		body["polozkyDokladu"] = _build_positions_from_items(faktura_data)
+	else:
+		logger.info("Používám původní logiku pro ABRA export")
+		body["polozkyDokladu"] = _build_positions_from_totals(faktura_dict)
+
+	body.update(_prepare_buyer_section(faktura_dict, partner_ref))
+	payload = _wrap_winstrom(doc_endpoint, body)
+	_validate_winstrom_payload(payload, partner_ref=partner_ref)
+	return payload
 
 
 def _map_invoice_json(faktura: Union[Dict[str, Any], InvoiceData], series_map: Optional[str], cfg: AppConfig) -> Dict[str, Any]:
@@ -641,49 +899,16 @@ def import_to_abra(faktura_data: Union[Dict[str, Any], InvoiceData], cfg: Option
 	if probe_resp.status_code >= 400:
 		logger.warning("ABRA probe failed (%s): %s", probe_resp.status_code, probe_resp.text)
 
-	# Convert InvoiceData to dict for compatibility with existing functions
-	if isinstance(faktura_data, InvoiceData):
-		faktura_dict = faktura_data.model_dump()
-	else:
-		faktura_dict = faktura_data
-	
 	# Resolve company code used in path
-	company_code = _ensure_company_id(base_url, auth, cfg.abra_timeout_s, cfg.abra_verify_tls, cfg.abra_company, faktura_dict)
+	company_code = _ensure_company_id(base_url, auth, cfg.abra_timeout_s, cfg.abra_verify_tls, cfg.abra_company, faktura_data if isinstance(faktura_data, dict) else faktura_data.model_dump())
 	# Best-effort lookup of buyer (odběratel) in ABRA adresář (bez vytváření nových)
-	partner_ref = _ensure_partner_ext_id(base_url, auth, cfg.abra_timeout_s, company_code, faktura_dict, cfg.abra_verify_tls, cfg.abra_partner_rel_code)
+	partner_ref = _ensure_partner_ext_id(base_url, auth, cfg.abra_timeout_s, company_code, faktura_data if isinstance(faktura_data, dict) else faktura_data.model_dump(), cfg.abra_verify_tls, cfg.abra_partner_rel_code)
 
-	# Build invoice payload
-	body = _map_invoice_json(faktura_data, cfg.abra_series_map, cfg)
-	# Set typDokl as coded value string expected by FlexiBee
-	if cfg.abra_doc_type_code:
-		body["typDokl"] = f"code:{cfg.abra_doc_type_code}"
-	else:
-		# Defaults: issued invoice → FAKTURA, received invoice → FAKTP
-		body["typDokl"] = "code:FAKTURA" if doc_endpoint == "faktura-vydana" else "code:FAKTP"
-	# For issued invoices, ABRA requires internal code 'kod'
-	if doc_endpoint == "faktura-vydana":
-		if isinstance(faktura_data, InvoiceData):
-			internal_code = body.pop("cisDosle", None) or faktura_data.cislo_dokladu or faktura_data.variabilni_symbol or f"AI-{int(time.time())}"
-		else:
-			internal_code = body.pop("cisDosle", None) or faktura_data.get("cislo_dokladu") or faktura_data.get("variabilni_symbol") or f"AI-{int(time.time())}"
-		body["kod"] = str(internal_code)
-	# Rozhodování mezi původní a novou logikou podle instrukcí
-	if isinstance(faktura_data, InvoiceData) and should_use_items_logic(faktura_data):
-		# Nová logika: export po řádcích se správně přiřazenou sazbou DPH
-		logger.info("Používám novou logiku s položkami pro ABRA export")
-		body["polozkyDokladu"] = _build_positions_from_items(faktura_data)
-	else:
-		# Původní logika: souhrnný export beze změn
-		logger.info("Používám původní logiku pro ABRA export")
-		# Pozn.: předáváme dict, nikoliv InvoiceData
-		body["polozkyDokladu"] = _build_positions_from_totals(faktura_dict)
-	# Link partner (odběratel) by external-id reference in buyer field when found
-	# FlexiBee supports 'ext:' references directly on foreign keys
-	if partner_ref:
-		body["firma"] = partner_ref
-	else:
-		logger.info("ABRA: faktura bude importována bez vazby na adresář (firma).")
-	payload = _wrap_winstrom(doc_endpoint, body)
+	payload = _build_invoice_payload(faktura_data, cfg, partner_ref, doc_endpoint)
+	try:
+		logger.debug("ABRA payload faktura: %s", json.dumps(payload, ensure_ascii=False))
+	except Exception:
+		logger.debug("ABRA payload faktura (repr): %s", payload)
 
 	# Try POST first
 	url = f"{base_url}/c/{company_code}/{doc_endpoint}.json"

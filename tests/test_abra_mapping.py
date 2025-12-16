@@ -1,4 +1,12 @@
-from EasyFlex.abra import _map_invoice_json
+import pytest
+
+from EasyFlex.abra import (
+	_build_invoice_payload,
+	_ensure_partner_ext_id,
+	_map_invoice_json,
+	_prepare_buyer_section,
+	_request_with_retry,
+)
 from EasyFlex.config import AppConfig
 
 
@@ -58,3 +66,127 @@ def test_map_invoice_json_infers_due_date_and_warnings() -> None:
 	assert body["datVyst"] == "2024-05-01"
 	assert body["datSplat"] == "2024-05-01"
 	assert "podkladUpozorneni" not in body
+
+
+class _DummyResponse:
+	def __init__(self, payload, status_code: int = 200):
+		self._payload = payload
+		self.status_code = status_code
+		self.text = ""
+		self.headers = {}
+
+	def json(self):
+		return self._payload
+
+
+def _stub_adresar(monkeypatch, payload, status_code: int = 200) -> None:
+	def _fake_request(method, url, auth, timeout_s, json_body=None, verify=True):
+		return _DummyResponse(payload, status_code)
+	monkeypatch.setattr("EasyFlex.abra._request_with_retry", _fake_request)
+
+
+def test_prepare_buyer_payload_sets_firma_when_partner_found(monkeypatch) -> None:
+	adresar_payload = {
+		"winstrom": {
+			"adresar": [
+				{"kod": "C001", "ic": "12345678", "dic": "CZ12345678", "nazev": "ACME s.r.o.", "psc": "11000", "mesto": "Praha"}
+			]
+		}
+	}
+	_stub_adresar(monkeypatch, adresar_payload)
+	invoice = {
+		"odberatel_jmeno": "ACME s.r.o.",
+		"odberatel_ic": "12345678",
+		"odberatel_dic": "CZ12345678",
+		"odberatel_adresa": "Hlavní 99, 110 00 Praha",
+		"odberatel_stat": "CZ",
+	}
+	ref = _ensure_partner_ext_id("https://server", ("u", "p"), 10, "demo", invoice, True, None)
+	assert ref == "code:C001"
+	buyer_payload = _prepare_buyer_section(invoice, ref)
+	assert buyer_payload["firma"] == "code:C001"
+	assert buyer_payload["nazFirmy"] == "ACME s.r.o."
+	assert buyer_payload["psc"] == "11000"
+	assert buyer_payload["mesto"].lower().startswith("praha")
+	assert buyer_payload["ic"] == "12345678"
+	assert buyer_payload["dic"] == "CZ12345678"
+	assert buyer_payload["stat"] == "code:CZ"
+
+
+def test_prepare_buyer_payload_without_partner_includes_snapshot_only() -> None:
+	invoice = {
+		"odberatel_jmeno": "Bez shody s.r.o.",
+		"odberatel_ic": "87654321",
+		"odberatel_dic": "SK1234567890",
+		"odberatel_adresa": "Testovací 1, 120 00 Praha",
+		"odberatel_stat": "Slovensko",
+	}
+	buyer_payload = _prepare_buyer_section(invoice, None)
+	assert "firma" not in buyer_payload
+	assert buyer_payload["nazFirmy"] == "Bez shody s.r.o."
+	assert buyer_payload["ulice"].startswith("Testovací")
+	assert buyer_payload["psc"] == "12000"
+	assert buyer_payload["mesto"].lower().startswith("praha")
+	assert buyer_payload["ic"] == "87654321"
+	assert buyer_payload["dic"] == "SK1234567890"
+	assert buyer_payload["stat"] == "code:SK"
+
+
+def test_resolve_partner_by_dic(monkeypatch) -> None:
+	adresar_payload = {"winstrom": {"adresar": [{"kod": "DIC1", "dic": "CZ111", "nazev": "Foo"}]}}
+	_stub_adresar(monkeypatch, adresar_payload)
+	invoice = {"odberatel_dic": "CZ111", "odberatel_jmeno": "Foo"}
+	ref = _ensure_partner_ext_id("https://server", ("u", "p"), 10, "demo", invoice, True, None)
+	assert ref == "code:DIC1"
+
+
+def test_resolve_partner_by_name_and_psc(monkeypatch) -> None:
+	adresar_payload = {
+		"winstrom": {
+			"adresar": [
+				{"kod": "A1", "nazev": "Novak s.r.o.", "psc": "12000", "mesto": "Praha"},
+				{"kod": "A2", "nazev": "Novak s.r.o.", "psc": "99999", "mesto": "Brno"},
+			]
+		}
+	}
+	_stub_adresar(monkeypatch, adresar_payload)
+	invoice = {
+		"odberatel_jmeno": "Novák s.r.o.",
+		"odberatel_adresa": "Hlavní 5, 120 00 Praha",
+	}
+	ref = _ensure_partner_ext_id("https://server", ("u", "p"), 10, "demo", invoice, True, None)
+	assert ref == "code:A1"
+
+
+def test_build_payload_no_match_has_snapshot_and_no_firma() -> None:
+	cfg = _make_config(abra_doc_endpoint="faktura-vydana")
+	invoice = {
+		"odberatel_jmeno": "Bez shody s.r.o.",
+		"odberatel_ic": "87654321",
+		"odberatel_dic": "SK1234567890",
+		"odberatel_adresa": "Testovací 1, 120 00 Praha",
+		"odberatel_stat": "Slovensko",
+		"cislo_dokladu": "X1",
+	}
+	payload = _build_invoice_payload(invoice, cfg, None, "faktura-vydana")
+	entry = payload["winstrom"]["faktura-vydana"][0]
+	assert "firma" not in entry
+	for key in ("nazFirmy", "ulice", "mesto", "psc", "ic", "dic"):
+		assert entry.get(key)
+
+
+def test_build_payload_match_includes_firma(monkeypatch) -> None:
+	adresar_payload = {"winstrom": {"adresar": [{"kod": "HIT", "ic": "555", "nazev": "Match"}]}}
+	_stub_adresar(monkeypatch, adresar_payload)
+	cfg = _make_config(abra_doc_endpoint="faktura-vydana")
+	invoice = {"odberatel_ic": "555", "odberatel_jmeno": "Match", "cislo_dokladu": "Y1"}
+	ref = _ensure_partner_ext_id("https://server", ("u", "p"), 10, "demo", invoice, True, None)
+	payload = _build_invoice_payload(invoice, cfg, ref, "faktura-vydana")
+	entry = payload["winstrom"]["faktura-vydana"][0]
+	assert entry["firma"] == "code:HIT"
+	assert entry["nazFirmy"] == "Match"
+
+
+def test_request_guard_blocks_adresar_write() -> None:
+	with pytest.raises(RuntimeError):
+		_request_with_retry("POST", "https://server/c/demo/adresar.json", auth=("u", "p"), timeout_s=1, verify=False)
