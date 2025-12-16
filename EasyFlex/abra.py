@@ -754,6 +754,20 @@ def _validate_winstrom_payload(payload: Dict[str, Any], *, partner_ref: Optional
 					raise ValueError(f"Payload obsahuje prázdnou hodnotu pro {key}.")
 
 
+def _extract_ext_identifier(payload: Dict[str, Any], doc_endpoint: str) -> Optional[str]:
+	try:
+		winstrom = payload.get("winstrom", {})
+		entries = winstrom.get(doc_endpoint)
+		if not isinstance(entries, list) or not entries:
+			return None
+		first = entries[0] if isinstance(entries[0], dict) else None
+		if not isinstance(first, dict):
+			return None
+		return first.get("cisDosle") or first.get("kod") or first.get("varSym")
+	except Exception:
+		return None
+
+
 def _build_invoice_payload(
 	faktura_data: Union[Dict[str, Any], InvoiceData],
 	cfg: AppConfig,
@@ -909,20 +923,21 @@ def import_to_abra(faktura_data: Union[Dict[str, Any], InvoiceData], cfg: Option
 		logger.debug("ABRA payload faktura: %s", json.dumps(payload, ensure_ascii=False))
 	except Exception:
 		logger.debug("ABRA payload faktura (repr): %s", payload)
+	ext_identifier = _extract_ext_identifier(payload, doc_endpoint)
 
 	# Try POST first
 	url = f"{base_url}/c/{company_code}/{doc_endpoint}.json"
 	resp = _request_with_retry("POST", url, auth=auth, timeout_s=cfg.abra_timeout_s, json_body=payload, verify=cfg.abra_verify_tls)
 	if resp.status_code in (200, 201):
 		data = resp.json()
-		logger.info("ABRA import OK ext=%s id=%s", body.get("cisDosle"), data.get("id"))
+		logger.info("ABRA import OK ext=%s id=%s", ext_identifier, data.get("id"))
 		return data
 	elif resp.status_code == 409:
 		# Conflict: try PUT (update)
 		resp2 = _request_with_retry("PUT", url, auth=auth, timeout_s=cfg.abra_timeout_s, json_body=payload, verify=cfg.abra_verify_tls)
 		if resp2.status_code in (200, 201):
 			data = resp2.json()
-			logger.info("ABRA update OK ext=%s id=%s", body.get("cisDosle"), data.get("id"))
+			logger.info("ABRA update OK ext=%s id=%s", ext_identifier, data.get("id"))
 			return data
 		logger.error("ABRA PUT failed: %s %s", resp2.status_code, resp2.text)
 	else:
@@ -932,7 +947,7 @@ def import_to_abra(faktura_data: Union[Dict[str, Any], InvoiceData], cfg: Option
 	# Write errors to a user-writable location
 	_err_dir = get_errors_dir()
 	_err_dir.mkdir(parents=True, exist_ok=True)
-	error_id = body.get('cisDosle') or 'unknown'
+	error_id = ext_identifier or 'unknown'
 	with open(os.path.join(_err_dir, f"abra_error_{error_id}.json"), "w", encoding="utf-8") as f:
 		json.dump({"request": payload, "response_status": resp.status_code, "response_text": resp.text}, f, ensure_ascii=False, indent=2)
 	return None

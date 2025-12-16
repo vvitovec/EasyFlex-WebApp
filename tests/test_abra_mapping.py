@@ -6,6 +6,7 @@ from EasyFlex.abra import (
 	_map_invoice_json,
 	_prepare_buyer_section,
 	_request_with_retry,
+	import_to_abra,
 )
 from EasyFlex.config import AppConfig
 
@@ -190,3 +191,40 @@ def test_build_payload_match_includes_firma(monkeypatch) -> None:
 def test_request_guard_blocks_adresar_write() -> None:
 	with pytest.raises(RuntimeError):
 		_request_with_retry("POST", "https://server/c/demo/adresar.json", auth=("u", "p"), timeout_s=1, verify=False)
+
+
+def test_import_to_abra_logs_ext_id_without_nameerror(monkeypatch, caplog) -> None:
+	captured_payloads = []
+
+	class _DummyResponse:
+		def __init__(self, payload, status_code: int = 200):
+			self._payload = payload
+			self.status_code = status_code
+			self.text = ""
+			self.headers = {}
+
+		def json(self):
+			return self._payload
+
+	def _fake_request(method, url, auth, timeout_s, json_body=None, verify=True):
+		# Probe and company/adresar GETs return empty OK
+		if method == "GET":
+			return _DummyResponse({}, 200)
+		if method == "POST":
+			captured_payloads.append(json_body)
+			return _DummyResponse({"id": "RID-1"}, 200)
+		raise RuntimeError(f"Unexpected method {method}")
+
+	monkeypatch.setattr("EasyFlex.abra._request_with_retry", _fake_request)
+	monkeypatch.setattr("EasyFlex.abra._ensure_company_id", lambda *args, **kwargs: "demo")
+	monkeypatch.setattr("EasyFlex.abra._ensure_partner_ext_id", lambda *args, **kwargs: "code:XYZ")
+
+	cfg = _make_config(abra_doc_endpoint="faktura-vydana")
+	invoice = {"cislo_dokladu": "TEST-123", "odberatel_jmeno": "Test s.r.o."}
+	with caplog.at_level("INFO"):
+		result = import_to_abra(invoice, cfg)
+	assert result == {"id": "RID-1"}
+	assert captured_payloads, "import_to_abra should send payload"
+	entry = captured_payloads[0]["winstrom"]["faktura-vydana"][0]
+	assert entry.get("kod") == "TEST-123"
+	assert entry.get("firma") == "code:XYZ"
