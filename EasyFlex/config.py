@@ -50,6 +50,8 @@ _CONFIG_ENV_KEYS: Tuple[str, ...] = (
 	"ABRA_DOC_TYPE_CODE",
 	"ABRA_PARTNER_REL_CODE",
 	"ABRA_VERIFY_TLS",
+	"ABRA_USE_KOD",
+	"ABRA_DUPLICATE_KOD_STRATEGY",
 	"EXTRACTION_DATE_ORDER",
 	"CSV_ENABLE_LLM_MAPPING",
 )
@@ -127,6 +129,8 @@ class AppConfig:
 	abra_doc_type_code: Optional[str]
 	abra_partner_rel_code: Optional[str]
 	abra_verify_tls: bool
+	abra_use_kod: bool
+	abra_duplicate_kod_strategy: str
 	# Extraction options
 	use_doc_number_as_variable_symbol: bool
 	infer_missing_dates: bool
@@ -562,6 +566,18 @@ def _load_config_uncached() -> AppConfig:
 		or os.getenv("ABRA_DOC_TYPE_CODE")
 	)
 	abra_partner_rel_code = os.getenv("ABRA_PARTNER_REL_CODE")
+	abra_use_kod = (
+		(cp.get("abra", "use_kod", fallback="true").lower() == "true" if cp.has_section("abra") else True)
+		if os.getenv("ABRA_USE_KOD") is None
+		else os.getenv("ABRA_USE_KOD", "true").lower() == "true"
+	)
+	abra_duplicate_kod_strategy = (
+		(cp.get("abra", "duplicate_kod_strategy", fallback=None) if cp.has_section("abra") else None)
+		or os.getenv("ABRA_DUPLICATE_KOD_STRATEGY")
+		or "safe_update"
+	).strip().lower()
+	if abra_duplicate_kod_strategy not in {"safe_update", "skip"}:
+		abra_duplicate_kod_strategy = "safe_update"
 	abra_verify_tls = True
 	if cp.has_section("abra"):
 		abra_verify_tls = cp.get("abra", "verify_tls", fallback="true").lower() == "true"
@@ -628,6 +644,8 @@ def _load_config_uncached() -> AppConfig:
 		abra_doc_type_code=abra_doc_type_code,
 		abra_partner_rel_code=abra_partner_rel_code,
 		abra_verify_tls=abra_verify_tls,
+		abra_use_kod=abra_use_kod,
+		abra_duplicate_kod_strategy=abra_duplicate_kod_strategy,
 		use_doc_number_as_variable_symbol=use_doc_number_as_variable_symbol,
 		infer_missing_dates=infer_missing_dates,
 		enable_multi_invoice_segmentation=enable_multi_invoice_segmentation,

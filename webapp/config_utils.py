@@ -84,6 +84,8 @@ def get_user_config() -> AppConfig:
 	_apply_override("date_day_first", _as_bool)
 	_apply_override("abra_doc_endpoint", str)
 	_apply_override("abra_doc_type_code", str)
+	_apply_override("abra_use_kod", _as_bool)
+	_apply_override("abra_duplicate_kod_strategy", str)
 	# Store optional convenience values that are not part of AppConfig
 	if "auto_import" in overrides:
 		try:

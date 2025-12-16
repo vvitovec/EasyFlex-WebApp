@@ -156,9 +156,19 @@ def _import_batch(batch: InvoiceBatch, cfg: Any, selected_ids: Optional[List[int
 		logger.info("Import ABRA řádek %s – odběratel %s", row.row_index, partner_preview)
 		try:
 			resp = import_to_abra(payload_dict, cfg=cfg)
+			if isinstance(resp, dict) and resp.get("__status") == "skipped-duplicate":
+				row.status = "Přeskočeno (duplicitní kód)"
+				row.error = None
+				skipped += 1
+				continue
+			if isinstance(resp, dict) and resp.get("__status") == "skipped-duplicate-foreign":
+				row.status = "Přeskočeno (kód patří jinému dokladu)"
+				row.error = None
+				skipped += 1
+				continue
 			if resp is None:
 				raise RuntimeError("Import se nepodařil (zkontrolujte logy).")
-			row.status = "Importováno"
+			row.status = "Importováno" if not (isinstance(resp, dict) and resp.get("__status") == "updated") else "Importováno (aktualizováno)"
 			row.error = None
 			success += 1
 		except Exception as exc:  # noqa: BLE001

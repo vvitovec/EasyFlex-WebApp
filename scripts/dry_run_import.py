@@ -49,6 +49,8 @@ def _make_config(doc_endpoint: str = "faktura-vydana") -> AppConfig:
 		abra_doc_type_code=None,
 		abra_partner_rel_code=None,
 		abra_verify_tls=True,
+		abra_use_kod=True,
+		abra_duplicate_kod_strategy="update",
 		use_doc_number_as_variable_symbol=False,
 		infer_missing_dates=True,
 		enable_multi_invoice_segmentation=False,
@@ -90,6 +92,12 @@ def main() -> None:
 	}
 	no_match_payload = _build_invoice_payload(no_match_invoice, cfg, None, cfg.abra_doc_endpoint or "faktura-vydana")
 	_print_payload("Payload – bez shody (firma neodeslána)", no_match_payload)
+
+	# Varianta bez posílání 'kod' (pokud nechceme ABRA kód)
+	cfg_no_kod = _make_config()
+	cfg_no_kod.abra_use_kod = False
+	no_kod_payload = _build_invoice_payload(match_invoice, cfg_no_kod, "code:DEMO", cfg_no_kod.abra_doc_endpoint or "faktura-vydana")
+	_print_payload("Payload – shoda bez 'kod' (abra_use_kod=false)", no_kod_payload)
 
 
 if __name__ == "__main__":
