@@ -1,0 +1,11 @@
+{
+  "cislo_dokladu": "id",
+  "odberatel_jmeno": "company",
+  "variabilni_symbol": "reference",
+  "celkova_cena": "total_amount",
+  "datum_vystaveni": "created_at",
+  "psc": "postal_code",
+  "odberatel_dic": "vat",
+  "odberatel_ic": "company_id",
+  "mesto": "city"
+}

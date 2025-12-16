@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 import pandas as pd
 from zipfile import ZipFile
 
@@ -158,6 +160,160 @@ def test_column_mapping_handles_supplier_customer_synonyms() -> None:
 	assert invoice.vyse_dph_12 == 12.0
 	assert invoice.vyse_dph_21 == 42.0
 	assert invoice.celkova_cena == 354.0
+
+
+def test_column_mapping_best_guess_for_noncanonical_headers() -> None:
+	processor = CSVProcessor()
+	df = pd.DataFrame(
+		{
+			"interní číslo": ["INT-001"],
+			"doklad": ["DK-99"],
+			"firma": ["Firma s.r.o."],
+			"vs": ["123456"],
+			"ič": ["11223344"],
+			"dič": ["CZ11223344"],
+			"psc": ["12000"],
+			"město": ["Brno"],
+		}
+	)
+	mapping = processor._infer_column_map(df)
+	# invoice number is mapped, even from interní/doklad naming
+	assert mapping.get("cislo_dokladu") in {"interní číslo", "doklad"}
+	assert mapping.get("variabilni_symbol") == "vs"
+	assert mapping.get("odberatel_jmeno") == "firma"
+	assert mapping.get("odberatel_ic") == "ič"
+	assert mapping.get("odberatel_dic") == "dič"
+	assert mapping.get("psc") == "psc"
+	assert mapping.get("mesto") == "město"
+	# no collisions
+	headers = list(mapping.values())
+	assert len(headers) == len(set(headers))
+	details = processor._column_map_details
+	assert details["cislo_dokladu"]["confidence"] > 0.55
+	assert details["odberatel_jmeno"]["decision"] in {"certain", "guess"}
+
+
+def test_column_mapping_prefers_best_guess_over_null() -> None:
+	processor = CSVProcessor()
+	df = pd.DataFrame(
+		{
+			"doklad": ["A-1"],
+			"název": ["Testovací odběratel"],
+			"vs": ["777001"],
+			"město": ["Ostrava"],
+		}
+	)
+	mapping = processor._infer_column_map(df)
+	assert mapping.get("cislo_dokladu") == "doklad"
+	assert mapping.get("variabilni_symbol") == "vs"
+	assert mapping.get("odberatel_jmeno") == "název"
+	assert processor._column_map_details["cislo_dokladu"]["decision"] in {"certain", "guess"}
+	assert processor._column_map_details["cislo_dokladu"]["header"] == "doklad"
+	assert processor._column_map_details["variabilni_symbol"]["header"] == "vs"
+	assert processor._column_map_details["odberatel_jmeno"]["header"] == "název"
+
+
+def test_value_pattern_dic_from_generic_id_header() -> None:
+	processor = CSVProcessor()
+	df = pd.DataFrame(
+		{
+			"firma": ["Test s.r.o.", "Jiná a.s."],
+			"id": ["CZ12345678", "CZ87654321"],
+			"ref": ["123456", "654321"],
+		}
+	)
+	mapping = processor._infer_column_map(df)
+	assert mapping.get("odberatel_jmeno") == "firma"
+	chosen_dic_target = None
+	for target in ("odberatel_dic", "dodavatel_dic"):
+		if processor._column_map_details.get(target, {}).get("header") == "id":
+			chosen_dic_target = target
+			break
+	assert chosen_dic_target is not None
+	assert processor._column_map_details[chosen_dic_target]["confidence"] >= 0.6
+	assert processor._column_map_details[chosen_dic_target]["decision"] in {"certain", "guess"}
+
+
+def test_value_pattern_vs_from_numeric_ref_header() -> None:
+	processor = CSVProcessor()
+	df = pd.DataFrame(
+		{
+			"název": ["Firma A", "Firma B"],
+			"ref": ["888001", "888002"],
+			"částka": ["1000", "1200"],
+		}
+	)
+	mapping = processor._infer_column_map(df)
+	assert mapping.get("odberatel_jmeno") == "název"
+	assert mapping.get("variabilni_symbol") == "ref"
+	assert processor._column_map_details["variabilni_symbol"]["confidence"] >= 0.55
+	assert processor._column_map_details["variabilni_symbol"]["decision"] in {"certain", "guess"}
+
+
+def test_value_pattern_psc_and_amount_and_date() -> None:
+	processor = CSVProcessor()
+	df = pd.DataFrame(
+		{
+			"zip": ["11000", "12000", "13000"],
+			"sum": ["1234.50", "2000,00", "999.99"],
+			"created": ["2024-01-01", "2024-02-01", "2024-03-01"],
+			"telefon": ["777888999", "605444333", "602111222"],
+		}
+	)
+	mapping = processor._infer_column_map(df)
+	assert mapping.get("psc") == "zip"
+	assert mapping.get("celkova_cena") == "sum"
+	assert mapping.get("datum_vystaveni") == "created"
+	assert "telefon" not in mapping.values()
+
+
+def test_integration_fixture_case1() -> None:
+	fixture = Path("tests/fixtures/mapping_case1.csv")
+	expected_path = Path("tests/fixtures/mapping_case1_expected.json")
+	df = pd.read_csv(fixture)
+	expected = json.loads(expected_path.read_text(encoding="utf-8"))
+	processor = CSVProcessor()
+	mapping = processor._infer_column_map(df)
+	for target, header in expected.items():
+		assert mapping.get(target) == header
+	headers = list(mapping.values())
+	assert len(headers) == len(set(headers))
+
+
+def test_integration_fixture_case2() -> None:
+	fixture = Path("tests/fixtures/mapping_case2.csv")
+	expected_path = Path("tests/fixtures/mapping_case2_expected.json")
+	df = pd.read_csv(fixture)
+	expected = json.loads(expected_path.read_text(encoding="utf-8"))
+	processor = CSVProcessor()
+	mapping = processor._infer_column_map(df)
+	for target, header in expected.items():
+		assert mapping.get(target) == header
+	headers = list(mapping.values())
+	assert len(headers) == len(set(headers))
+
+
+def test_permutation_noise_invariants() -> None:
+	import random
+
+	base_headers = {
+		"cislo": "F-1",
+		"nazev": "Firma X",
+		"vs": "987654",
+		"sum": "1000",
+		"zip": "11150",
+	}
+	columns = list(base_headers.keys()) + ["noise1", "noise2"]
+	random.Random(42).shuffle(columns)
+	data = {col: [base_headers.get(col, "xxx")] * 3 for col in columns}
+	df = pd.DataFrame(data)
+	processor = CSVProcessor()
+	mapping = processor._infer_column_map(df)
+	headers = list(mapping.values())
+	assert len(headers) == len(set(headers))
+	assert mapping.get("variabilni_symbol") in {"vs"}
+	assert mapping.get("psc") in {"zip"}
+	assert processor._column_map_details["variabilni_symbol"]["confidence"] >= 0.5
 
 
 def _write_sample_xlsx(path) -> None:

@@ -14,6 +14,7 @@ vyse_dph_12 zůstávají null; DPH se mapuje na 21 % sloupec „DPH“/„Celkem
 import logging
 import re
 import unicodedata
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from zipfile import ZipFile, BadZipFile
@@ -36,19 +37,41 @@ logger = logging.getLogger(__name__)
 XL_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 PKG_REL_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+CONFIDENT_CONFIDENCE = 0.72
+DEFAULT_MIN_GUESS_CONF = 0.58
+DEFAULT_PATTERN_SAMPLE_ROWS = 20
 
 
 FIELD_SPECS: Dict[str, Dict[str, Any]] = {
 	"cislo_dokladu": {
 		"label": "Číslo faktury",
 		"description": "Jedinečné číslo dokladu nebo faktury.",
-		"keywords": [["cislo", "fakt"], ["invoice", "number"], ["cislo", "doklad"], ["document", "number"]],
+		"keywords": [
+			["cislo", "fakt"],
+			["invoice", "number"],
+			["cislo", "doklad"],
+			["document", "number"],
+			["interni", "cislo"],
+			["interni", "doklad"],
+			["doklad"],
+		],
 		"type": "string",
 	},
 	"variabilni_symbol": {
 		"label": "Číslo Objednávky",
 		"description": "Variabilní symbol nebo číslo objednávky.",
-		"keywords": [["variabil"], ["vs"], ["order", "number"], ["po", "number"], ["purchase", "order"], ["reference", "number"], ["po", "reference"], ["order", "reference"], ["customer", "reference"]],
+		"keywords": [
+			["variabil"],
+			["variabilni", "symbol"],
+			["vs"],
+			["order", "number"],
+			["po", "number"],
+			["purchase", "order"],
+			["reference", "number"],
+			["po", "reference"],
+			["order", "reference"],
+			["customer", "reference"],
+		],
 		"type": "string",
 	},
 	"dodavatel_jmeno": {
@@ -84,7 +107,18 @@ FIELD_SPECS: Dict[str, Dict[str, Any]] = {
 	"odberatel_jmeno": {
 		"label": "Jméno",
 		"description": "Název nebo jméno odběratele (customer/client).",
-		"keywords": [["odberatel", "nazev"], ["odberatel", "jmeno"], ["customer", "name"], ["client", "name"], ["buyer", "name"], ["customer", "company"]],
+		"keywords": [
+			["odberatel", "nazev"],
+			["odberatel", "jmeno"],
+			["customer", "name"],
+			["client", "name"],
+			["buyer", "name"],
+			["customer", "company"],
+			["firma"],
+			["nazev"],
+			["jmeno"],
+			["obchodni", "jmeno"],
+		],
 		"type": "string",
 	},
 	"odberatel_adresa": {
@@ -180,9 +214,9 @@ FIELD_SPECS: Dict[str, Dict[str, Any]] = {
 }
 
 FALLBACK_SYNONYMS: Dict[str, List[str]] = {
-	"cislo_dokladu": ["cislo dokladu"],
-	"variabilni_symbol": ["variabilni symbol"],
-	"odberatel_jmeno": ["nazev/jmeno", "nazev jmeno", "odberatel"],
+	"cislo_dokladu": ["cislo dokladu", "interni cislo", "interni doklad", "doklad"],
+	"variabilni_symbol": ["variabilni symbol", "vs"],
+	"odberatel_jmeno": ["nazev/jmeno", "nazev jmeno", "odberatel", "firma", "nazev", "jmeno"],
 	"odberatel_ic": ["ic"],
 	"odberatel_dic": ["dic / ic dph", "dic", "ic dph"],
 	"datum_vystaveni": ["vystaveno", "datum vystaveni", "vystaveni"],
@@ -191,6 +225,8 @@ FALLBACK_SYNONYMS: Dict[str, List[str]] = {
 	"celkova_cena": ["celkem s dph", "celkem s dani"],
 	"zaklad_dane_21": ["celkem bez dph", "zaklad dane"],
 	"vyse_dph_21": ["dph"],
+	"psc": ["psc"],
+	"mesto": ["mesto"],
 }
 
 
@@ -201,6 +237,10 @@ class CSVProcessor:
 		self.logger = logger
 		self._config: Optional[AppConfig] = config
 		self._field_specs: Dict[str, Dict[str, Any]] = FIELD_SPECS
+		cfg = self._get_config()
+		self._min_guess_conf = max(0.0, min(0.95, getattr(cfg, "csv_min_guess_conf", DEFAULT_MIN_GUESS_CONF)))
+		self._pattern_sample_rows = max(5, min(100, getattr(cfg, "csv_pattern_sample_rows", DEFAULT_PATTERN_SAMPLE_ROWS)))
+		self._mapping_debug_path = getattr(cfg, "csv_mapping_debug_path", None)
 		# Mapování cílových interních polí na defaultní (očekávané) názvy sloupců
 		self._expected_headers_by_target: Dict[str, str] = {
 			name: spec["label"]
@@ -213,6 +253,8 @@ class CSVProcessor:
 		}
 		# Bude naplněno detekcí/LLM: interní pole → skutečná hlavička v CSV
 		self._column_map: Dict[str, str] = {}
+		# Detailní metadata mapování (confidence, zdroj, důvod)
+		self._column_map_details: Dict[str, Dict[str, Any]] = {}
 
 	def _get_config(self) -> AppConfig:
 		return self._config or load_config()
@@ -662,28 +704,149 @@ class CSVProcessor:
 			return None
 
 	def _infer_column_map(self, df: pd.DataFrame) -> Dict[str, str]:
-		"""Zkusí odvodit mapování sloupců:
-		1) Přímé shody s očekávanými názvy
-		2) Heuristické shody (normalizace, synonyma)
-		3) LLM (OpenAI) na základě hlaviček + prvních dvou řádků
-		"""
+		"""Dvoufázové mapování sloupců s confidence a auditními důvody."""
+		cfg = self._get_config()
+		min_guess_conf = max(0.0, min(0.95, getattr(cfg, "csv_min_guess_conf", self._min_guess_conf)))
 		cols = list(df.columns)
 		mapping: Dict[str, str] = {}
-		# 1) Přímé shody
+		self._column_map_details = {}
+		used_headers: Set[str] = set()
+		norm_cols = {c: self._normalize(c) for c in cols}
+		candidates_by_target: Dict[str, List[Dict[str, Any]]] = {}
+
+		def _clamp_conf(value: float) -> float:
+			try:
+				val = float(value)
+			except Exception:
+				return 0.0
+			return max(0.0, min(0.99, val))
+
+		def _decision_rank(decision: str) -> int:
+			return {"certain": 2, "guess": 1, "reject": 0}.get(decision, 0)
+
+		def _source_rank(source: str) -> int:
+			return {
+				"exact": 5,
+				"pattern": 4,
+				"heuristic": 3,
+				"fallback": 2,
+				"llm": 1,
+			}.get(source, 0)
+
+		def _is_sane_candidate(target: str, stats: Optional[Dict[str, float]]) -> Tuple[bool, str, float]:
+			if not stats:
+				return True, "", 0.0
+			reasons = []
+			penalty = 0.0
+			null_ratio = stats.get("null_ratio", 0.0)
+			if null_ratio > 0.65:
+				penalty += 0.2
+				reasons.append(f"mnoho prázdných {null_ratio:.2f}")
+			if target in {"psc", "variabilni_symbol"} and stats.get("phone_ratio", 0.0) > 0.4:
+				penalty += 0.25
+				reasons.append("vypadá jako telefon")
+			if target == "psc" and stats.get("long_ratio", 0.0) > 0.3:
+				penalty += 0.2
+				reasons.append("PSČ příliš dlouhé")
+			if target == "variabilni_symbol" and stats.get("short_ratio", 0.0) > 0.4:
+				penalty += 0.15
+				reasons.append("VS příliš krátký")
+			if target in {"psc"} and stats.get("psc", 0.0) < 0.3:
+				penalty += 0.15
+			if target in {"variabilni_symbol"} and stats.get("vs", 0.0) < 0.25:
+				penalty += 0.15
+			if target in {"dodavatel_dic", "odberatel_dic"} and stats.get("dic", 0.0) < 0.25:
+				penalty += 0.25
+			if target in {"dodavatel_ic", "odberatel_ic"} and stats.get("ic", 0.0) < 0.25:
+				penalty += 0.2
+			if target in {"celkova_cena", "zaklad_dane_0", "zaklad_dane_12", "zaklad_dane_21", "vyse_dph_12", "vyse_dph_21"} and stats.get("amount", 0.0) < 0.25:
+				penalty += 0.25
+				reasons.append("málo částkových hodnot")
+			if target in {"datum_vystaveni", "datum_duzp", "datum_splatnosti"} and stats.get("date", 0.0) < 0.25:
+				penalty += 0.25
+				reasons.append("málo datumů")
+			return penalty < 0.45, "; ".join(reasons), penalty
+
+		def register_candidate(
+			target: str,
+			header: str,
+			confidence: float,
+			reason: str,
+			source: str,
+			decision: str,
+			token_score: int = 0,
+			type_score: int = 0,
+			pattern_score: float = 0.0,
+			stats: Optional[Dict[str, float]] = None,
+		) -> None:
+			conf = _clamp_conf(confidence)
+			dec_flag = "certain" if (conf >= CONFIDENT_CONFIDENCE or decision == "certain") else "guess"
+			ok, penalty_reason, penalty = _is_sane_candidate(target, stats)
+			if penalty:
+				conf = _clamp_conf(conf - penalty)
+				if penalty_reason:
+					reason = f"{reason}; penalizace: {penalty_reason}"
+			if not ok:
+				return
+			candidate = {
+				"target": target,
+				"header": header,
+				"confidence": conf,
+				"reason": reason,
+				"source": source,
+				"decision": dec_flag,
+				"token_score": token_score,
+				"type_score": type_score,
+				"pattern_score": pattern_score,
+				"stats": stats or {},
+				"ranking": (
+					_decision_rank(dec_flag),
+					_source_rank(source),
+					round(pattern_score, 3),
+					token_score,
+					type_score,
+					-len(str(header or "")),
+					target,
+				),
+			}
+			candidates_by_target.setdefault(target, []).append(candidate)
+
+		# 1) Přímé shody (jisté)
 		for target, expected_label in self._expected_headers_by_target.items():
 			if expected_label in df.columns:
-				mapping[target] = expected_label
-		# 2) Heuristika pro chybějící
-		remaining = [t for t in self._expected_headers_by_target.keys() if t not in mapping]
-		norm_cols = {c: self._normalize(c) for c in cols}
-		if remaining:
-			for target in list(remaining):
-				cand = self._heuristic_match(target, norm_cols, df)
-				if cand:
-					mapping[target] = cand
+				register_candidate(
+					target,
+					expected_label,
+					1.0,
+					"Přesný název sloupce",
+					"exact",
+					"certain",
+					token_score=3,
+					type_score=2,
+					pattern_score=1.0,
+					stats=self._analyze_value_patterns(df[expected_label], self._pattern_sample_rows),
+				)
+
+		# 2) Heuristiky (silné/odhad)
+		for target in self._expected_headers_by_target.keys():
+			heuristic = self._heuristic_candidate(target, norm_cols, df)
+			if heuristic:
+				register_candidate(
+					target,
+					heuristic["header"],
+					heuristic["confidence"],
+					heuristic["reason"],
+					heuristic["source"],
+					heuristic["decision"],
+					token_score=heuristic.get("token_score", 0),
+					type_score=heuristic.get("type_score", 0),
+					pattern_score=heuristic.get("pattern_score", 0.0),
+					stats=heuristic.get("stats"),
+				)
+
 		existing_headers = set(mapping.values())
-		# 3) LLM – pokud máme klíč a něco chybí, nebo vždy, aby pokryl i jiné formáty
-		cfg = self._get_config()
+
+		# 3) LLM návrhy (vracejí jisté i odhadované)
 		use_llm = bool(cfg.openai_api_key) and bool(getattr(cfg, 'csv_enable_llm_mapping', False))
 		need_llm = use_llm and (len(mapping) < len(self._expected_headers_by_target))
 		if need_llm:
@@ -691,17 +854,127 @@ class CSVProcessor:
 			try:
 				llm_map = self._ask_llm_for_mapping(df)
 				llm_map = self._sanitize_llm_mapping(llm_map, df, reserved_headers=existing_headers)
-				for target, header in llm_map.items():
-					if target in mapping:
+				for target, info in llm_map.items():
+					header = info.get("header")
+					if not header:
 						continue
-					if header and header in df.columns and header not in existing_headers:
-						mapping[target] = header
-						existing_headers.add(header)
+					register_candidate(
+						target,
+						header,
+						info.get("confidence", 0.0),
+						info.get("reason") or "LLM návrh",
+						info.get("source") or "llm",
+						info.get("decision") or "guess",
+						pattern_score=0.0,
+						token_score=0,
+						type_score=0,
+					)
 			except Exception as e:  # noqa: BLE001
 				self.logger.warning("LLM mapování selhalo: %s", e)
-		# 4) Fallback synonyma pro zbylé cílové klíče
-		self._apply_synonym_fallback(mapping, df, existing_headers)
+
+		# 4) Fallback synonyma pro zbylé cílové klíče (slabší odhady)
+		for target in self._expected_headers_by_target.keys():
+			fallback = self._fallback_synonym_candidate(target, norm_cols, df)
+			if fallback:
+				register_candidate(
+					target,
+					fallback["header"],
+					fallback["confidence"],
+					fallback["reason"],
+					fallback["source"],
+					fallback["decision"],
+					pattern_score=fallback.get("pattern_score", 0.0),
+					token_score=fallback.get("token_score", 0),
+					type_score=fallback.get("type_score", 0),
+					stats=fallback.get("stats"),
+				)
+
+		def commit_candidate(candidate: Dict[str, Any]) -> bool:
+			target = candidate["target"]
+			header = candidate["header"]
+			conf = candidate["confidence"]
+			if not header or target in mapping or header in used_headers:
+				return False
+			if candidate["decision"] == "guess" and conf < min_guess_conf:
+				return False
+			mapping[target] = header
+			self._column_map_details[target] = {
+				"header": header,
+				"confidence": _clamp_conf(conf),
+				"reason": candidate["reason"],
+				"source": candidate["source"],
+				"decision": candidate["decision"],
+			}
+			used_headers.add(header)
+			return True
+
+		# Fáze 1: jisté kandidáty podle rankingu
+		certain_candidates: List[Dict[str, Any]] = []
+		for target, cands in candidates_by_target.items():
+			certain_candidates.extend([c for c in cands if c["decision"] == "certain"])
+		for cand in sorted(certain_candidates, key=lambda c: c["ranking"], reverse=True):
+			commit_candidate(cand)
+
+		# Fáze 2: nejlepší odhady bez kolizí, včetně second-best fallback
+		for target in self._expected_headers_by_target.keys():
+			if target in mapping:
+				continue
+			cands = sorted(candidates_by_target.get(target, []), key=lambda c: c["ranking"], reverse=True)
+			for cand in cands:
+				if cand["decision"] == "guess" and cand["confidence"] < min_guess_conf:
+					continue
+				if commit_candidate(cand):
+					break
+
+		# Doplň detaily pro nenamapované cíle (audit)
+		for target in self._expected_headers_by_target.keys():
+			if target not in self._column_map_details:
+				cands = sorted(candidates_by_target.get(target, []), key=lambda c: c["ranking"], reverse=True)
+				reason = "Nenašel se vhodný sloupec"
+				if cands:
+					top = cands[0]
+					if top["confidence"] < min_guess_conf:
+						reason = f"Kandidáti pod prahem {min_guess_conf:.2f}"
+					elif top["header"] in used_headers:
+						reason = f"Kolize hlavičky {top['header']}"
+				self._column_map_details[target] = {
+					"header": None,
+					"confidence": 0.0,
+					"reason": reason,
+					"source": "reject",
+					"decision": "reject",
+				}
+
+		summary = []
+		for target in sorted(self._expected_headers_by_target.keys()):
+			detail = self._column_map_details.get(target, {})
+			status = detail.get("decision")
+			status_label = {"certain": "jisté", "guess": "odhad", "reject": "zamítnuto"}.get(status, "neznámé")
+			summary.append(
+				f"{target}->{detail.get('header') or '-'} "
+				f"({status_label}, conf={detail.get('confidence', 0):.2f}, zdroj={detail.get('source')}, důvod={detail.get('reason')})"
+			)
+		if summary:
+			self.logger.info("Detaily mapování sloupců: %s", " | ".join(summary))
+		self._export_mapping_debug(df, mapping)
 		return mapping
+
+	def _export_mapping_debug(self, df: pd.DataFrame, mapping: Dict[str, str]) -> None:
+		"""Při zapnutém debug exportu uloží detail mapování do JSONu."""
+		if not self._mapping_debug_path:
+			return
+		try:
+			path = Path(self._mapping_debug_path)
+			path.parent.mkdir(parents=True, exist_ok=True)
+			payload = {
+				"headers": [str(c) for c in df.columns],
+				"mapping": mapping,
+				"details": self._column_map_details,
+			}
+			path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+			self.logger.info("Mapping debug export uložen do %s", path)
+		except Exception as exc:  # noqa: BLE001
+			self.logger.warning("Mapping debug export selhal: %s", exc)
 
 	def _normalize(self, s: str) -> str:
 		val = str(s or "").replace("\ufeff", "").strip().strip('"').lower()
@@ -709,13 +982,103 @@ class CSVProcessor:
 		val = re.sub(r"\s+", " ", val)
 		return val
 
+	def _confidence_from_scores(self, token_score: int, type_score: int) -> float:
+		"""Odhad jistoty z heuristických skóre (deterministicky)."""
+		conf = 0.35 + 0.2 * token_score + 0.15 * max(type_score, 0)
+		return max(0.05, min(0.98, conf))
+
+	def _analyze_value_patterns(self, series: Optional[pd.Series], limit: int = 20) -> Dict[str, float]:
+		"""Vyhodnotí, jak moc hodnoty připomínají DIČ/IČ/PSČ/VS/datum/částku + základní statistiky."""
+		if series is None:
+			return {}
+		total = 0
+		hits = {"dic": 0, "ic": 0, "psc": 0, "vs": 0, "date": 0, "amount": 0, "phone_like": 0}
+		non_empty = 0
+		unique_values: Set[str] = set()
+		lengths: List[int] = []
+		numericish = 0
+		for val in series.head(limit):
+			total += 1
+			if pd.isna(val):
+				continue
+			text = str(val).strip()
+			if not text:
+				continue
+			non_empty += 1
+			unique_values.add(text)
+			lengths.append(len(text))
+			clean = re.sub(r"[\\s-]", "", text.upper())
+			if re.fullmatch(r"[A-Z]{2}[0-9]{6,12}", clean):
+				hits["dic"] += 1
+			if re.fullmatch(r"[0-9]{7,10}", clean):
+				hits["ic"] += 1
+			if re.fullmatch(r"[0-9]{3,6}", clean):
+				hits["psc"] += 1
+			if re.fullmatch(r"[0-9]{5,15}", clean):
+				hits["vs"] += 1
+			if re.fullmatch(r"[0-9]{9,12}", clean):
+				hits["phone_like"] += 1
+			try:
+				if parse_invoice_date(text):
+					hits["date"] += 1
+			except Exception:
+				pass
+			if self._safe_float(text) is not None:
+				hits["amount"] += 1
+				numericish += 1
+			elif text.isdigit():
+				numericish += 1
+		safe_total = max(1, total)
+		stats: Dict[str, float] = {key: (hits[key] / max(1, non_empty)) for key in hits}
+		stats["null_ratio"] = 1 - (non_empty / safe_total)
+		stats["unique_ratio"] = (len(unique_values) / non_empty) if non_empty else 0.0
+		stats["avg_len"] = (sum(lengths) / non_empty) if non_empty else 0.0
+		stats["short_ratio"] = len([l for l in lengths if l <= 3]) / max(1, non_empty)
+		stats["long_ratio"] = len([l for l in lengths if l >= 14]) / max(1, non_empty)
+		stats["phone_ratio"] = stats.get("phone_like", 0.0)
+		stats["numeric_ratio"] = numericish / max(1, non_empty)
+		return stats
+
+	def _value_pattern_hint(self, target: str, series: Optional[pd.Series]) -> Tuple[float, Optional[str]]:
+		patterns = self._analyze_value_patterns(series, self._pattern_sample_rows)
+		target_patterns: Dict[str, List[Tuple[str, str]]] = {
+			"dodavatel_dic": [("dic", "DIČ")],
+			"odberatel_dic": [("dic", "DIČ")],
+			"dodavatel_ic": [("ic", "IČ")],
+			"odberatel_ic": [("ic", "IČ")],
+			"psc": [("psc", "PSČ")],
+			"variabilni_symbol": [("vs", "VS")],
+			"datum_vystaveni": [("date", "datum")],
+			"datum_duzp": [("date", "datum")],
+			"datum_splatnosti": [("date", "datum")],
+			"zaklad_dane_0": [("amount", "částka")],
+			"zaklad_dane_12": [("amount", "částka")],
+			"zaklad_dane_21": [("amount", "částka")],
+			"vyse_dph_12": [("amount", "částka")],
+			"vyse_dph_21": [("amount", "částka")],
+			"celkova_cena": [("amount", "částka")],
+		}
+		candidates = target_patterns.get(target, [])
+		best_ratio = 0.0
+		best_label: Optional[str] = None
+		for key, label in candidates:
+			ratio = patterns.get(key, 0.0)
+			if ratio > best_ratio:
+				best_ratio = ratio
+				best_label = label
+		return best_ratio, best_label
+
 	def _heuristic_match(self, target: str, norm_cols: Dict[str, str], df: Optional[pd.DataFrame]) -> Optional[str]:
+		candidate = self._heuristic_candidate(target, norm_cols, df)
+		return candidate["header"] if candidate else None
+
+	def _heuristic_candidate(self, target: str, norm_cols: Dict[str, str], df: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
 		"""Pokusí se spárovat sloupec podle klíčových slov a typu hodnot."""
 		spec = self._field_specs.get(target, {})
 		patterns = spec.get("keywords", []) or []
 		expected_type = spec.get("type")
 		best_col: Optional[str] = None
-		best_score: Optional[tuple[int, int]] = None
+		best_score: Optional[Tuple[int, int, int, int]] = None
 		for col, norm in norm_cols.items():
 			token_score = 0
 			for token_set in patterns:
@@ -726,11 +1089,53 @@ class CSVProcessor:
 			type_score = 0
 			if df is not None and expected_type:
 				type_score = self._type_match_score(df[col], expected_type)
-			composite = (token_score + type_score, type_score, token_score)
+			composite = (token_score + type_score, type_score, token_score, -len(norm))
 			if best_score is None or composite > best_score:
 				best_score = composite
 				best_col = col
-		return best_col
+		if best_col is None:
+			return None
+		token_score = best_score[2] if best_score else 0
+		type_score = best_score[1] if best_score else 0
+		series = df[best_col] if df is not None else None
+		stats = self._analyze_value_patterns(series, self._pattern_sample_rows)
+		value_ratio, value_label = self._value_pattern_hint(target, series)
+
+		strong_pattern_targets = {
+			"dodavatel_dic",
+			"odberatel_dic",
+			"dodavatel_ic",
+			"odberatel_ic",
+			"psc",
+			"variabilni_symbol",
+		}
+		source = "heuristic"
+		if token_score == 0 and type_score <= 0:
+			if value_ratio >= 0.55 and target in strong_pattern_targets:
+				conf = min(0.99, 0.45 + 0.4 * value_ratio)
+				reason = f"Datový vzor {value_label or 'data'} {value_ratio:.2f}"
+				source = "pattern"
+			else:
+				return None
+		else:
+			conf = self._confidence_from_scores(token_score, type_score)
+			reason = f"Heuristika: klíčová slova {token_score}, typ {type_score}"
+			if value_ratio > 0:
+				conf = min(0.99, conf + 0.25 * value_ratio)
+				reason += f"; data vzor {value_label or 'data'} {value_ratio:.2f}"
+		pattern_score = value_ratio
+		return {
+			"target": target,
+			"header": best_col,
+			"confidence": conf,
+			"reason": reason,
+			"source": source,
+			"decision": decision,
+			"token_score": token_score,
+			"type_score": type_score,
+			"pattern_score": pattern_score,
+			"stats": stats,
+		}
 
 	def _fallback_synonym_match(self, target: str, norm_cols: Dict[str, str], used_headers: Set[str]) -> Optional[str]:
 		patterns = FALLBACK_SYNONYMS.get(target, [])
@@ -742,19 +1147,34 @@ class CSVProcessor:
 					return col
 		return None
 
-	def _apply_synonym_fallback(self, mapping: Dict[str, str], df: pd.DataFrame, used_headers: Set[str]) -> None:
-		norm_cols = {c: self._normalize(c) for c in df.columns}
-		added = 0
-		for target in self._expected_headers_by_target.keys():
-			if target in mapping:
-				continue
-			cand = self._fallback_synonym_match(target, norm_cols, used_headers)
-			if cand:
-				mapping[target] = cand
-				used_headers.add(cand)
-				added += 1
-		if added:
-			self.logger.info("Mapování sloupců (fallback) doplnilo %s položek", added)
+	def _fallback_synonym_candidate(self, target: str, norm_cols: Dict[str, str], df: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
+		cand = self._fallback_synonym_match(target, norm_cols, set())
+		if not cand:
+			return None
+		conf = 0.55
+		reason = "Fallback synonymum"
+		stats = None
+		pattern_score = 0.0
+		if df is not None and cand in df.columns:
+			stats = self._analyze_value_patterns(df[cand], self._pattern_sample_rows)
+			value_ratio, value_label = self._value_pattern_hint(target, df[cand])
+			pattern_score = value_ratio
+			if value_ratio > 0:
+				conf = min(0.99, conf + 0.25 * value_ratio)
+				reason += f"; data vzor {value_label or 'data'} {value_ratio:.2f}"
+		decision = "certain" if conf >= CONFIDENT_CONFIDENCE else "guess"
+		return {
+			"target": target,
+			"header": cand,
+			"confidence": conf,
+			"reason": reason,
+			"source": "fallback",
+			"decision": decision,
+			"pattern_score": pattern_score,
+			"token_score": 0,
+			"type_score": 0,
+			"stats": stats,
+		}
 
 	def _type_match_score(self, series: pd.Series, expected_type: str) -> int:
 		"""Vyšší skóre znamená lepší shodu s očekávaným typem."""
@@ -865,7 +1285,7 @@ class CSVProcessor:
 		expected_type = spec.get("type")
 		if expected_type and header in df.columns:
 			type_score = self._type_match_score(df[header], expected_type)
-		priority = 1 if target in ("celkova_cena", "cislo_dokladu", "datum_vystaveni") else 0
+		priority = 1 if target in ("celkova_cena", "cislo_dokladu", "datum_vystaveni", "odberatel_jmeno") else 0
 		return (token_score, type_score, priority)
 
 	def _pick_best_target_for_header(self, header: str, targets: List[str], df: pd.DataFrame) -> Optional[str]:
@@ -880,58 +1300,84 @@ class CSVProcessor:
 
 	def _sanitize_llm_mapping(
 		self,
-		llm_map: Dict[str, Optional[str]],
+		llm_map: Dict[str, Any],
 		df: pd.DataFrame,
 		reserved_headers: Optional[Set[str]] = None,
-	) -> Dict[str, str]:
-		"""Validuje a zpřesní mapu z LLM: odstraní neznámé hlavičky a duplicity."""
+	) -> Dict[str, Dict[str, Any]]:
+		"""Validuje a zpřesní mapu z LLM: odstraní neznámé hlavičky, kolize a doplní confidence."""
 		if not isinstance(llm_map, dict):
 			return {}
 		allowed_targets = set(self._expected_headers_by_target.keys())
 		columns = [str(c) for c in df.columns]
 		header_set = set(columns)
 		used_headers: Set[str] = set(reserved_headers or set())
-		validated: Dict[str, Optional[str]] = {}
+		normalized: Dict[str, Dict[str, Any]] = {}
 		for target, raw_header in llm_map.items():
 			if target not in allowed_targets:
 				continue
-			header = None
-			if raw_header and raw_header in header_set:
-				header = raw_header
-			elif raw_header:
-				header = self._best_header_fuzzy(str(raw_header), columns)
-			if header in used_headers:
-				header = None
-			validated[target] = header
-		header_to_targets: Dict[str, List[str]] = {}
-		for target, header in validated.items():
-			if header:
-				header_to_targets.setdefault(header, []).append(target)
-		result: Dict[str, str] = {}
-		for target, header in validated.items():
-			if header and len(header_to_targets.get(header, [])) == 1 and header not in used_headers:
-				result[target] = header
-				used_headers.add(header)
-		for header, targets in header_to_targets.items():
-			if len(targets) <= 1 or header in used_headers:
-				continue
-			best_target = self._pick_best_target_for_header(header, targets, df)
-			if best_target:
-				result[best_target] = header
-				used_headers.add(header)
-		available_norm = {c: self._normalize(c) for c in columns if c not in used_headers}
-		for target, header in validated.items():
-			if target in result:
-				continue
-			cand = self._heuristic_match(target, available_norm, df)
-			if cand and cand not in used_headers:
-				result[target] = cand
-				used_headers.add(cand)
-		return result
+			header_candidate = None
+			confidence = 0.0
+			reason = "LLM návrh"
+			decision = "guess"
+			if isinstance(raw_header, dict):
+				header_candidate = (
+					raw_header.get("header")
+					or raw_header.get("column")
+					or raw_header.get("name")
+					or raw_header.get("value")
+				)
+				try:
+					confidence = float(raw_header.get("confidence", 0.0))
+				except Exception:
+					confidence = 0.0
+				reason = str(raw_header.get("reason") or reason)
+				if raw_header.get("decision"):
+					decision = str(raw_header.get("decision")).lower()
+			else:
+				header_candidate = raw_header
+				reason = "LLM návrh (jednoduchý formát)"
 
-	def _ask_llm_for_mapping(self, df: pd.DataFrame) -> Dict[str, Optional[str]]:
+			header = None
+			if header_candidate and header_candidate in header_set:
+				header = str(header_candidate)
+			elif header_candidate:
+				header = self._best_header_fuzzy(str(header_candidate), columns)
+			if header in used_headers:
+				reason = f"Kolize s již obsazenou hlavičkou {header}"
+				header = None
+			confidence = max(0.0, min(0.99, confidence if confidence else (0.65 if header else 0.0)))
+			if str(decision).lower() == "certain":
+				decision = "certain"
+			decision_flag = "certain" if (confidence >= CONFIDENT_CONFIDENCE or decision == "certain") else "guess"
+			normalized[target] = {
+				"header": header,
+				"confidence": confidence,
+				"reason": reason,
+				"source": "llm",
+				"decision": decision_flag,
+			}
+
+		header_best: Dict[str, str] = {}
+		for target, info in normalized.items():
+			header = info.get("header")
+			if not header:
+				continue
+			prev_target = header_best.get(header)
+			if not prev_target or info.get("confidence", 0.0) > normalized[prev_target].get("confidence", 0.0):
+				header_best[header] = target
+		for target, info in normalized.items():
+			header = info.get("header")
+			if not header:
+				continue
+			if header_best.get(header) != target:
+				info["reason"] = f"Kolize s cílem {header_best.get(header)}"
+				info["header"] = None
+					info["decision"] = "guess"
+		return normalized
+
+	def _ask_llm_for_mapping(self, df: pd.DataFrame) -> Dict[str, Any]:
 		"""Zavolá OpenAI a požádá o mapování hlaviček na interní klíče.
-		Vrací dict: interní_pole → název hlavičky nebo None.
+		Vrací dict: interní_pole → {header, confidence, reason, decision}.
 		"""
 		cfg = self._get_config()
 		if not cfg.openai_api_key:
@@ -953,18 +1399,37 @@ class CSVProcessor:
 		allowed_headers = [str(col) for col in df.columns]
 		for key in self._expected_headers_by_target.keys():
 			spec = self._field_specs.get(key, {})
-			prop: Dict[str, Any] = {
-				"type": ["string", "null"],
-				"enum": allowed_headers + [None],
-			}
-			description = spec.get("description")
-			if description:
-				prop["description"] = description
-			properties[key] = prop
+			properties[key] = {
+				"type": "object",
+				"additionalProperties": False,
+				"properties": {
+					"header": {
+						"type": ["string", "null"],
+						"enum": allowed_headers + [None],
+						"description": "Přesná hlavička z tabulky nebo null, pokud žádná nedává smysl.",
+					},
+					"confidence": {
+						"type": "number",
+						"minimum": 0,
+						"maximum": 1,
+						"description": "0-1 jistota přiřazení (vyšší = jistější).",
+					},
+					"reason": {
+						"type": "string",
+						"description": "Krátký důvod proč byla hlavička vybrána.",
+					},
+						"decision": {
+							"type": "string",
+							"enum": ["certain", "guess"],
+							"description": "certain = jasná shoda, guess = nejlepší odhad",
+						},
+					},
+					"required": ["header", "confidence", "reason"],
+				}
 		response_format = {
 			"type": "json_schema",
 			"json_schema": {
-				"name": "CsvColumnMapping",
+				"name": "CsvColumnMappingRich",
 				"schema": {
 					"type": "object",
 					"additionalProperties": False,
@@ -996,12 +1461,13 @@ class CSVProcessor:
 				"role": "system",
 				"content": (
 					"Jsi mapovač sloupců tabulek faktur do interní struktury EasyFlex. Odpověz pouze JSONem dle schématu, bez textu navíc. "
-					"Pravidla: (1) vybírej výhradně z dostupných hlaviček, nikdy nevytvářej nové; (2) jeden sloupec přiřaď k nejvýše jednomu poli; "
-					"(3) pokud vhodný sloupec chybí nebo je nejasný, nastav null; (4) respektuj datové typy (datum, číslo, text) a ignoruj popisné/poznámkové sloupce; "
-					"(5) toleruj diakritiku, varianty názvů i drobné překlepy, ale nehádej hodnoty, které nedávají smysl podle ukázkových dat; "
-					"(6) Dodavatel = supplier/vendor, odběratel = customer/client. "
-					"(7) Nepřidávej žádné klíče ani komentáře a nevracej duplicitní hlavičky. "
-					"Výstupní JSON musí obsahovat přesně interní klíče a hodnotou je přesná hlavička z tabulky nebo null.\n"
+					"Pro každý interní klíč vrať objekt {header, confidence, reason, decision}. decision='certain', pokud je shoda jasná; decision='guess' použij pro nejlepší odhad. "
+					"Pravidla: (1) vybírej výhradně z dostupných hlaviček, nikdy nevytvářej nové; (2) stejnou hlavičku nepřiřazuj více polím – vyber to nejpravděpodobnější; "
+					"(3) pokud si nejsi jistý, preferuj nejlepší odhad (confidence 0.35–0.7) místo \"nevím\"; null použij jen pokud opravdu není žádný rozumný kandidát; "
+					"(4) respektuj datové typy (datum, číslo, text) a ignoruj popisné/poznámkové sloupce; "
+					"(5) toleruj diakritiku, varianty názvů i překlepy a využij ukázkové hodnoty; "
+					"(6) Dodavatel = supplier/vendor, odběratel = customer/client; interní čísla dokladu patří do pole 'cislo_dokladu'; "
+					"(7) Nepřidávej žádné klíče ani komentáře.\n"
 					+ fields_text
 					+ "\nDostupné sloupce s ukázkami:\n"
 					+ columns_text
@@ -1026,8 +1492,8 @@ class CSVProcessor:
 				"timeout": getattr(cfg, 'openai_timeout_s', 30),
 			}
 			if model_supports_sampling_params(model_name):
-				request_kwargs["temperature"] = float(getattr(cfg, "openai_temperature", 0.0))
-				request_kwargs["top_p"] = float(getattr(cfg, "openai_top_p", 0.15))
+				request_kwargs["temperature"] = 0.0
+				request_kwargs["top_p"] = 0.0
 			token_param = "max_completion_tokens" if "gpt-5" in str(model_name) else "max_tokens"
 			request_kwargs[token_param] = max_out_tokens
 			if getattr(cfg, "openai_reasoning_effort", None) and "gpt-5" in str(model_name):

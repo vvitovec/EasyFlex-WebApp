@@ -113,6 +113,22 @@ Klikněte na `Uložit`.
   - EXE (uživatel): `C:\Users\<uživatel>\AppData\Roaming\EasyFlex\errors\`
   - Vývoj: `errors\` (pokud složka existuje), jinak `EasyFlex\errors\`
 
+### CSV mapování – konfigurace
+
+- `CSV_ENABLE_LLM_MAPPING` (bool): povolit LLM mapování sloupců (posílá hlavičky a ukázková data do OpenAI).
+- `CSV_MIN_GUESS_CONF` (0–1, default 0.58): minimální confidence pro aplikaci „guess“ kandidáta (odhady pod prahem se nezapíšou).
+- `CSV_PATTERN_SAMPLE_ROWS` (int, default 20): kolik řádků použít pro analýzu datových vzorů (DIČ/IČ/VS/PSČ/datum/částka).
+- `CSV_MAPPING_DEBUG_PATH` (cesta): pokud je nastaveno, uloží se JSON s detaily mapování (`headers`, `mapping`, `details`) pro ladění.
+
+Příklad `.env` pro ladění mapování:
+
+```
+CSV_ENABLE_LLM_MAPPING=true
+CSV_MIN_GUESS_CONF=0.6
+CSV_PATTERN_SAMPLE_ROWS=25
+CSV_MAPPING_DEBUG_PATH=errors/mapping_debug.json
+```
+
 ---
 
 ## Ochrana dat a soukromí

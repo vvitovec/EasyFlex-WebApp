@@ -1,0 +1,25 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r EasyFlex/requirements.txt
+      - name: Run pytest
+        run: |
+          pytest tests/test_csv_processor.py -q
+      - name: Run eval mapping fixtures
+        run: |
+          python -m EasyFlex.tools.eval_mapping --fixtures tests/fixtures

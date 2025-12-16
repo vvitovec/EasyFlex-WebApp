@@ -54,6 +54,9 @@ _CONFIG_ENV_KEYS: Tuple[str, ...] = (
 	"ABRA_DUPLICATE_KOD_STRATEGY",
 	"EXTRACTION_DATE_ORDER",
 	"CSV_ENABLE_LLM_MAPPING",
+	"CSV_MIN_GUESS_CONF",
+	"CSV_PATTERN_SAMPLE_ROWS",
+	"CSV_MAPPING_DEBUG_PATH",
 )
 
 _CONFIG_CACHE: Optional["AppConfig"] = None
@@ -138,6 +141,9 @@ class AppConfig:
 	date_day_first: bool
 	# CSV processing
 	csv_enable_llm_mapping: bool
+	csv_min_guess_conf: float
+	csv_pattern_sample_rows: int
+	csv_mapping_debug_path: Optional[str]
 
 
 class _InMemoryLogHandler(logging.Handler):
@@ -612,6 +618,27 @@ def _load_config_uncached() -> AppConfig:
 		cp.get("csv", "enable_llm_mapping", fallback="false").lower() == "true"
 		if cp.has_section("csv") else (os.getenv("CSV_ENABLE_LLM_MAPPING", "false").lower() == "true")
 	)
+	try:
+		csv_min_guess_conf = float(
+			(cp.get("csv", "min_guess_conf", fallback=None) if cp.has_section("csv") else None)
+			or os.getenv("CSV_MIN_GUESS_CONF", 0.58)
+		)
+	except Exception:
+		csv_min_guess_conf = 0.58
+	try:
+		csv_pattern_sample_rows = int(
+			(cp.get("csv", "pattern_sample_rows", fallback=None) if cp.has_section("csv") else None)
+			or os.getenv("CSV_PATTERN_SAMPLE_ROWS", 20)
+		)
+	except Exception:
+		csv_pattern_sample_rows = 20
+	if csv_pattern_sample_rows <= 0:
+		csv_pattern_sample_rows = 20
+	csv_mapping_debug_path = (
+		(cp.get("csv", "mapping_debug_path", fallback=None) if cp.has_section("csv") else None)
+		or os.getenv("CSV_MAPPING_DEBUG_PATH")
+		or None
+	)
 	
 	config = AppConfig(
 		openai_api_key=api_key,
@@ -651,6 +678,9 @@ def _load_config_uncached() -> AppConfig:
 		enable_multi_invoice_segmentation=enable_multi_invoice_segmentation,
 		date_day_first=date_day_first,
 		csv_enable_llm_mapping=csv_enable_llm_mapping,
+		csv_min_guess_conf=csv_min_guess_conf,
+		csv_pattern_sample_rows=csv_pattern_sample_rows,
+		csv_mapping_debug_path=csv_mapping_debug_path,
 	)
 	setattr(config, "use_issue_date_as_due_date", config.infer_missing_dates)
 	return config

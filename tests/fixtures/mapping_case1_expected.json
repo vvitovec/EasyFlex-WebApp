@@ -1,0 +1,11 @@
+{
+  "cislo_dokladu": "interni cislo",
+  "odberatel_jmeno": "firma",
+  "variabilni_symbol": "ref",
+  "celkova_cena": "sum",
+  "datum_vystaveni": "created",
+  "psc": "zip",
+  "odberatel_dic": "dic",
+  "odberatel_ic": "ic",
+  "mesto": "city"
+}

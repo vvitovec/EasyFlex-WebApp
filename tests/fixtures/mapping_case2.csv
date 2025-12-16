@@ -1,0 +1,4 @@
+id,company,reference,total_amount,created_at,postal_code,vat,company_id,city,phone,note
+CZ99911122,Alpha s.r.o.,123450,2500.00,2024-04-10,14000,CZ99911122,99911122,Praha,777888999,"poznámka"
+CZ55566677,Beta a.s.,123451,3100.50,2024-04-12,15000,CZ55566677,55566677,Brno,605111222,"poznamka 2"
+CZ33322211,Gamma s.r.o.,123452,4100,2024-04-15,16000,CZ33322211,33322211,Ostrava,604123456,"pozn."
