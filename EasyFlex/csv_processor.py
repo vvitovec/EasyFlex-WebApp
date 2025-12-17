@@ -217,6 +217,11 @@ class CSVProcessor:
 	def _get_config(self) -> AppConfig:
 		return self._config or load_config()
 
+	def _day_first(self) -> bool:
+		"""Aktuální preference pořadí dne/měsíce podle konfigurace."""
+		cfg = self._get_config()
+		return getattr(cfg, "date_day_first", True)
+
 	def process_csv_file(self, csv_path: str) -> List[InvoiceData]:
 		"""Zachovaná alias metoda pro kompatibilitu se starým API."""
 		return self.process_table_file(csv_path)
@@ -523,11 +528,15 @@ class CSVProcessor:
 		Informace o jménu a adrese jsou o odběrateli.
 		"""
 		try:
+			cfg = self._get_config()
+			day_first = getattr(cfg, "date_day_first", True)
 			invoice_data = InvoiceData()
 
 			# Základní informace
 			invoice_data.cislo_dokladu = self._safe_get(row, "Číslo faktury")
 			invoice_data.variabilni_symbol = self._safe_get(row, "Číslo Objednávky")
+			if getattr(cfg, "use_doc_number_as_variable_symbol", False) and invoice_data.cislo_dokladu:
+				invoice_data.variabilni_symbol = invoice_data.cislo_dokladu
 
 			# Dodavatel
 			dodavatel_jmeno = self._safe_get(row, "Dodavatel – název")
@@ -547,9 +556,9 @@ class CSVProcessor:
 				invoice_data.dodavatel_dic = dodavatel_dic
 
 			# Datum
-			invoice_data.datum_vystaveni = parse_invoice_date(self._safe_get(row, "Datum vystavení"))
-			invoice_data.datum_duzp = parse_invoice_date(self._safe_get(row, "Datum objednávky"))
-			invoice_data.datum_splatnosti = parse_invoice_date(self._safe_get(row, "Datum splatnosti"))
+			invoice_data.datum_vystaveni = parse_invoice_date(self._safe_get(row, "Datum vystavení"), day_first=day_first)
+			invoice_data.datum_duzp = parse_invoice_date(self._safe_get(row, "Datum objednávky"), day_first=day_first)
+			invoice_data.datum_splatnosti = parse_invoice_date(self._safe_get(row, "Datum splatnosti"), day_first=day_first)
 
 			# Odběratel
 			invoice_data.odberatel_jmeno = self._safe_get(row, "Jméno")
@@ -597,7 +606,9 @@ class CSVProcessor:
 				"datum_splatnosti": getattr(invoice_data, "datum_splatnosti", None),
 				"datum_duzp": invoice_data.datum_duzp,
 			}
-			date_payload, inferred_warnings = domysleni_chybejicich_datumu(date_payload)
+			inferred_warnings: List[str] = []
+			if getattr(cfg, "infer_missing_dates", False):
+				date_payload, inferred_warnings = domysleni_chybejicich_datumu(date_payload, day_first=day_first)
 			invoice_data.datum_vystaveni = date_payload.get("datum_vystaveni")
 			invoice_data.datum_splatnosti = date_payload.get("datum_splatnosti")
 			invoice_data.datum_duzp = date_payload.get("datum_duzp")
@@ -769,13 +780,14 @@ class CSVProcessor:
 					return 1
 			return -1
 		if expected_type == "date":
+			day_first = self._day_first()
 			for val in values:
 				text = str(val).strip()
 				if not text:
 					continue
 				parsed = None
 				try:
-					parsed = parse_invoice_date(text)
+					parsed = parse_invoice_date(text, day_first=day_first)
 				except Exception:
 					parsed = None
 				if parsed:
@@ -835,12 +847,13 @@ class CSVProcessor:
 		number_hits = 0
 		date_hits = 0
 		code_hits = 0
+		day_first = self._day_first()
 		for val in values:
 			text = str(val).strip()
 			if self._safe_float(text) is not None:
 				number_hits += 1
 			try:
-				if parse_invoice_date(text):
+				if parse_invoice_date(text, day_first=day_first):
 					date_hits += 1
 			except Exception:
 				pass

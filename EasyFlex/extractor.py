@@ -300,10 +300,11 @@ class InvoiceExtractor:
 
 			# Apply extraction options from config
 			cfg = self._config
+			day_first = getattr(cfg, "date_day_first", True)
 			if cfg.use_doc_number_as_variable_symbol and payload.get("cislo_dokladu"):
 				payload["variabilni_symbol"] = payload["cislo_dokladu"]
 			if getattr(cfg, "infer_missing_dates", False):
-				payload, inferred_warnings = domysleni_chybejicich_datumu(payload)
+				payload, inferred_warnings = domysleni_chybejicich_datumu(payload, day_first=day_first)
 				if inferred_warnings:
 					warnings.extend(inferred_warnings)
 
@@ -409,10 +410,11 @@ class InvoiceExtractor:
 			payload, warnings = await self._run_vision_extraction(b64_images)
 
 			cfg = self._config
+			day_first = getattr(cfg, "date_day_first", True)
 			if cfg.use_doc_number_as_variable_symbol and payload.get("cislo_dokladu"):
 				payload["variabilni_symbol"] = payload["cislo_dokladu"]
 			if getattr(cfg, "infer_missing_dates", False):
-				payload, inferred_warnings = domysleni_chybejicich_datumu(payload)
+				payload, inferred_warnings = domysleni_chybejicich_datumu(payload, day_first=day_first)
 				if inferred_warnings:
 					warnings.extend(inferred_warnings)
 
