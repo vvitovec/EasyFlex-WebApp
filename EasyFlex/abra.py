@@ -1015,7 +1015,8 @@ def _map_invoice_json(faktura: Union[Dict[str, Any], InvoiceData], series_map: O
 			"datum_splatnosti": dat_splat,
 			"datum_duzp": datum_duzp,
 		}
-		date_payload, inferred_warnings = domysleni_chybejicich_datumu(date_payload)
+		day_first = getattr(cfg, "date_day_first", True)
+		date_payload, inferred_warnings = domysleni_chybejicich_datumu(date_payload, day_first=day_first)
 		dat_vyst = date_payload.get("datum_vystaveni") or dat_vyst
 		dat_splat = date_payload.get("datum_splatnosti") or dat_splat
 		datum_duzp = date_payload.get("datum_duzp") or datum_duzp

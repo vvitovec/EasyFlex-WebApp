@@ -1,7 +1,10 @@
-import pandas as pd
+from copy import deepcopy
 from zipfile import ZipFile
 
+import pandas as pd
+
 from EasyFlex.csv_processor import CSVProcessor
+from EasyFlex.config import load_config
 from EasyFlex.invoice_warnings import get_warning
 
 
@@ -35,7 +38,7 @@ def _assert_sample_invoice(invoice) -> None:
 
 
 def test_csv_row_mapping_infers_due_date_and_warnings() -> None:
-	processor = CSVProcessor()
+	processor = CSVProcessor(config=_config_with(infer_missing_dates=True))
 	df = pd.DataFrame(
 		{
 			"Číslo faktury": ["F-2024-001"],
@@ -60,6 +63,61 @@ def test_csv_row_mapping_infers_due_date_and_warnings() -> None:
 	assert invoice.zaklad_dane_21 == 2000.0
 	warning_text = get_warning(invoice, "") or ""
 	assert "splatnosti" in warning_text.lower()
+
+
+def test_csv_row_mapping_skips_inference_when_disabled() -> None:
+	processor = CSVProcessor(config=_config_with(infer_missing_dates=False))
+	df = pd.DataFrame(
+		{
+			"Číslo faktury": ["F-2024-002"],
+			"Číslo Objednávky": ["PO-2"],
+			"Datum vystavení": ["1.5.2024"],
+			"Datum objednávky": [""],
+			"Datum splatnosti": [""],
+			"Jméno": ["ACME"],
+			"Adresa": ["Testovací 123"],
+		}
+	)
+	processor._column_map = processor._infer_column_map(df)
+	invoice = processor._map_row_to_invoice_data(df.iloc[0], 1)
+	assert invoice is not None
+	assert invoice.datum_vystaveni == "2024-05-01"
+	assert invoice.datum_splatnosti is None
+	assert get_warning(invoice) is None
+
+
+def test_csv_processor_uses_doc_number_for_variable_symbol_when_enabled() -> None:
+	processor = CSVProcessor(config=_config_with(use_doc_number_as_variable_symbol=True, infer_missing_dates=False))
+	df = pd.DataFrame(
+		{
+			"Číslo faktury": ["INV-10"],
+			"Číslo Objednávky": [""],
+			"Datum vystavení": ["1.5.2024"],
+			"Jméno": ["Test s.r.o."],
+		}
+	)
+	processor._column_map = processor._infer_column_map(df)
+	invoice = processor._map_row_to_invoice_data(df.iloc[0], 1)
+	assert invoice is not None
+	assert invoice.variabilni_symbol == "INV-10"
+
+
+def test_csv_processor_respects_date_order_setting() -> None:
+	processor = CSVProcessor(config=_config_with(date_day_first=False, infer_missing_dates=False))
+	df = pd.DataFrame(
+		{
+			"Číslo faktury": ["A-1"],
+			"Číslo Objednávky": ["PO-3"],
+			"Datum vystavení": ["09/01/2024"],
+			"Datum splatnosti": ["09/30/2024"],
+			"Jméno": ["Test"],
+		}
+	)
+	processor._column_map = processor._infer_column_map(df)
+	invoice = processor._map_row_to_invoice_data(df.iloc[0], 1)
+	assert invoice is not None
+	assert invoice.datum_vystaveni == "2024-09-01"
+	assert invoice.datum_splatnosti == "2024-09-30"
 
 
 def test_process_table_file_reads_csv(tmp_path) -> None:
@@ -271,3 +329,10 @@ def _write_sample_xlsx(path) -> None:
 		archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
 		archive.writestr("xl/sharedStrings.xml", shared_xml)
 		archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+def _config_with(**overrides):
+	cfg = deepcopy(load_config())
+	for key, value in overrides.items():
+		setattr(cfg, key, value)
+	if "infer_missing_dates" in overrides:
+		setattr(cfg, "use_issue_date_as_due_date", cfg.infer_missing_dates)
+	return cfg

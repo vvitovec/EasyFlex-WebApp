@@ -1,3 +1,5 @@
 *.db
 settings.ini
 .env
+__pycache__/
+*.pyc
