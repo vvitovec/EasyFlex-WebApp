@@ -48,6 +48,7 @@ def _make_config(**overrides) -> AppConfig:
 		use_doc_number_as_variable_symbol=False,
 		infer_missing_dates=True,
 		enable_multi_invoice_segmentation=False,
+		date_day_first=True,
 		csv_enable_llm_mapping=False,
 	)
 	for key, value in overrides.items():

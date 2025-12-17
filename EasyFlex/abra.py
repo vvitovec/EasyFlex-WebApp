@@ -815,7 +815,8 @@ def _extract_ext_identifier(payload: Dict[str, Any], doc_endpoint: str) -> Optio
 		first = entries[0] if isinstance(entries[0], dict) else None
 		if not isinstance(first, dict):
 			return None
-		return first.get("cisDosle") or first.get("kod") or first.get("varSym")
+		# Prefer stable external id if present; fall back to request identifiers
+		return first.get("id") or first.get("cisDosle") or first.get("kod") or first.get("varSym")
 	except Exception:
 		return None
 
