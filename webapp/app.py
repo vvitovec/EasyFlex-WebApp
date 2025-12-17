@@ -337,37 +337,46 @@ def create_app() -> Flask:
 			.first_or_404()
 		)
 		invoice_data = dict(row.invoice_data or {})
-		error = None
+		field_labels = dict(EDITABLE_FIELDS)
+		warning_fields: list[str] = []
 		if request.method == "POST":
 			updates: Dict[str, Any] = {}
+			day_first = getattr(cfg, "date_day_first", True)
 			for field, _label in EDITABLE_FIELDS:
 				raw = (request.form.get(field) or "").strip()
 				if not raw:
 					updates[field] = None
 					continue
 				if field in DATE_FIELDS:
-					parsed = parse_invoice_date(raw, day_first=getattr(cfg, "date_day_first", True))
+					parsed = parse_invoice_date(raw, day_first=day_first)
 					if parsed is None:
-						error = f"Pole '{field}' obsahuje neplatné datum."
-						break
-					updates[field] = parsed
+						updates[field] = None
+						warning_fields.append(field_labels.get(field, field))
+					else:
+						updates[field] = parsed
 				elif field in FLOAT_FIELDS:
 					try:
 						updates[field] = _parse_float_value(raw)
 					except ValueError:
-						error = f"Pole '{field}' musí být číslo."
-						break
+						updates[field] = None
+						warning_fields.append(field_labels.get(field, field))
 				else:
 					updates[field] = raw
-			if error is None:
-				apply_invoice_updates(row, updates, day_first=getattr(cfg, "date_day_first", True))
+			apply_invoice_updates(row, updates, day_first=day_first)
+			if warning_fields:
+				flash(
+					"Změny uloženy. Některé hodnoty se nepodařilo převést a byly vymazány: "
+					+ ", ".join(warning_fields),
+					"warning",
+				)
+			else:
 				flash("Úprava faktury uložena.", "success")
-				return redirect(url_for("view_results", batch_id=row.batch_id))
+			return redirect(url_for("view_results", batch_id=row.batch_id))
 		return render_template(
 			"edit_invoice.html",
 			row=row,
 			invoice=invoice_data,
-			error=error,
+			error=None,
 			fields=EDITABLE_FIELDS,
 		)
 

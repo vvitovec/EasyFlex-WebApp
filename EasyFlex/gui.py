@@ -137,16 +137,12 @@ class InvoiceEditDialog:
 				continue
 			if field in date_fields:
 				parsed = parse_invoice_date(raw)
-				if parsed is None:
-					messagebox.showerror("EasyFlex", f"Pole '{field}' obsahuje neplatné datum.")
-					return None
-				updates[field] = parsed
+				updates[field] = parsed if parsed is not None else None
 			elif field in self.FLOAT_FIELDS:
 				try:
 					updates[field] = self._parse_float(raw)
 				except ValueError:
-					messagebox.showerror("EasyFlex", f"Pole '{field}' musí být číslo.")
-					return None
+					updates[field] = None
 			else:
 				updates[field] = raw
 		return updates
