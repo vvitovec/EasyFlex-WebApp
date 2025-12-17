@@ -52,10 +52,15 @@ def get_user_config() -> AppConfig:
 		cfg.abra_verify_tls = bool(settings.abra_verify_tls)
 	overrides = settings.config_overrides or {}
 
-	def _as_bool(value):
-		if isinstance(value, str):
-			return value.strip().lower() in {"1", "true", "yes", "on", "ano"}
-		return bool(value)
+        def _as_bool(value):
+                """Cast common truthy/falsey values to bool reliably."""
+
+                if isinstance(value, str):
+                        normalized = value.strip().lower()
+                        if normalized in {"0", "false", "no", "off", "ne"}:
+                                return False
+                        return normalized in {"1", "true", "yes", "on", "ano"}
+                return bool(value)
 
 	def _apply_override(attr: str, caster=None):
 		if attr not in overrides:
@@ -78,14 +83,16 @@ def get_user_config() -> AppConfig:
 	_apply_override("image_max_width", int)
 	_apply_override("image_jpeg_quality", int)
 	_apply_override("use_doc_number_as_variable_symbol", _as_bool)
-	_apply_override("infer_missing_dates", _as_bool)
-	_apply_override("enable_multi_invoice_segmentation", _as_bool)
-	_apply_override("csv_enable_llm_mapping", _as_bool)
-	_apply_override("date_day_first", _as_bool)
-	_apply_override("abra_doc_endpoint", str)
-	_apply_override("abra_doc_type_code", str)
-	_apply_override("abra_use_kod", _as_bool)
-	_apply_override("abra_duplicate_kod_strategy", str)
+        _apply_override("infer_missing_dates", _as_bool)
+        _apply_override("enable_multi_invoice_segmentation", _as_bool)
+        _apply_override("csv_enable_llm_mapping", _as_bool)
+        _apply_override("date_day_first", _as_bool)
+        _apply_override("abra_doc_endpoint", str)
+        _apply_override("abra_doc_type_code", str)
+        _apply_override("abra_use_kod", _as_bool)
+        _apply_override("abra_duplicate_kod_strategy", str)
+        if "infer_missing_dates" in overrides:
+                setattr(cfg, "use_issue_date_as_due_date", getattr(cfg, "infer_missing_dates", False))
 	# Store optional convenience values that are not part of AppConfig
 	if "auto_import" in overrides:
 		try:
