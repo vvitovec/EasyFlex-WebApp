@@ -20,7 +20,7 @@ try:
 except Exception:  # pragma: no cover - fallback when submodule missing
 	PDFInfoNotInstalledError = PDFPageCountError = PDFSyntaxError = Exception
 from PIL import Image
-from openai import OpenAI, RateLimitError, APITimeoutError, APIConnectionError
+from openai import OpenAI, RateLimitError, APITimeoutError, APIConnectionError, BadRequestError
 import pandas as pd
 
 from .models import InvoiceData, InvoiceItem, VATSummary, VATRate
@@ -474,6 +474,7 @@ class InvoiceExtractor:
 		current_model = self.model or DEFAULT_OPENAI_MODEL
 		fallback_model = DEFAULT_OPENAI_MODEL
 		used_fallback = False
+		sampling_forced_off = False
 		for attempt in range(self.max_retries + 1):
 			try:
 				token_param = "max_completion_tokens" if "gpt-5" in str(current_model) else "max_tokens"
@@ -483,7 +484,7 @@ class InvoiceExtractor:
 					"response_format": response_format,
 					"timeout": self.timeout_s,
 				}
-				if model_supports_sampling_params(current_model):
+				if model_supports_sampling_params(current_model) and not sampling_forced_off:
 					request_kwargs["temperature"] = 0
 					request_kwargs["top_p"] = self.top_p
 				if self.reasoning_effort and "gpt-5" in str(current_model):
@@ -515,6 +516,25 @@ class InvoiceExtractor:
 			except (APITimeoutError, APIConnectionError) as e:  # type: ignore[name-defined]
 				last_exception = e
 				if attempt < self.max_retries:
+					delay = self._calculate_backoff_delay(attempt)
+					await asyncio.sleep(delay)
+					continue
+				raise
+			except BadRequestError as e:
+				last_exception = e
+				if not sampling_forced_off and self._sampling_params_unsupported(e):
+					sampling_forced_off = True
+					delay = self._calculate_backoff_delay(attempt)
+					logger.warning(
+						"Model %s nepodporuje temperature/top_p (segmentace), opakuji bez nich po %.1fs",
+						current_model,
+						delay,
+					)
+					await asyncio.sleep(delay)
+					continue
+				if not used_fallback and current_model != fallback_model:
+					current_model = fallback_model
+					used_fallback = True
 					delay = self._calculate_backoff_delay(attempt)
 					await asyncio.sleep(delay)
 					continue
@@ -1017,6 +1037,30 @@ class InvoiceExtractor:
 		# No luck
 		raise json.JSONDecodeError("Unable to parse JSON from content", content, 0)
 
+	def _sampling_params_unsupported(self, exc: Exception) -> bool:
+		"""Detect OpenAI errors complaining about temperature/top_p being unsupported."""
+		if not isinstance(exc, BadRequestError):
+			return False
+		parts: List[str] = []
+		try:
+			body = getattr(exc, "body", None)
+			if body:
+				parts.append(json.dumps(body, ensure_ascii=False))
+		except Exception:
+			pass
+		try:
+			resp = getattr(exc, "response", None)
+			if resp is not None and hasattr(resp, "json"):
+				parts.append(json.dumps(resp.json(), ensure_ascii=False))
+		except Exception:
+			pass
+		message = getattr(exc, "message", None)
+		if message:
+			parts.append(str(message))
+		parts.append(str(exc))
+		text = " ".join(p for p in parts if p).lower()
+		return ("temperature" in text or "top_p" in text) and ("unsupported" in text or "does not support" in text)
+
 	async def _call_openai(
 		self,
 		images_b64: List[str],
@@ -1083,6 +1127,7 @@ class InvoiceExtractor:
 		fallback_model = DEFAULT_OPENAI_MODEL
 		current_max_tokens = self.max_tokens
 		used_fallback_model = False
+		sampling_forced_off = False
 		for attempt in range(self.max_retries + 1):
 			try:
 				token_param = "max_completion_tokens" if "gpt-5" in str(current_model) else "max_tokens"
@@ -1092,7 +1137,7 @@ class InvoiceExtractor:
 					"response_format": response_format,
 					"timeout": self.timeout_s,
 				}
-				if model_supports_sampling_params(current_model):
+				if model_supports_sampling_params(current_model) and not sampling_forced_off:
 					request_kwargs["temperature"] = self.temperature
 					request_kwargs["top_p"] = self.top_p
 				if self.reasoning_effort and "gpt-5" in str(current_model):
@@ -1177,6 +1222,23 @@ class InvoiceExtractor:
 				else:
 					logger.error("API chyba po %d pokusech: %s", self.max_retries + 1, str(e))
 					raise
+
+			except BadRequestError as e:
+				last_exception = e
+				if not sampling_forced_off and self._sampling_params_unsupported(e):
+					sampling_forced_off = True
+					delay = self._calculate_backoff_delay(attempt)
+					logger.warning(
+						"Model %s nepodporuje temperature/top_p, opakuji bez těchto parametrů (attempt %d/%d) po %.1fs",
+						current_model,
+						attempt + 1,
+						self.max_retries + 1,
+						delay,
+					)
+					await asyncio.sleep(delay)
+					continue
+				logger.error("OpenAI požadavek odmítnut: %s", str(e))
+				raise
 
 			except Exception as e:  # noqa: BLE001
 				# Non-retryable errors (auth, invalid request, etc.)

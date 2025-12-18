@@ -90,8 +90,10 @@ def model_supports_sampling_params(model_name: Optional[str]) -> bool:
 	if not model_name:
 		return True
 	model_lower = str(model_name).lower()
-	# Reasoning models (o1/o3) currently force the default temperature/top_p
-	return not (model_lower.startswith("o1") or model_lower.startswith("o3"))
+	# Reasoning models (o1/o3 or models containing 'reasoning') currently force the default temperature/top_p
+	if model_lower.startswith("o1") or model_lower.startswith("o3") or "reasoning" in model_lower:
+		return False
+	return True
 
 
 @dataclass
