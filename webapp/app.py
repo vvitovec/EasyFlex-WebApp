@@ -102,6 +102,43 @@ def _run_extraction(extractor: InvoiceExtractor, pdf_path: Path) -> List[Extract
 			loop.close()
 
 
+def _normalize_upload_label(filename: str, index: int) -> str:
+	"""Return a safe label for displaying the uploaded path."""
+	name = (filename or "").replace("\\", "/").strip().lstrip("./")
+	return name or f"upload-{index + 1}.pdf"
+
+
+def _dedupe_filename(base_name: str, used: set[str], *, fallback: str) -> str:
+	"""Ensure uploaded files saved to disk have unique, safe names."""
+	safe_base = secure_filename(base_name) or fallback
+	root = Path(safe_base).stem or "upload"
+	suffix = Path(safe_base).suffix or Path(fallback).suffix or ".pdf"
+	candidate = f"{root}{suffix}"
+	counter = 2
+	while candidate in used:
+		candidate = f"{root}-{counter}{suffix}"
+		counter += 1
+	used.add(candidate)
+	return candidate
+
+
+def _derive_batch_label(display_names: List[str]) -> str:
+	"""Derive human-friendly source label for a batch."""
+	if not display_names:
+		return "nahraná PDF"
+	if len(display_names) == 1:
+		return Path(display_names[0]).name
+	folder_hint = None
+	for name in display_names:
+		parts = name.replace("\\", "/").split("/")
+		if len(parts) > 1 and parts[0]:
+			folder_hint = parts[0]
+			break
+	if folder_hint:
+		return f"Složka {folder_hint} ({len(display_names)} PDF)"
+	return f"{len(display_names)} PDF souborů"
+
+
 def _parse_float_value(value: str) -> float:
 	import re  # local import to mirror GUI helper without global dependency
 	clean_value = re.sub(r"[\s\u00A0\u202F]", "", value)
@@ -238,23 +275,63 @@ def create_app() -> Flask:
 			flash("Nejprve vyplňte svůj OpenAI API klíč v Nastavení.", "warning")
 			return redirect(url_for("user_settings"))
 		if request.method == "POST":
-			file = request.files.get("pdf")
-			if file is None or file.filename == "":
-				flash("Vyberte prosím PDF soubor.", "warning")
+			uploaded_files = [f for f in request.files.getlist("pdfs") if f and f.filename]
+			if not uploaded_files:
+				fallback = request.files.get("pdf")
+				if fallback and fallback.filename:
+					uploaded_files = [fallback]
+			if not uploaded_files:
+				flash("Vyberte prosím alespoň jeden PDF soubor nebo složku.", "warning")
 				return render_template("upload_pdf.html")
-			filename = secure_filename(file.filename) or "upload.pdf"
+			pdf_files = []
+			skipped_non_pdf: list[str] = []
+			for item in uploaded_files:
+				if (item.filename or "").lower().endswith(".pdf"):
+					pdf_files.append(item)
+				else:
+					skipped_non_pdf.append(item.filename or "")
+			if skipped_non_pdf:
+				flash(
+					"Následující soubory byly přeskočeny (nejsou PDF): "
+					+ ", ".join(filter(None, skipped_non_pdf)),
+					"warning",
+				)
+			if not pdf_files:
+				flash("V nahraných souborech není žádné PDF.", "warning")
+				return render_template("upload_pdf.html")
+			display_names: list[str] = []
+			results: list[ExtractResult] = []
+			extraction_errors = 0
 			with tempfile.TemporaryDirectory() as tmpdir:
-				pdf_path = Path(tmpdir) / filename
-				file.save(pdf_path)
+				tmp_dir_path = Path(tmpdir)
+				used_names: set[str] = set()
+				saved_files: list[tuple[Path, str]] = []
+				for idx, storage in enumerate(pdf_files):
+					display_name = _normalize_upload_label(storage.filename, idx)
+					display_names.append(display_name)
+					save_name = _dedupe_filename(display_name, used_names, fallback=f"upload-{idx + 1}.pdf")
+					pdf_path = tmp_dir_path / save_name
+					storage.save(pdf_path)
+					saved_files.append((pdf_path, display_name))
 				extractor = InvoiceExtractor(config=cfg)
-				try:
-					results = _run_extraction(extractor, pdf_path)
-				except Exception as exc:  # noqa: BLE001
-					logger.exception("Chyba při extrakci PDF")
-					return render_template("upload_pdf.html", error=str(exc))
-			batch = create_batch_from_results(current_user, results, filename, source_type="pdf")
-			if any(getattr(res, "error", None) for res in results):
-				flash("Některé faktury obsahují chybu extrakce.", "warning")
+				# Sekvenční zpracování – stabilní paměť i vytížení API/serveru
+				for pdf_path, display_name in saved_files:
+					try:
+						file_results = _run_extraction(extractor, pdf_path)
+					except Exception as exc:  # noqa: BLE001
+						logger.exception("Chyba při extrakci PDF %s", display_name)
+						results.append(ExtractResult(file_path=display_name, data=None, error=str(exc)))
+						extraction_errors += 1
+						continue
+					for res in file_results:
+						res.file_path = display_name
+						if getattr(res, "error", None):
+							extraction_errors += 1
+					results.extend(file_results)
+			source_label = _derive_batch_label(display_names)
+			batch = create_batch_from_results(current_user, results, source_label, source_type="pdf")
+			if extraction_errors:
+				flash(f"Některé soubory obsahují chybu extrakce ({extraction_errors}).", "warning")
 			if getattr(cfg, "auto_import", False):
 				company_code, direction, doc_type_code = current_context(current_user.settings, base_cfg=cfg)
 				apply_context_to_config(cfg, company_code, direction, doc_type_code)

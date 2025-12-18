@@ -2,16 +2,50 @@
 
 {% block content %}
 <div class="card">
-	<h2>Nahrát PDF fakturu</h2>
-	<p>Vyberte jedno nebo více PDF s fakturami. Extrakce proběhne po nahrání.</p>
-	<p class="muted">Během zpracování prosím nezavírejte okno.</p>
+	<h2>Nahrát PDF faktury</h2>
+	<p>Vyberte jedno nebo více PDF s fakturami nebo rovnou celou složku. Extrakce proběhne po nahrání.</p>
+	<p class="muted">Soubory se zpracují postupně, takže se server zbytečně nepřetěžuje. Během zpracování prosím nezavírejte okno.</p>
 	{% if error %}
 		<div class="flash danger">{{ error }}</div>
 	{% endif %}
 	<form method="post" enctype="multipart/form-data" class="form show-loading" data-loading-message="Probíhá extrakce… prosím nezavírejte okno.">
-		<label for="pdf">PDF soubor</label>
-		<input id="pdf" name="pdf" type="file" accept="application/pdf" required>
+		<label for="pdfs">PDF soubory</label>
+		<input id="pdfs" name="pdfs" type="file" accept="application/pdf" multiple required>
+		<label class="checkbox-inline">
+			<input id="pick-folder" type="checkbox">
+			Nahrát celou složku s PDF
+		</label>
+		<p class="muted">Výběr složky funguje v moderních prohlížečích (Chrome, Edge). Pokud jej zapnete, vyprázdní se případně zvolený soubor.</p>
 		<button type="submit">Odeslat</button>
 	</form>
 </div>
+<script>
+	(function() {
+		const input = document.getElementById('pdfs');
+		const folderToggle = document.getElementById('pick-folder');
+		if (!input || !folderToggle) return;
+		const updatePickerMode = () => {
+			if (folderToggle.checked) {
+				input.setAttribute('webkitdirectory', '');
+				input.setAttribute('directory', '');
+			} else {
+				input.removeAttribute('webkitdirectory');
+				input.removeAttribute('directory');
+			}
+			input.value = '';
+		};
+		folderToggle.addEventListener('change', updatePickerMode);
+		updatePickerMode();
+		input.addEventListener('change', () => {
+			const form = input.closest('form');
+			if (!form) return;
+			const count = input.files ? input.files.length : 0;
+			if (count > 1) {
+				form.dataset.loadingMessage = `Zpracovávám ${count} PDF… prosím nezavírejte okno.`;
+			} else {
+				form.dataset.loadingMessage = "Probíhá extrakce… prosím nezavírejte okno.";
+			}
+		});
+	})();
+</script>
 {% endblock %}

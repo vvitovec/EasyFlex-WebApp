@@ -133,7 +133,12 @@ def create_batch_from_results(user: User, results: List[Any], source_label: str,
 			set_warning(invoice_dict, warning_text)
 		source_name = ""
 		if getattr(res, "file_path", None):
-			source_name = Path(getattr(res, "file_path")).name
+			raw_path = getattr(res, "file_path")
+			try:
+				path_obj = Path(raw_path)
+				source_name = str(path_obj) if not path_obj.is_absolute() else path_obj.name
+			except Exception:
+				source_name = str(raw_path)
 		row = InvoiceRow(
 			batch=batch,
 			row_index=idx,
