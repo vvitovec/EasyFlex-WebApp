@@ -1,3 +1,4 @@
+import json
 import pytest
 
 from EasyFlex.abra import (
@@ -417,3 +418,28 @@ def test_unverifiable_extid_not_claimed_foreign(monkeypatch) -> None:
 	result = import_to_abra(invoice, cfg)
 	assert isinstance(result, dict)
 	assert result.get("__status") == "failed-duplicate-unverifiable"
+
+def test_vat_codes_for_21_and_12_are_unchanged() -> None:
+	cfg = _make_config(abra_doc_endpoint="faktura-vydana")
+	invoice = {"cislo_dokladu": "VAT-21-12", "zaklad_dane_21": 1000.0, "zaklad_dane_12": 500.0}
+	payload = _build_invoice_payload(invoice, cfg, None, "faktura-vydana")
+	entry = payload["winstrom"]["faktura-vydana"][0]
+	codes = [pos.get("typSzbDphK") for pos in entry.get("polozkyDokladu", [])]
+	assert codes == ["typSzbDph.dphSniz", "typSzbDph.dphZakl"]
+
+def test_vat_code_for_zero_uses_dphOsv_and_no_dphNul() -> None:
+	cfg = _make_config(abra_doc_endpoint="faktura-vydana")
+	invoice = {"cislo_dokladu": "VAT-0", "zaklad_dane_0": 100.0}
+	payload = _build_invoice_payload(invoice, cfg, None, "faktura-vydana")
+	entry = payload["winstrom"]["faktura-vydana"][0]
+	codes = [pos.get("typSzbDphK") for pos in entry.get("polozkyDokladu", [])]
+	assert codes == ["typSzbDph.dphOsv"]
+	assert "typSzbDph.dphNul" not in json.dumps(payload)
+
+def test_header_has_no_typSzbDphK_with_multiple_rates() -> None:
+	cfg = _make_config(abra_doc_endpoint="faktura-vydana")
+	invoice = {"cislo_dokladu": "VAT-MIX", "zaklad_dane_21": 1000.0, "zaklad_dane_12": 500.0}
+	payload = _build_invoice_payload(invoice, cfg, None, "faktura-vydana")
+	entry = payload["winstrom"]["faktura-vydana"][0]
+	assert "typSzbDphK" not in entry
+

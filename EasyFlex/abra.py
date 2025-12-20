@@ -312,7 +312,7 @@ def _build_positions_from_totals(faktura: Dict[str, Any]) -> list[Dict[str, Any]
 	"""Create item positions strictly from explicitly extracted per-rate bases.
 
 	No computations are performed. Only the following fields are used if present:
-	- zaklad_dane_0 → typSzbDph.dphNul
+	- zaklad_dane_0 → typSzbDph.dphOsv
 	- zaklad_dane_12 → typSzbDph.dphSniz
 	- zaklad_dane_21 → typSzbDph.dphZakl
 	"""
@@ -327,7 +327,7 @@ def _build_positions_from_totals(faktura: Dict[str, Any]) -> list[Dict[str, Any]
 				"nazev": "Služby/zboží 0% DPH",
 				"mnozMj": 1,
 				"cenaMj": float(zaklad_0),
-				"typSzbDphK": "typSzbDph.dphNul",
+				"typSzbDphK": "typSzbDph.dphOsv",
 			})
 		if zaklad_12 is not None and float(zaklad_12) > 0:
 			positions.append({
@@ -398,15 +398,15 @@ def _build_positions_from_items(invoice_data: InvoiceData) -> list[Dict[str, Any
 				elif (invoice_data.zaklad_dane_12 or 0) > 0 and (invoice_data.zaklad_dane_21 or 0) == 0 and (invoice_data.zaklad_dane_0 or 0) == 0:
 					vat_guess = "typSzbDph.dphSniz"
 				elif (invoice_data.zaklad_dane_0 or 0) > 0 and (invoice_data.zaklad_dane_21 or 0) == 0 and (invoice_data.zaklad_dane_12 or 0) == 0:
-					vat_guess = "typSzbDph.dphNul"
+					vat_guess = "typSzbDph.dphOsv"
 				else:
 					# Fall back to ratio-based inference if only one non-zero rate can be deduced
 					faktura_dict = invoice_data.model_dump()
 					inferred = _infer_vat_code(faktura_dict)
-					vat_guess = {"high": "typSzbDph.dphZakl", "low": "typSzbDph.dphSniz", "none": "typSzbDph.dphNul"}.get(inferred)
+					vat_guess = {"high": "typSzbDph.dphZakl", "low": "typSzbDph.dphSniz", "none": "typSzbDph.dphOsv"}.get(inferred)
 			except Exception:
 				vat_guess = None
-			position["typSzbDphK"] = vat_guess or "typSzbDph.dphNul"
+			position["typSzbDphK"] = vat_guess or "typSzbDph.dphOsv"
 		
 		positions.append(position)
 	
@@ -420,7 +420,7 @@ def _map_vat_rate_to_code(vat_rate: VATRate) -> str:
     elif vat_rate == VATRate.LOW:
         return "typSzbDph.dphSniz"    # 12%
     else:
-        return "typSzbDph.dphNul"     # 0%
+        return "typSzbDph.dphOsv"     # 0%
 
 
 def _request_with_retry(method: str, url: str, *, auth: tuple[str, str], timeout_s: int, json_body: Optional[Dict] = None, verify: bool = True) -> requests.Response:
