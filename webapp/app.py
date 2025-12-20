@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +20,7 @@ from flask import (
 	abort,
 )
 from flask_login import login_required, current_user
+from sqlalchemy.exc import OperationalError
 from werkzeug.utils import secure_filename
 
 from EasyFlex.config import load_config
@@ -162,6 +164,9 @@ def _import_batch(batch: InvoiceBatch, cfg: Any, selected_ids: Optional[List[int
 	success = 0
 	error = 0
 	skipped = 0
+	processed = 0
+	slowest_row = None
+	slowest_s = 0.0
 	for row in sorted(batch.rows, key=lambda r: r.row_index):
 		row.marked_for_import = row.id in selected_set
 		if not row.marked_for_import:
@@ -191,6 +196,7 @@ def _import_batch(batch: InvoiceBatch, cfg: Any, selected_ids: Optional[List[int
 			"odberatel_dic": payload_dict.get("odberatel_dic"),
 		}
 		logger.info("Import ABRA řádek %s – odběratel %s", row.row_index, partner_preview)
+		start = time.perf_counter()
 		try:
 			resp = import_to_abra(payload_dict, cfg=cfg)
 			if isinstance(resp, dict) and resp.get("__status") == "skipped-duplicate":
@@ -231,7 +237,27 @@ def _import_batch(batch: InvoiceBatch, cfg: Any, selected_ids: Optional[List[int
 			row.error = str(exc)
 			row.status = None
 			error += 1
+		finally:
+			elapsed = time.perf_counter() - start
+			processed += 1
+			if elapsed > slowest_s:
+				slowest_s = elapsed
+				slowest_row = row.row_index
+			logger.info("Import ABRA řádek %s dokončen za %.2fs", row.row_index, elapsed)
 	db.session.commit()
+	if processed:
+		logger.info(
+			"Import ABRA souhrn: zpracováno %s faktur (OK=%s, chyba=%s, přeskočeno=%s); "
+			"nejdéle trvala řádek %s (%.2fs)",
+			processed,
+			success,
+			error,
+			skipped,
+			slowest_row,
+			slowest_s,
+		)
+	else:
+		logger.info("Import ABRA souhrn: zpracováno 0 faktur.")
 	return success, error, skipped
 
 
@@ -243,14 +269,19 @@ def create_app() -> Flask:
 
 	app.config["SECRET_KEY"] = os.getenv("EASYFLEX_SECRET_KEY", "dev-secret-key")
 
-		# Pokud je nastaveno DATABASE_URL (např. z Render Postgres), použij ho,
-		# jinak fallback na lokální SQLite soubor easyflex_web.db
+	# Pokud je nastaveno DATABASE_URL (např. z Render Postgres), použij ho,
+	# jinak fallback na lokální SQLite soubor easyflex_web.db
 	db_url = os.getenv("DATABASE_URL")
 	if db_url:
-    	# Render dává URL ve tvaru "postgres://", SQLAlchemy očekává "postgresql://"
+		# Render dává URL ve tvaru "postgres://", SQLAlchemy očekává "postgresql://"
 		if db_url.startswith("postgres://"):
 			db_url = db_url.replace("postgres://", "postgresql://", 1)
 		app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+		if db_url.startswith("postgresql://"):
+			app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+				"pool_pre_ping": True,
+				"pool_recycle": 300,
+			}
 	else:
 		app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
 	app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -720,30 +751,49 @@ def create_app() -> Flask:
 			"SET" if password else "MISSING",
 		)
 		if not password:
-			return
+			return True
 
-		admin = User.query.filter_by(username="admin").first()
-		if admin is None:
-			app.logger.info("ensure_admin_user: creating new admin user 'admin'")
-			admin = User(username="admin", is_admin=True)
-			admin.set_password(password)
-			db.session.add(admin)
-		else:
-			app.logger.info(
-				"ensure_admin_user: updating existing admin user id=%s", admin.id
-			)
-			admin.is_admin = True
-			admin.set_password(password)
+		max_attempts = 2
+		for attempt in range(max_attempts):
+			try:
+				admin = User.query.filter_by(username="admin").first()
+				if admin is None:
+					app.logger.info("ensure_admin_user: creating new admin user 'admin'")
+					admin = User(username="admin", is_admin=True)
+					admin.set_password(password)
+					db.session.add(admin)
+				else:
+					app.logger.info(
+						"ensure_admin_user: updating existing admin user id=%s", admin.id
+					)
+					admin.is_admin = True
+					admin.set_password(password)
 
-		db.session.commit()
-		app.logger.info("ensure_admin_user: admin user saved")
+				db.session.commit()
+				app.logger.info("ensure_admin_user: admin user saved")
+				return True
+			except OperationalError as exc:
+				db.session.rollback()
+				db.session.remove()
+				app.logger.warning(
+					"ensure_admin_user: transient DB error on attempt %s/%s: %s",
+					attempt + 1,
+					max_attempts,
+					exc,
+				)
+				if attempt + 1 < max_attempts:
+					time.sleep(0.2)
+				else:
+					return False
 
 	@app.before_request
 	def _run_admin_init_once():
 		"""Run ensure_admin_user() exactly once per process."""
 		if not app.config.get("_ADMIN_INITIALIZED", False):
-			ensure_admin_user()
-			app.config["_ADMIN_INITIALIZED"] = True
+			if ensure_admin_user():
+				app.config["_ADMIN_INITIALIZED"] = True
+			else:
+				app.logger.warning("ensure_admin_user: init failed, will retry on next request.")
 			
 	return app
 

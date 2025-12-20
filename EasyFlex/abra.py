@@ -428,35 +428,79 @@ def _request_with_retry(method: str, url: str, *, auth: tuple[str, str], timeout
 		raise RuntimeError(f"ABRA guard: blokován {method} na /adresar ({url})")
 	retries = [0.5, 1.0, 2.0, 4.0]
 	last_exc: Optional[Exception] = None
+	connect_timeout = min(5.0, float(timeout_s))
+	read_timeout = float(timeout_s)
+	timeout = (connect_timeout, read_timeout)
 	for attempt, backoff in enumerate([0.0] + retries, start=1):
 		if backoff > 0:
 			time.sleep(backoff)
+		start = time.perf_counter()
 		try:
-			resp = requests.request(method, url, auth=auth, timeout=timeout_s, json=json_body, verify=verify)
+			resp = requests.request(method, url, auth=auth, timeout=timeout, json=json_body, verify=verify)
+			elapsed = time.perf_counter() - start
 		except requests.exceptions.ConnectionError as exc:
+			elapsed = time.perf_counter() - start
 			if "getaddrinfo failed" in str(exc) or "Failed to resolve" in str(exc):
-				logger.error("ABRA DNS resolution failed for %s: %s", url, exc)
+				logger.error("ABRA DNS resolution failed for %s after %.2fs: %s", url, elapsed, exc)
 				raise RuntimeError(f"ABRA server not reachable: {url}") from exc
 			last_exc = exc
-			logger.warning("ABRA %s %s connection failed on attempt %s: %s", method, url, attempt, exc)
+			logger.warning(
+				"ABRA %s %s connection failed on attempt %s after %.2fs: %s",
+				method,
+				url,
+				attempt,
+				elapsed,
+				exc,
+			)
 			continue
 		except requests.exceptions.Timeout as exc:
+			elapsed = time.perf_counter() - start
 			last_exc = exc
-			logger.warning("ABRA %s %s timeout on attempt %s: %s", method, url, attempt, exc)
+			logger.warning(
+				"ABRA %s %s timeout on attempt %s after %.2fs (connect=%ss read=%ss): %s",
+				method,
+				url,
+				attempt,
+				elapsed,
+				connect_timeout,
+				read_timeout,
+				exc,
+			)
 			continue
 		except Exception as exc:  # noqa: BLE001
+			elapsed = time.perf_counter() - start
 			last_exc = exc
-			logger.warning("ABRA %s %s failed on attempt %s: %s", method, url, attempt, exc)
+			logger.warning(
+				"ABRA %s %s failed on attempt %s after %.2fs: %s",
+				method,
+				url,
+				attempt,
+				elapsed,
+				exc,
+			)
 			continue
 
 		if 500 <= resp.status_code < 600:
 			last_exc = RuntimeError(f"ABRA HTTP {resp.status_code}")
-			logger.warning("ABRA %s %s → %s, retrying...", method, url, resp.status_code)
+			logger.warning(
+				"ABRA %s %s → %s in %.2fs, retrying...",
+				method,
+				url,
+				resp.status_code,
+				elapsed,
+			)
 			continue
 
 		if resp.status_code in (429, 408, 425, 423):
 			retry_after_hdr = resp.headers.get('Retry-After')
 			last_exc = RuntimeError(f"ABRA HTTP {resp.status_code}")
+			logger.warning(
+				"ABRA %s %s → %s in %.2fs, retrying...",
+				method,
+				url,
+				resp.status_code,
+				elapsed,
+			)
 			if retry_after_hdr:
 				try:
 					delay = float(retry_after_hdr)
@@ -466,6 +510,7 @@ def _request_with_retry(method: str, url: str, *, auth: tuple[str, str], timeout
 					pass
 			continue
 
+		logger.info("ABRA %s %s → %s in %.2fs", method, url, resp.status_code, elapsed)
 		return resp
 
 	raise RuntimeError(f"ABRA request failed after retries: {method} {url}") from last_exc
