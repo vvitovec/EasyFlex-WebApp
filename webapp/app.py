@@ -17,6 +17,7 @@ from flask import (
 	redirect,
 	url_for,
 	flash,
+	send_file,
 	abort,
 )
 from flask_login import login_required, current_user
@@ -154,6 +155,24 @@ def _parse_float_value(value: str) -> float:
 def _has_minimal_invoice_data(inv: Dict[str, object]) -> bool:
 	"""Minimal sanity check to avoid importing empty rows."""
 	return bool(inv.get("cislo_dokladu") or inv.get("variabilni_symbol") or inv.get("odberatel_jmeno"))
+
+
+def _count_billable_results(results: List[ExtractResult]) -> int:
+	"""Return number of invoices we should bill for (non-empty extraction results)."""
+	count = 0
+	for res in results:
+		if getattr(res, "data", None) is not None:
+			count += 1
+	return count
+
+
+def _deduct_credits(user: User, amount: int) -> int:
+	"""Decrease user credits by amount and persist. Returns remaining credits."""
+	if amount <= 0:
+		return user.credits
+	user.credits = max(0, int(user.credits or 0) - amount)
+	db.session.commit()
+	return user.credits
 
 
 def _import_batch(batch: InvoiceBatch, cfg: Any, selected_ids: Optional[List[int]]) -> tuple[int, int, int]:
@@ -297,6 +316,25 @@ def create_app() -> Flask:
 	def dashboard():
 		return render_template("dashboard.html")
 
+	@app.route("/credits")
+	@login_required
+	def credits():
+		return render_template(
+			"credits.html",
+			account_number="254980360/0600",
+			price_per_credit=0.5,
+			min_purchase=100,
+		)
+
+	@app.route("/assets/qr-payment")
+	@login_required
+	def qr_payment():
+		base_dir = Path(__file__).resolve().parent
+		image_path = base_dir.parent / "assets" / "qr_payment.jpeg"
+		if not image_path.exists():
+			abort(404)
+		return send_file(image_path, mimetype="image/jpeg")
+
 	@app.route("/upload-pdf", methods=["GET", "POST"])
 	@login_required
 	def upload_pdf():
@@ -306,6 +344,9 @@ def create_app() -> Flask:
 			flash("Nejprve vyplňte svůj OpenAI API klíč v Nastavení.", "warning")
 			return redirect(url_for("user_settings"))
 		if request.method == "POST":
+			if current_user.credits <= 0:
+				flash("Nemáte žádné kredity. Dokupte si je v sekci Kredity.", "danger")
+				return redirect(url_for("credits"))
 			uploaded_files = [f for f in request.files.getlist("pdfs") if f and f.filename]
 			if not uploaded_files:
 				fallback = request.files.get("pdf")
@@ -330,6 +371,14 @@ def create_app() -> Flask:
 			if not pdf_files:
 				flash("V nahraných souborech není žádné PDF.", "warning")
 				return render_template("upload_pdf.html")
+			min_required = len(pdf_files)
+			if current_user.credits < min_required:
+				flash(
+					f"Nemáte dostatek kreditů pro zpracování {len(pdf_files)} PDF. "
+					"Otevřete sekci Kredity a doplňte si zůstatek.",
+					"danger",
+				)
+				return redirect(url_for("credits"))
 			display_names: list[str] = []
 			results: list[ExtractResult] = []
 			extraction_errors = 0
@@ -359,10 +408,21 @@ def create_app() -> Flask:
 						if getattr(res, "error", None):
 							extraction_errors += 1
 					results.extend(file_results)
+			billable_results = _count_billable_results(results)
+			if billable_results > current_user.credits:
+				flash(
+					f"Extrakce našla {billable_results} faktur, ale máte k dispozici jen "
+					f"{current_user.credits} kreditů. Dokupte kredity a zkuste to prosím znovu.",
+					"danger",
+				)
+				return redirect(url_for("credits"))
 			source_label = _derive_batch_label(display_names)
 			batch = create_batch_from_results(current_user, results, source_label, source_type="pdf")
 			if extraction_errors:
 				flash(f"Některé soubory obsahují chybu extrakce ({extraction_errors}).", "warning")
+			if billable_results:
+				remaining = _deduct_credits(current_user, billable_results)
+				flash(f"Odečteno {billable_results} kreditů. Aktuální zůstatek: {remaining}.", "info")
 			if getattr(cfg, "auto_import", False):
 				company_code, direction, doc_type_code = current_context(current_user.settings, base_cfg=cfg)
 				apply_context_to_config(cfg, company_code, direction, doc_type_code)
@@ -377,6 +437,9 @@ def create_app() -> Flask:
 		cfg = get_user_config()
 		ensure_seed_data(current_user, cfg)
 		if request.method == "POST":
+			if current_user.credits <= 0:
+				flash("Nemáte žádné kredity. Dokupte si je v sekci Kredity.", "danger")
+				return redirect(url_for("credits"))
 			file = request.files.get("table")
 			if file is None or file.filename == "":
 				flash("Vyberte prosím CSV/XLSX/XML soubor.", "warning")
@@ -391,7 +454,20 @@ def create_app() -> Flask:
 				except Exception as exc:  # noqa: BLE001
 					logger.exception("Chyba při zpracování tabulky")
 					return render_template("upload_table.html", error=str(exc))
+			credit_cost = len(invoices) * 2
+			if credit_cost == 0:
+				flash("V tabulce nebyly nalezeny žádné faktury.", "warning")
+				return render_template("upload_table.html")
+			if current_user.credits < credit_cost:
+				flash(
+					f"Pro zpracování tabulky potřebujete {credit_cost} kreditů, "
+					f"ale k dispozici máte {current_user.credits}. Dokupte kredity a zkuste to znovu.",
+					"danger",
+				)
+				return redirect(url_for("credits"))
 			batch = create_batch_from_invoices(current_user, invoices, filename, source_type="table")
+			remaining = _deduct_credits(current_user, credit_cost)
+			flash(f"Odečteno {credit_cost} kreditů. Aktuální zůstatek: {remaining}.", "info")
 			if getattr(cfg, "auto_import", False):
 				company_code, direction, doc_type_code = current_context(current_user.settings, base_cfg=cfg)
 				apply_context_to_config(cfg, company_code, direction, doc_type_code)
@@ -710,7 +786,8 @@ def create_app() -> Flask:
 		message = None
 		error = None
 		if request.method == "POST":
-			if request.form.get("action") == "delete":
+			action = request.form.get("action") or "create"
+			if action == "delete":
 				try:
 					user_id = int(request.form.get("user_id", "0"))
 				except ValueError:
@@ -724,6 +801,31 @@ def create_app() -> Flask:
 					db.session.delete(user_to_delete)
 					db.session.commit()
 					message = f"Uživatel {user_to_delete.username} smazán."
+			elif action == "adjust_credits":
+				try:
+					user_id = int(request.form.get("user_id", "0"))
+				except ValueError:
+					user_id = 0
+				try:
+					amount = int(request.form.get("amount", "0"))
+				except ValueError:
+					amount = 0
+				direction = request.form.get("direction") or "add"
+				target_user = User.query.get(user_id)
+				if target_user is None:
+					error = "Uživatel nebyl nalezen."
+				elif amount <= 0:
+					error = "Zadejte částku větší než 0."
+				else:
+					before = target_user.credits or 0
+					if direction == "subtract":
+						target_user.credits = max(0, before - amount)
+						diff = before - target_user.credits
+						message = f"Uživateli {target_user.username} odebráno {diff} kreditů."
+					else:
+						target_user.credits = before + amount
+						message = f"Uživateli {target_user.username} přidáno {amount} kreditů."
+					db.session.commit()
 			else:
 				username = (request.form.get("username") or "").strip()
 				password = request.form.get("password") or ""
@@ -736,7 +838,7 @@ def create_app() -> Flask:
 					user.set_password(password)
 					db.session.add(user)
 					db.session.commit()
-					message = f"Uživatel {username} vytvořen."
+					message = f"Uživatel {username} vytvořen s 10 startovními kredity."
 		users = User.query.order_by(User.username.asc()).all()
 		return render_template("users.html", users=users, message=message, error=error)
 
@@ -761,6 +863,7 @@ def create_app() -> Flask:
 					app.logger.info("ensure_admin_user: creating new admin user 'admin'")
 					admin = User(username="admin", is_admin=True)
 					admin.set_password(password)
+					admin.credits = 10
 					db.session.add(admin)
 				else:
 					app.logger.info(
@@ -768,6 +871,8 @@ def create_app() -> Flask:
 					)
 					admin.is_admin = True
 					admin.set_password(password)
+					if admin.credits is None:
+						admin.credits = 10
 
 				db.session.commit()
 				app.logger.info("ensure_admin_user: admin user saved")
