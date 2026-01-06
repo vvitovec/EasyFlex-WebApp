@@ -316,6 +316,14 @@ def create_app() -> Flask:
 	def dashboard():
 		return render_template("dashboard.html")
 
+	@app.route("/napoveda")
+	def help_page():
+		return render_template(
+			"help.html",
+			contact_email="vvitovec27@gmail.com",
+			contact_phone="+420 774 943 304",
+		)
+
 	@app.route("/credits")
 	@login_required
 	def credits():
@@ -851,9 +859,10 @@ def create_app() -> Flask:
 				else:
 					user = User(username=username)
 					user.set_password(password)
+					user.credits = 100
 					db.session.add(user)
 					db.session.commit()
-					message = f"Uživatel {username} vytvořen s 10 startovními kredity."
+					message = f"Uživatel {username} vytvořen se 100 startovními kredity."
 		users = User.query.order_by(User.username.asc()).all()
 		return render_template("users.html", users=users, message=message, error=error)
 
@@ -878,7 +887,7 @@ def create_app() -> Flask:
 					app.logger.info("ensure_admin_user: creating new admin user 'admin'")
 					admin = User(username="admin", is_admin=True)
 					admin.set_password(password)
-					admin.credits = 10
+					admin.credits = 100
 					db.session.add(admin)
 				else:
 					app.logger.info(
@@ -887,7 +896,7 @@ def create_app() -> Flask:
 					admin.is_admin = True
 					admin.set_password(password)
 					if admin.credits is None:
-						admin.credits = 10
+						admin.credits = 100
 
 				db.session.commit()
 				app.logger.info("ensure_admin_user: admin user saved")
