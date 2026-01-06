@@ -33,7 +33,7 @@ from EasyFlex.models import InvoiceData
 
 from .models import init_db, db, User, InvoiceBatch, InvoiceRow
 from .auth import init_auth
-from .config_utils import get_user_config
+from .config_utils import EXTRACTOR_OVERRIDE_KEYS, get_user_config
 from .invoice_batches import (
 	DISPLAY_COLUMNS,
 	COLUMN_LABELS,
@@ -574,6 +574,8 @@ def create_app() -> Flask:
 		settings = current_user.settings
 		error = None
 		active_tab = request.form.get("active_tab") or request.args.get("tab") or "abra"
+		if not current_user.is_admin and active_tab == "extractor":
+			active_tab = "abra"
 		# Handle quick actions for ABRA entities
 		action = request.form.get("action") if request.method == "POST" else None
 		if action and settings is not None:
@@ -617,7 +619,10 @@ def create_app() -> Flask:
 		# Main settings save
 		if request.method == "POST" and settings is not None and not action:
 			active_tab = request.form.get("active_tab") or active_tab
-			settings.openai_api_key = (request.form.get("openai_api_key") or "").strip() or None
+			if current_user.is_admin:
+				settings.openai_api_key = (request.form.get("openai_api_key") or "").strip() or None
+			else:
+				settings.openai_api_key = None
 			settings.abra_server = (request.form.get("abra_server") or "").strip() or None
 			port_raw = (request.form.get("abra_port") or "").strip()
 			if port_raw and not port_raw.isdigit():
@@ -636,36 +641,38 @@ def create_app() -> Flask:
 				else:
 					overrides[key] = value
 
-			_set_override("openai_model", (request.form.get("openai_model") or "").strip() or None)
-			for int_field, form_key in (
-				("concurrency", "concurrency"),
-				("max_tokens", "max_tokens"),
-				("dpi", "pdf_dpi"),
-				("max_pages", "max_pages"),
-				("openai_max_retries", "max_retries"),
-				("image_max_width", "image_max_width"),
-				("image_jpeg_quality", "image_jpeg_quality"),
-			):
-				raw_val = (request.form.get(form_key) or "").strip()
-				if raw_val:
-					try:
-						_set_override(int_field, int(raw_val))
-					except ValueError:
-						error = f"Pole {form_key} musí být číslo."
-						break
-				else:
-					_set_override(int_field, None)
-			if error is None:
-				for float_field, form_key in (("openai_request_delay", "request_delay"),):
+			if current_user.is_admin:
+				_set_override("openai_model", (request.form.get("openai_model") or "").strip() or None)
+				for int_field, form_key in (
+					("concurrency", "concurrency"),
+					("max_tokens", "max_tokens"),
+					("dpi", "pdf_dpi"),
+					("max_pages", "max_pages"),
+					("openai_max_retries", "max_retries"),
+					("image_max_width", "image_max_width"),
+					("image_jpeg_quality", "image_jpeg_quality"),
+				):
 					raw_val = (request.form.get(form_key) or "").strip()
 					if raw_val:
 						try:
-							_set_override(float_field, float(raw_val))
+							_set_override(int_field, int(raw_val))
 						except ValueError:
 							error = f"Pole {form_key} musí být číslo."
 							break
 					else:
-						_set_override(float_field, None)
+						_set_override(int_field, None)
+			if error is None:
+				if current_user.is_admin:
+					for float_field, form_key in (("openai_request_delay", "request_delay"),):
+						raw_val = (request.form.get(form_key) or "").strip()
+						if raw_val:
+							try:
+								_set_override(float_field, float(raw_val))
+							except ValueError:
+								error = f"Pole {form_key} musí být číslo."
+								break
+						else:
+							_set_override(float_field, None)
 			if error is None:
 				_set_override("use_doc_number_as_variable_symbol", bool(request.form.get("use_doc_number_as_variable_symbol")))
 				_set_override("infer_missing_dates", bool(request.form.get("infer_missing_dates")))
@@ -678,6 +685,9 @@ def create_app() -> Flask:
 					_set_override("abra_doc_endpoint", (request.form.get("abra_doc_endpoint") or "").strip() or None)
 				if "abra_doc_type_code" in request.form:
 					_set_override("abra_doc_type_code", (request.form.get("abra_doc_type_code") or "").strip() or None)
+				if not current_user.is_admin:
+					for key in EXTRACTOR_OVERRIDE_KEYS:
+						overrides.pop(key, None)
 				settings.config_overrides = overrides
 				db.session.commit()
 				flash("Nastavení uloženo.", "success")
