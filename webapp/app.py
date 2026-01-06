@@ -347,11 +347,21 @@ def create_app() -> Flask:
 	@login_required
 	def upload_pdf():
 		cfg = get_user_config()
+		segmentation_enabled = bool(getattr(cfg, "enable_multi_invoice_segmentation", False))
 		ensure_seed_data(current_user, cfg)
-		if request.method == "POST" and not cfg.openai_api_key:
-			flash("Nejprve vyplňte svůj OpenAI API klíč v Nastavení.", "warning")
-			return redirect(url_for("user_settings"))
 		if request.method == "POST":
+			segmentation_enabled = bool(request.form.get("enable_multi_invoice_segmentation"))
+			cfg.enable_multi_invoice_segmentation = segmentation_enabled
+			settings = getattr(current_user, "settings", None)
+			if settings is not None:
+				overrides = dict(settings.config_overrides or {})
+				if overrides.get("enable_multi_invoice_segmentation") != segmentation_enabled:
+					overrides["enable_multi_invoice_segmentation"] = segmentation_enabled
+					settings.config_overrides = overrides
+					db.session.commit()
+			if not cfg.openai_api_key:
+				flash("Nejprve vyplňte svůj OpenAI API klíč v Nastavení.", "warning")
+				return redirect(url_for("user_settings"))
 			if current_user.credits <= 0:
 				flash("Nemáte žádné kredity. Dokupte si je v sekci Kredity.", "danger")
 				return redirect(url_for("credits"))
@@ -362,7 +372,7 @@ def create_app() -> Flask:
 					uploaded_files = [fallback]
 			if not uploaded_files:
 				flash("Vyberte prosím alespoň jeden PDF soubor nebo složku.", "warning")
-				return render_template("upload_pdf.html")
+				return render_template("upload_pdf.html", cfg=cfg)
 			pdf_files = []
 			skipped_non_pdf: list[str] = []
 			for item in uploaded_files:
@@ -378,7 +388,7 @@ def create_app() -> Flask:
 				)
 			if not pdf_files:
 				flash("V nahraných souborech není žádné PDF.", "warning")
-				return render_template("upload_pdf.html")
+				return render_template("upload_pdf.html", cfg=cfg)
 			min_required = len(pdf_files)
 			if current_user.credits < min_required:
 				flash(
@@ -437,7 +447,8 @@ def create_app() -> Flask:
 				_import_batch(batch, cfg, None)
 				flash("Auto-import dokončen (viz statusy níže).", "info")
 			return redirect(url_for("view_results", batch_id=batch.id))
-		return render_template("upload_pdf.html")
+		cfg.enable_multi_invoice_segmentation = segmentation_enabled
+		return render_template("upload_pdf.html", cfg=cfg)
 
 	@app.route("/upload-table", methods=["GET", "POST"])
 	@login_required
@@ -689,7 +700,6 @@ def create_app() -> Flask:
 			if error is None:
 				_set_override("use_doc_number_as_variable_symbol", bool(request.form.get("use_doc_number_as_variable_symbol")))
 				_set_override("infer_missing_dates", bool(request.form.get("infer_missing_dates")))
-				_set_override("enable_multi_invoice_segmentation", bool(request.form.get("enable_multi_invoice_segmentation")))
 				_set_override("csv_enable_llm_mapping", bool(request.form.get("csv_enable_llm_mapping")))
 				_set_override("auto_import", bool(request.form.get("auto_import")))
 				date_order = (request.form.get("date_order") or "dd-mm").strip().lower()

@@ -16,6 +16,10 @@
 			<input id="pick-folder" type="checkbox">
 			Nahrát celou složku s PDF
 		</label>
+		<label class="checkbox-inline">
+			<input type="checkbox" name="enable_multi_invoice_segmentation" value="1" {% if cfg.enable_multi_invoice_segmentation %}checked{% endif %}>
+			Povolit segmentaci více faktur v jednom PDF
+		</label>
 		<p class="muted">Výběr složky funguje v moderních prohlížečích (Chrome, Edge). Pokud jej zapnete, vyprázdní se případně zvolený soubor.</p>
 		<button type="submit">Odeslat</button>
 	</form>
