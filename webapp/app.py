@@ -454,20 +454,25 @@ def create_app() -> Flask:
 				except Exception as exc:  # noqa: BLE001
 					logger.exception("Chyba při zpracování tabulky")
 					return render_template("upload_table.html", error=str(exc))
-			credit_cost = len(invoices) * 2
-			if credit_cost == 0:
+			invoice_count = len(invoices)
+			credit_cost = 2 if invoice_count > 0 else 0
+			if invoice_count == 0:
 				flash("V tabulce nebyly nalezeny žádné faktury.", "warning")
 				return render_template("upload_table.html")
 			if current_user.credits < credit_cost:
 				flash(
-					f"Pro zpracování tabulky potřebujete {credit_cost} kreditů, "
+					f"Pro zpracování tabulky potřebujete {credit_cost} kredity, "
 					f"ale k dispozici máte {current_user.credits}. Dokupte kredity a zkuste to znovu.",
 					"danger",
 				)
 				return redirect(url_for("credits"))
 			batch = create_batch_from_invoices(current_user, invoices, filename, source_type="table")
 			remaining = _deduct_credits(current_user, credit_cost)
-			flash(f"Odečteno {credit_cost} kreditů. Aktuální zůstatek: {remaining}.", "info")
+			flash(
+				f"Z tabulky načteno {invoice_count} faktur. Odečteno {credit_cost} kreditů. "
+				f"Aktuální zůstatek: {remaining}.",
+				"info",
+			)
 			if getattr(cfg, "auto_import", False):
 				company_code, direction, doc_type_code = current_context(current_user.settings, base_cfg=cfg)
 				apply_context_to_config(cfg, company_code, direction, doc_type_code)
