@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card">
+	<h2>Kredity</h2>
+	<p>Každý uživatel má svůj kreditový zůstatek. Bez kreditů nelze spouštět nové extrakce.</p>
+	<div class="credit-summary">
+		<div class="credit-value">{{ current_user.credits or 0 }}</div>
+		<div class="credit-label">aktuální zůstatek</div>
+	</div>
+	<p class="muted">Nový uživatel dostává 10 kreditů zdarma na vyzkoušení.</p>
+</div>
+
+<div class="card">
+	<h3>Ceník funkcí</h3>
+	<ul>
+		<li>Extrakce faktury z PDF: <strong>1 kredit</strong> za každou fakturu.</li>
+		<li>Extrakce faktury z tabulky (CSV/XLSX/XML): <strong>2 kredity</strong> za každou fakturu.</li>
+	</ul>
+</div>
+
+<div class="card">
+	<h3>Dobití kreditů</h3>
+	<p>Zpracování probíhá manuálně administrátorem. Kredity obvykle připíšeme do 30 minut, nejpozději do 24 hodin. Kdyby se něco pokazilo, kontaktujte nás.</p>
+	<div class="inline-payment">
+		<div class="payment-details">
+			<div><strong>Číslo účtu:</strong> {{ account_number }}</div>
+			<div><strong>Zpráva pro příjemce:</strong> uveďte vaše uživatelské jméno</div>
+			<div><strong>Cena:</strong> 1 kredit = {{ "%.1f"|format(price_per_credit) }} Kč</div>
+			<div><strong>Minimální nákup:</strong> {{ min_purchase }} kreditů ({{ "%.1f"|format(price_per_credit * min_purchase) }} Kč)</div>
+		</div>
+		<div class="qr-box">
+			<img src="{{ url_for('qr_payment') }}" alt="QR platba" loading="lazy">
+			<div class="muted center">Naskenujte QR pro platbu</div>
+		</div>
+	</div>
+	<p class="muted">Po přijetí platby vám admin kredity ručně připíše.</p>
+</div>
+{% endblock %}

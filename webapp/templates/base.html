@@ -14,6 +14,8 @@
 				<a href="{{ url_for('dashboard') }}">Dashboard</a>
 				<a href="{{ url_for('upload_pdf') }}">Nahrát PDF</a>
 				<a href="{{ url_for('upload_table') }}">Nahrát tabulku</a>
+				<a href="{{ url_for('credits') }}">Kredity</a>
+				<span class="credit-chip">Zůstatek: {{ current_user.credits or 0 }} kreditů</span>
 				<a href="{{ url_for('user_settings') }}">Nastavení</a>
 				{% if current_user.is_admin %}
 					<a href="{{ url_for('manage_users') }}">Uživatelé</a>

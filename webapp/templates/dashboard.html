@@ -12,4 +12,15 @@
 		{% endif %}
 	</div>
 </div>
+<div class="card">
+	<h3>Stav kreditů</h3>
+	<p class="muted">Kredity se odečítají za každou extrakci. Pokud dojdou, není možné spustit další zpracování.</p>
+	<div class="credit-summary">
+		<div class="credit-value">{{ current_user.credits or 0 }}</div>
+		<div class="credit-label">aktuální zůstatek</div>
+	</div>
+	<div class="actions">
+		<a class="button secondary" href="{{ url_for('credits') }}">Detail a dobití kreditů</a>
+	</div>
+</div>
 {% endblock %}

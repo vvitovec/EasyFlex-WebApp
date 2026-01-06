@@ -20,10 +20,13 @@ def main() -> None:
 		if user:
 			user.is_admin = True
 			user.set_password(password)
+			if user.credits is None:
+				user.credits = 10
 			action = "aktualizován"
 		else:
 			user = User(username="admin", is_admin=True)
 			user.set_password(password)
+			user.credits = 10
 			db.session.add(user)
 			action = "vytvořen"
 		db.session.commit()

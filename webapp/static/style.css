@@ -25,6 +25,17 @@ body {
 	font-weight: 500;
 }
 
+.credit-chip {
+	display: inline-block;
+	background: #0a4f8c;
+	color: #e6f1ff;
+	border: 1px solid rgba(255, 255, 255, 0.2);
+	padding: 6px 10px;
+	border-radius: 999px;
+	font-size: 14px;
+	margin-left: 12px;
+}
+
 .content {
 	max-width: 1000px;
 	margin: 24px auto;
@@ -196,6 +207,95 @@ input[type="file"] {
 .flash.error {
 	background: #ffecec;
 	color: #8a1f1f;
+}
+
+.credit-balance {
+	font-weight: 700;
+	color: #0f5fa6;
+	margin-bottom: 6px;
+}
+
+.credit-actions {
+	display: grid;
+	gap: 6px;
+}
+
+.inline-credit-form {
+	display: grid;
+	grid-template-columns: 1fr auto;
+	gap: 6px;
+	align-items: center;
+}
+
+.inline-credit-form input[type="number"] {
+	padding: 6px 8px;
+}
+
+.sr-only {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	border: 0;
+}
+
+.credit-summary {
+	display: flex;
+	align-items: baseline;
+	gap: 10px;
+	margin: 8px 0 4px;
+}
+
+.credit-value {
+	font-size: 32px;
+	font-weight: 800;
+	color: #0f5fa6;
+	line-height: 1.1;
+}
+
+.credit-label {
+	color: #606775;
+	font-weight: 600;
+}
+
+.inline-payment {
+	display: grid;
+	grid-template-columns: 1.2fr 0.8fr;
+	gap: 16px;
+	align-items: center;
+}
+
+.payment-details {
+	display: grid;
+	gap: 6px;
+	padding: 10px;
+	border: 1px solid #e1e3e8;
+	border-radius: 8px;
+	background: #fafbff;
+}
+
+.qr-box {
+	text-align: center;
+}
+
+.qr-box img {
+	max-width: 220px;
+	width: 100%;
+	border-radius: 8px;
+	border: 1px solid #e1e3e8;
+}
+
+.center {
+	text-align: center;
+}
+
+@media (max-width: 720px) {
+	.inline-payment {
+		grid-template-columns: 1fr;
+	}
 }
 
 .form-actions {

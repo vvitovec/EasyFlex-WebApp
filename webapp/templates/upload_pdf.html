@@ -5,6 +5,7 @@
 	<h2>Nahrát PDF faktury</h2>
 	<p>Vyberte jedno nebo více PDF s fakturami nebo rovnou celou složku. Extrakce proběhne po nahrání.</p>
 	<p class="muted">Soubory se zpracují postupně, takže se server zbytečně nepřetěžuje. Během zpracování prosím nezavírejte okno.</p>
+	<p><strong>Cena:</strong> 1 kredit za každou fakturu z PDF. Aktuální zůstatek: {{ current_user.credits or 0 }} kreditů.</p>
 	{% if error %}
 		<div class="flash danger">{{ error }}</div>
 	{% endif %}

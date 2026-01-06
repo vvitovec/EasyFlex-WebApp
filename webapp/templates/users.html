@@ -25,6 +25,7 @@
 			<tr>
 				<th>Uživatel</th>
 				<th>Admin</th>
+				<th>Kredity</th>
 				<th>Akce</th>
 			</tr>
 		</thead>
@@ -34,12 +35,33 @@
 					<td>{{ user.username }}</td>
 					<td>{{ "Ano" if user.is_admin else "Ne" }}</td>
 					<td>
+						<div class="credit-balance">{{ user.credits or 0 }} kreditů</div>
+						<div class="credit-actions">
+							<form method="post" class="inline-credit-form">
+								<input type="hidden" name="action" value="adjust_credits">
+								<input type="hidden" name="direction" value="add">
+								<input type="hidden" name="user_id" value="{{ user.id }}">
+								<label for="add-{{ user.id }}" class="sr-only">Přidat kredity</label>
+								<input id="add-{{ user.id }}" name="amount" type="number" min="1" value="10" required>
+								<button type="submit" class="button small">Přidat</button>
+							</form>
+							<form method="post" class="inline-credit-form">
+								<input type="hidden" name="action" value="adjust_credits">
+								<input type="hidden" name="direction" value="subtract">
+								<input type="hidden" name="user_id" value="{{ user.id }}">
+								<label for="remove-{{ user.id }}" class="sr-only">Odebrat kredity</label>
+								<input id="remove-{{ user.id }}" name="amount" type="number" min="1" value="10" required>
+								<button type="submit" class="button small secondary">Odebrat</button>
+							</form>
+						</div>
+					</td>
+					<td>
 						{% if user.id != current_user.id %}
-						<form method="post" onsubmit="return confirm('Opravdu smazat uživatele {{ user.username }}?');">
-							<input type="hidden" name="action" value="delete">
-							<input type="hidden" name="user_id" value="{{ user.id }}">
-							<button type="submit" class="button small secondary">Smazat</button>
-						</form>
+							<form method="post" onsubmit="return confirm('Opravdu smazat uživatele {{ user.username }}?');">
+								<input type="hidden" name="action" value="delete">
+								<input type="hidden" name="user_id" value="{{ user.id }}">
+								<button type="submit" class="button small secondary">Smazat</button>
+							</form>
 						{% else %}
 							—
 						{% endif %}

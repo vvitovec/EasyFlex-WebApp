@@ -18,6 +18,7 @@ class User(db.Model, UserMixin):
 	username = db.Column(db.String(80), unique=True, nullable=False)
 	password_hash = db.Column(db.String(255), nullable=False)
 	is_admin = db.Column(db.Boolean, default=False, nullable=False)
+	credits = db.Column(db.Integer, default=10, nullable=False, server_default=text("10"))
 	settings = db.relationship(
 		"UserSettings",
 		uselist=False,
@@ -139,3 +140,8 @@ def init_db(app) -> None:
 		if "config_overrides" not in columns:
 			with engine.begin() as conn:
 				conn.execute(text("ALTER TABLE user_settings ADD COLUMN config_overrides TEXT"))
+		user_columns = {col["name"] for col in insp.get_columns("user")}
+		if "credits" not in user_columns:
+			table_name = '"user"' if engine.dialect.name == "postgresql" else "user"
+			with engine.begin() as conn:
+				conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN credits INTEGER DEFAULT 10 NOT NULL"))
