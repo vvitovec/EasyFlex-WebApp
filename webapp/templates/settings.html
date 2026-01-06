@@ -8,14 +8,16 @@
 		<div class="flash danger">{{ error }}</div>
 	{% endif %}
 	<div class="tabs">
-		<div class="tab-headers">
-			<button type="button" data-tab="abra" class="{% if active_tab == 'abra' %}active{% endif %}">ABRA</button>
-			<button type="button" data-tab="extractor" class="{% if active_tab == 'extractor' %}active{% endif %}">Extractor</button>
-			<button type="button" data-tab="extraction" class="{% if active_tab == 'extraction' %}active{% endif %}">Extrakce</button>
-			<button type="button" data-tab="import" class="{% if active_tab == 'import' %}active{% endif %}">Import do ABRA</button>
-		</div>
-		<form method="post">
-			<input type="hidden" id="active_tab" name="active_tab" value="{{ active_tab }}">
+			<div class="tab-headers">
+				<button type="button" data-tab="abra" class="{% if active_tab == 'abra' %}active{% endif %}">ABRA</button>
+				{% if current_user.is_admin %}
+					<button type="button" data-tab="extractor" class="{% if active_tab == 'extractor' %}active{% endif %}">Extractor</button>
+				{% endif %}
+				<button type="button" data-tab="extraction" class="{% if active_tab == 'extraction' %}active{% endif %}">Extrakce</button>
+				<button type="button" data-tab="import" class="{% if active_tab == 'import' %}active{% endif %}">Import do ABRA</button>
+			</div>
+			<form method="post">
+				<input type="hidden" id="active_tab" name="active_tab" value="{{ active_tab }}">
 			<div class="tab-content {% if active_tab == 'abra' %}active{% endif %}" id="tab-abra">
 				<label for="abra_server">ABRA server</label>
 				<input id="abra_server" name="abra_server" type="text" value="{{ settings.abra_server or '' }}">
@@ -38,40 +40,42 @@
 				</label>
 			</div>
 
-			<div class="tab-content {% if active_tab == 'extractor' %}active{% endif %}" id="tab-extractor">
-				<label for="openai_api_key">OpenAI API Key</label>
-				<div class="input-with-eye">
-					<input id="openai_api_key" name="openai_api_key" type="password" value="{{ settings.openai_api_key or '' }}">
-					<button type="button" class="eye-toggle" data-target="openai_api_key" aria-label="Zobrazit OpenAI klíč">&#128065;</button>
+			{% if current_user.is_admin %}
+				<div class="tab-content {% if active_tab == 'extractor' %}active{% endif %}" id="tab-extractor">
+					<label for="openai_api_key">OpenAI API Key</label>
+					<div class="input-with-eye">
+						<input id="openai_api_key" name="openai_api_key" type="password" value="{{ settings.openai_api_key or '' }}">
+						<button type="button" class="eye-toggle" data-target="openai_api_key" aria-label="Zobrazit OpenAI klíč">&#128065;</button>
+					</div>
+
+					<label for="openai_model">Model</label>
+					<input id="openai_model" name="openai_model" type="text" value="{{ cfg.openai_model }}">
+
+					<label for="concurrency">Concurrency</label>
+					<input id="concurrency" name="concurrency" type="number" value="{{ cfg.concurrency }}">
+
+					<label for="max_tokens">Max Tokens</label>
+					<input id="max_tokens" name="max_tokens" type="number" value="{{ cfg.max_tokens }}">
+
+					<label for="pdf_dpi">PDF DPI</label>
+					<input id="pdf_dpi" name="pdf_dpi" type="number" value="{{ cfg.dpi }}">
+
+					<label for="max_pages">Max Pages</label>
+					<input id="max_pages" name="max_pages" type="number" value="{{ cfg.max_pages }}">
+
+					<label for="request_delay">Request Delay (s)</label>
+					<input id="request_delay" name="request_delay" type="number" step="0.1" value="{{ cfg.openai_request_delay }}">
+
+					<label for="max_retries">Max Retries</label>
+					<input id="max_retries" name="max_retries" type="number" value="{{ cfg.openai_max_retries }}">
+
+					<label for="image_max_width">Max šířka obrázků (px)</label>
+					<input id="image_max_width" name="image_max_width" type="number" value="{{ cfg.image_max_width }}">
+
+					<label for="image_jpeg_quality">JPEG kvalita (50-100)</label>
+					<input id="image_jpeg_quality" name="image_jpeg_quality" type="number" value="{{ cfg.image_jpeg_quality }}">
 				</div>
-
-				<label for="openai_model">Model</label>
-				<input id="openai_model" name="openai_model" type="text" value="{{ cfg.openai_model }}">
-
-				<label for="concurrency">Concurrency</label>
-				<input id="concurrency" name="concurrency" type="number" value="{{ cfg.concurrency }}">
-
-				<label for="max_tokens">Max Tokens</label>
-				<input id="max_tokens" name="max_tokens" type="number" value="{{ cfg.max_tokens }}">
-
-				<label for="pdf_dpi">PDF DPI</label>
-				<input id="pdf_dpi" name="pdf_dpi" type="number" value="{{ cfg.dpi }}">
-
-				<label for="max_pages">Max Pages</label>
-				<input id="max_pages" name="max_pages" type="number" value="{{ cfg.max_pages }}">
-
-				<label for="request_delay">Request Delay (s)</label>
-				<input id="request_delay" name="request_delay" type="number" step="0.1" value="{{ cfg.openai_request_delay }}">
-
-				<label for="max_retries">Max Retries</label>
-				<input id="max_retries" name="max_retries" type="number" value="{{ cfg.openai_max_retries }}">
-
-				<label for="image_max_width">Max šířka obrázků (px)</label>
-				<input id="image_max_width" name="image_max_width" type="number" value="{{ cfg.image_max_width }}">
-
-				<label for="image_jpeg_quality">JPEG kvalita (50-100)</label>
-				<input id="image_jpeg_quality" name="image_jpeg_quality" type="number" value="{{ cfg.image_jpeg_quality }}">
-			</div>
+			{% endif %}
 
 			<div class="tab-content {% if active_tab == 'extraction' %}active{% endif %}" id="tab-extraction">
 				<label class="checkbox-row">

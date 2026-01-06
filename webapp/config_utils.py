@@ -8,7 +8,93 @@ from flask_login import current_user
 
 from EasyFlex.config import load_config, AppConfig
 
-from .models import UserSettings, db
+from .models import UserSettings, User, db
+
+EXTRACTOR_OVERRIDE_KEYS = {
+	"openai_model",
+	"concurrency",
+	"max_tokens",
+	"dpi",
+	"max_pages",
+	"openai_request_delay",
+	"openai_max_retries",
+	"image_max_width",
+	"image_jpeg_quality",
+}
+
+OVERRIDE_CASTERS = {
+	"openai_model": str,
+	"concurrency": int,
+	"max_tokens": int,
+	"dpi": int,
+	"max_pages": int,
+	"openai_request_delay": float,
+	"openai_max_retries": int,
+	"image_max_width": int,
+	"image_jpeg_quality": int,
+	"use_doc_number_as_variable_symbol": bool,
+	"infer_missing_dates": bool,
+	"enable_multi_invoice_segmentation": bool,
+	"csv_enable_llm_mapping": bool,
+	"date_day_first": bool,
+	"abra_doc_endpoint": str,
+	"abra_doc_type_code": str,
+	"abra_use_kod": bool,
+	"abra_duplicate_kod_strategy": str,
+}
+
+NON_APPCONFIG_OVERRIDES = {"auto_import"}
+
+
+def _as_bool(value):
+	if isinstance(value, str):
+		return value.strip().lower() in {"1", "true", "yes", "on", "ano"}
+	return bool(value)
+
+
+def _ensure_settings_row(user, base_cfg: AppConfig) -> UserSettings:
+	settings = getattr(user, "settings", None)
+	if settings is None:
+		settings = UserSettings(user=user)
+		# Pre-fill with base values so the settings page is informative
+		# Sensitive values must stay empty for new users
+		settings.abra_company = None
+		settings.abra_verify_tls = getattr(base_cfg, "abra_verify_tls", True)
+		settings.config_overrides = {}
+		db.session.add(settings)
+		db.session.commit()
+	elif settings.config_overrides is None:
+		settings.config_overrides = {}
+		db.session.commit()
+	return settings
+
+
+def _get_admin_settings(base_cfg: AppConfig) -> UserSettings | None:
+	admin = User.query.filter_by(is_admin=True).order_by(User.id.asc()).first()
+	if admin is None:
+		return None
+	return _ensure_settings_row(admin, base_cfg)
+
+
+def _apply_overrides(cfg: AppConfig, overrides: dict) -> None:
+	for attr, caster in OVERRIDE_CASTERS.items():
+		if attr not in overrides:
+			continue
+		value = overrides.get(attr)
+		if caster is bool:
+			value = _as_bool(value)
+		elif value is not None:
+			try:
+				value = caster(value)
+			except Exception:
+				continue
+		setattr(cfg, attr, value)
+	# Store optional convenience values that are not part of AppConfig
+	if "auto_import" in overrides:
+		try:
+			setattr(cfg, "auto_import", _as_bool(overrides.get("auto_import")))
+		except Exception:
+			pass
 
 
 def _ensure_base_config() -> AppConfig:
@@ -24,23 +110,17 @@ def get_user_config() -> AppConfig:
 	"""Return a deep-copied AppConfig with overrides from current user's settings."""
 	base_cfg = _ensure_base_config()
 	# Ensure settings row exists for current user
-	settings = getattr(current_user, "settings", None)
-	if settings is None:
-		settings = UserSettings(user=current_user)
-		# Pre-fill with base values so the settings page is informative
-		# Sensitive values must stay empty for new users
-		settings.abra_company = None
-		settings.abra_verify_tls = getattr(base_cfg, "abra_verify_tls", True)
-		settings.config_overrides = {}
-		db.session.add(settings)
-		db.session.commit()
-	elif settings.config_overrides is None:
-		settings.config_overrides = {}
-		db.session.commit()
+	settings = _ensure_settings_row(current_user, base_cfg)
+	admin_settings = _get_admin_settings(base_cfg)
 	# Build per-user copy
 	cfg = deepcopy(base_cfg)
-	# Credentials are per-user only: do not inherit from base config
-	cfg.openai_api_key = settings.openai_api_key or None
+	# Credentials are per-user only: do not inherit from base config (except extractor for non-admins)
+	if current_user.is_admin:
+		cfg.openai_api_key = settings.openai_api_key or None
+	elif admin_settings is not None:
+		cfg.openai_api_key = admin_settings.openai_api_key or None
+	else:
+		cfg.openai_api_key = None
 	cfg.abra_server = settings.abra_server or None
 	cfg.abra_port = settings.abra_port if settings.abra_port is not None else None
 	# Použij uloženou firmu, pokud ji má uživatel nastavenou (jinak ponecháme hodnotu ze základní konfigurace)
@@ -50,46 +130,17 @@ def get_user_config() -> AppConfig:
 	cfg.abra_password = settings.abra_password or None
 	if settings.abra_verify_tls is not None:
 		cfg.abra_verify_tls = bool(settings.abra_verify_tls)
-	overrides = settings.config_overrides or {}
-
-	def _as_bool(value):
-		if isinstance(value, str):
-			return value.strip().lower() in {"1", "true", "yes", "on", "ano"}
-		return bool(value)
-
-	def _apply_override(attr: str, caster=None):
-		if attr not in overrides:
-			return
-		value = overrides.get(attr)
-		if caster is not None and value is not None:
-			try:
-				value = caster(value)
-			except Exception:
-				return
-		setattr(cfg, attr, value)
-
-	_apply_override("openai_model", str)
-	_apply_override("concurrency", int)
-	_apply_override("max_tokens", int)
-	_apply_override("dpi", int)
-	_apply_override("max_pages", int)
-	_apply_override("openai_request_delay", float)
-	_apply_override("openai_max_retries", int)
-	_apply_override("image_max_width", int)
-	_apply_override("image_jpeg_quality", int)
-	_apply_override("use_doc_number_as_variable_symbol", _as_bool)
-	_apply_override("infer_missing_dates", _as_bool)
-	_apply_override("enable_multi_invoice_segmentation", _as_bool)
-	_apply_override("csv_enable_llm_mapping", _as_bool)
-	_apply_override("date_day_first", _as_bool)
-	_apply_override("abra_doc_endpoint", str)
-	_apply_override("abra_doc_type_code", str)
-	_apply_override("abra_use_kod", _as_bool)
-	_apply_override("abra_duplicate_kod_strategy", str)
-	# Store optional convenience values that are not part of AppConfig
-	if "auto_import" in overrides:
-		try:
-			setattr(cfg, "auto_import", _as_bool(overrides.get("auto_import")))
-		except Exception:
-			pass
+	user_overrides = dict(settings.config_overrides or {})
+	admin_overrides = dict(admin_settings.config_overrides or {}) if admin_settings else {}
+	# For non-admin users, copy extractor overrides from admin and ignore personal overrides
+	if not current_user.is_admin:
+		for key in EXTRACTOR_OVERRIDE_KEYS:
+			if key in admin_overrides:
+				user_overrides[key] = admin_overrides[key]
+			elif key in user_overrides:
+				user_overrides.pop(key, None)
+	else:
+		# Admin keeps own overrides; ensure extractor keys present in user_overrides already
+		pass
+	_apply_overrides(cfg, user_overrides)
 	return cfg
