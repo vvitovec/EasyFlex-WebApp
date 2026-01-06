@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card">
+	<h2>Nápověda &ndash; EasyFlex Web</h2>
+	<p class="muted">Průvodce, jak využít všechny funkce aplikace od prvního přihlášení až po export do ABRA Gen.</p>
+
+	<section class="help-section">
+		<h3>Rychlý start</h3>
+		<ol>
+			<li>Přihlaste se a otevřete <strong>Nastavení</strong> &rarr; vyplňte svůj OpenAI API klíč a údaje k ABRA Gen.</li>
+			<li>V sekci <strong>Kredity</strong> zkontrolujte zůstatek (noví uživatelé začínají se 100 kredity). Jeden kredit = zpracování jedné faktury.</li>
+			<li>V <strong>Nahrát PDF</strong> nahrajte jedno nebo více PDF. Před odesláním zkontrolujte, že máte dostatek kreditů.</li>
+			<li>Po zpracování zkontrolujte výsledek na kartě <strong>Výsledky</strong> a upravte případné chybějící údaje.</li>
+			<li>Označte řádky pro import a dokončete převod do ABRA pomocí tlačítka <strong>Importovat do ABRA</strong>.</li>
+		</ol>
+	</section>
+
+	<section class="help-section">
+		<h3>Podrobný průvodce</h3>
+		<div class="help-grid">
+			<div class="help-tile">
+				<h4>Nastavení</h4>
+				<ul>
+					<li><strong>OpenAI API klíč</strong>: nutný pro extrakci dat z PDF.</li>
+					<li><strong>ABRA připojení</strong>: host, port, firma, uživatel a heslo &ndash; bez nich nelze importovat.</li>
+					<li><strong>Typy dokladů a společnosti</strong>: předvyplňte je, aby se při importu nabízely správné hodnoty.</li>
+				</ul>
+			</div>
+			<div class="help-tile">
+				<h4>Kredity</h4>
+				<ul>
+					<li>1 kredit = zpracování 1 faktury (prázdné výsledky se neúčtují).</li>
+					<li>Platby: bankovní převod (CZK). QR kód a variabilní symbol najdete v sekci <strong>Kredity</strong>.</li>
+					<li>Minimální dobití: 100 Kč (200 kreditů).</li>
+				</ul>
+			</div>
+			<div class="help-tile">
+				<h4>Nahrávání PDF</h4>
+				<ul>
+					<li>Můžete nahrát jednotlivé soubory nebo složku s více PDF.</li>
+					<li>Nepodporované formáty se automaticky přeskočí a zobrazí se upozornění.</li>
+					<li>Po nahrání dostanete přehled faktur; můžete ručně opravit čísla dokladů, datumy nebo částky.</li>
+				</ul>
+			</div>
+			<div class="help-tile">
+				<h4>Import do ABRA</h4>
+				<ul>
+					<li>Před importem vyberte firmu, směr a typ dokladu.</li>
+					<li>Řádky lze označit/odznačit pro import; chybné řádky se dají opravit a import zopakovat.</li>
+					<li>Log s chybami (např. špatné IČ/DIČ) se zobrazí přímo u řádku.</li>
+				</ul>
+			</div>
+		</div>
+	</section>
+
+	<section class="help-section">
+		<h3>Časté otázky</h3>
+		<dl class="faq">
+			<dt>Nenačítá se mi QR kód pro platbu, co dělat?</dt>
+			<dd>Zkontrolujte, zda jste přihlášeni. QR kód je dostupný jen po přihlášení v sekci <strong>Kredity</strong>. Pokud problém přetrvá, napište nám.</dd>
+
+			<dt>Nemám dostatek kreditů, ale potřebuji rychle zpracovat faktury.</dt>
+			<dd>Dočasně odeberte některé PDF a spusťte zpracování menšího počtu souborů. Současně můžete dobít kredity převodem (zobrazí se variabilní symbol).</dd>
+
+			<dt>Import do ABRA hlásí chybu ověření.</dt>
+			<dd>Ověřte přihlašovací údaje v <strong>Nastavení</strong> a že je správně zvolená firma i typ dokladu. Pokud používáte vlastní certifikát, ujistěte se, že je server dostupný a akceptuje TLS.</dd>
+
+			<dt>Co se stane, když je faktura prázdná nebo nečitelná?</dt>
+			<dd>Prázdné výsledky neodečítají kredity. Pokud je text nečitelný, zkuste lepší sken nebo kontaktujte podporu.</dd>
+
+			<dt>Jak funguje označování řádků pro import?</dt>
+			<dd>Každý řádek má přepínač. Jen označené řádky se odešlou do ABRA. Před importem můžete hodnoty upravit a změny uložit.</dd>
+		</dl>
+	</section>
+
+	<section class="help-section">
+		<h3>Kontakt</h3>
+		<p>Máte další otázky nebo narazili jste na problém? Kontaktujte nás:</p>
+		<ul class="contact-list">
+			<li>E-mail: <a href="mailto:{{ contact_email }}">{{ contact_email }}</a></li>
+			<li>Telefon: <a href="tel:{{ contact_phone }}">{{ contact_phone }}</a></li>
+		</ul>
+	</section>
+</div>
+{% endblock %}

@@ -199,6 +199,51 @@ input[type="file"] {
 	margin-bottom: 8px;
 }
 
+.help-section {
+	margin-top: 24px;
+}
+
+.help-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+	gap: 16px;
+	margin-top: 12px;
+}
+
+.help-tile {
+	background: #f7f8fb;
+	border: 1px solid #e1e3e8;
+	border-radius: 8px;
+	padding: 12px;
+}
+
+.help-tile h4 {
+	margin-top: 0;
+}
+
+.faq {
+	margin: 0;
+}
+
+.faq dt {
+	font-weight: 700;
+	margin-top: 12px;
+}
+
+.faq dd {
+	margin: 4px 0 0 0;
+	color: #404553;
+}
+
+.contact-list {
+	list-style: none;
+	padding: 0;
+}
+
+.contact-list li + li {
+	margin-top: 6px;
+}
+
 .flash.info {
 	background: #e7f1ff;
 	color: #0f5fa6;
