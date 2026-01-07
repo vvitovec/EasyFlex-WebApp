@@ -1,0 +1,173 @@
+AI_EXTRAKCE — jak EasyFlex používá OpenAI API pro extrakci dat z PDF faktur
+
+Tento dokument shrnuje a detailně popisuje, jak je v projektu EasyFlex implementována
+komunikace s OpenAI API pro:
+1) extrakci strukturovaných dat z PDF faktur (Vision + structured outputs)
+2) mapování/řazení sloupců tabulek (CSV „LLM mapování“)
+
+Popis vychází z implementace v modulu EasyFlex/extractor.py a EasyFlex/csv_processor.py
+spolu s konfiguračním modelem EasyFlex/config.py.
+
+
+1) Přehled komponent a role OpenAI
+---------------------------------
+- Hlavní extraktor: EasyFlex/extractor.py (třída InvoiceExtractor)
+  - Využívá OpenAI Chat Completions s Vision (image_url s base64 snímky) a se structured
+    JSON výstupem (response_format: json_schema).
+  - Udržuje konfiguraci OpenAI (API key, model, temperature, top_p, reasoning_effort,
+    timeouty, retry/backoff, minimální rozestup mezi požadavky).
+  - Umí jednofázovou extrakci i dvoufázovou segmentaci více faktur v jednom PDF.
+  - Zajišťuje cache výsledků (na disk, podle hash klíče PDF) a postprocessing dat.
+
+- CSV mapování sloupců: EasyFlex/csv_processor.py
+  - Heuristicky mapuje hlavičky tabulek do interních polí.
+  - Pokud je povoleno LLM mapování, zavolá OpenAI a vyžádá mapování hlaviček
+    na interní klíče se strict JSON schématem.
+
+- Konfigurace: EasyFlex/config.py
+  - AppConfig drží všechny OpenAI parametry (model, teplota, top_p, reasoning_effort,
+    retry, delay, timeout, connection_timeout).
+  - DEFAULT_OPENAI_MODEL je „gpt-5“.
+  - Umožňuje vypnutí sampling parametrů (temperature/top_p) pro modely, které je
+    nepodporují.
+
+
+2) Nastavení a získání API klíče
+--------------------------------
+- API klíč je uložen v nastavení aplikace (cfg.openai_api_key). Pokud není přítomen,
+  extrakce je zablokována a volání OpenAI není možné.
+- InvoiceExtractor si uchovává klíč v self._provided_api_key a klient OpenAI vytváří
+  lazy až při první potřebě (_get_client). Pokud se klíč změní v konfiguraci, klient
+  se zneplatní a vytvoří se znovu.
+
+
+3) Hlavní tok extrakce faktur z PDF
+-----------------------------------
+3.1 Konverze PDF na obrázky
+- PDF se převádí pomocí pdf2image.convert_from_path (DPI z konfigurace, fmt=png).
+- Pokud PDF neobsahuje stránky nebo konverze selže, je vyvolána chyba.
+
+3.2 Příprava obrázků pro OpenAI
+- Každá stránka je převedena na JPEG/PNG a zakódována do base64.
+- Pokud je obrázek příliš široký, provede se downscale na image_max_width.
+- Komprese se řídí image_jpeg_quality (defaultně 85).
+
+3.3 Volání OpenAI — hlavní extrakce
+- Metoda _call_openai(images_b64, strict_dates=False, strict_amounts=False) volá
+  OpenAI Chat Completions s Vision:
+  - messages:
+    - system prompt: detailní pravidla extrakce (jen to, co je na faktuře, žádné
+      odvozování; datumy ve formátu YYYY-MM-DD; částky jako čísla bez symbolů; pokud
+      je údaj nejasný, vrátit null; pole „položky“ je vždy null).
+    - user prompt: text „Zde jsou snímky faktury...“ + seznam image_url položek
+      s base64 daty.
+  - response_format: json_schema se strict=True a přesně definovanou strukturou
+    (InvoiceData). Požaduje se validní JSON s explicitně uvedenými klíči.
+  - model: cfg.openai_model (defaultně gpt-5), s volitelnými parametry:
+    - temperature, top_p (pokud model podporuje sampling)
+    - reasoning_effort (pro gpt-5)
+  - max_tokens: používá max_completion_tokens pro gpt-5, jinak max_tokens.
+  - timeout: cfg.openai_timeout_s
+
+3.4 Validace a postprocessing po odpovědi
+- Preferuje se „parsed“ výstup SDK (structured outputs), jinak se parsuje obsah
+  zprávy (content) s fallbacky:
+  - přímý JSON
+  - JSON ve fenced code blocku
+  - extrakce prvního JSON objektu mezi { ... }
+- Po načtení payloadu se provede:
+  - sjednocení klíče „položky“ (případně oprava „polozky“)
+  - doplnění null polí na 0.0 u výchozích číselných polí
+  - normalizace dat (datumy) a kontrola podezřelých hodnot
+  - kontrola vnitřní konzistence částek (základy + DPH)
+
+3.5 Opakovaný dotaz při nesouladech
+- Pokud kontrola dat nebo částek selže (nevalidní datumy / podezřelé datumy /
+  nesedící částky), extraktor opakuje dotaz s přísnějšími pravidly:
+  - strict_dates=True: datumy musí být jen jasně vytištěné
+  - strict_amounts=True: pokud nesedí součty, ponechat sporná pole null
+
+3.6 Segmentace více faktur v jednom PDF (volitelné)
+- Při zapnutí „multi invoice segmentation“ probíhá dvoufázová extrakce:
+  1) Segmentační volání pro každou stránku (klasifikace, zda jde o fakturu a jaká je
+     role stránky — start/middle/end/single/unknown).
+  2) Sestavení skupin stránek podle segmentačního výstupu a následná extrakce každé
+     skupiny samostatně.
+- Segmentační volání OpenAI používá vlastní JSON schema (PageSegmentation) a prompt
+  se striktními instrukcemi (vrať jen JSON; nic nevymýšlej).
+
+3.7 Cache výsledků
+- Výsledky extrakce se ukládají do cache (soubor JSON v cache dir, klíč hash z cesty,
+  velikosti a mtime PDF).
+- Při opakované extrakci stejného souboru se použije cache (bez volání OpenAI).
+
+
+4) Robustnost komunikace s OpenAI (retry, backoff, throttling)
+-------------------------------------------------------------
+- Throttling: před každým OpenAI requestem se hlídá minimální rozestup
+  (openai_request_delay) jak na úrovni instance, tak globálně (sdílený lock).
+- Retry logika:
+  - openai_max_retries + exponential backoff (retry_delay, backoff_factor, max_delay)
+  - zvláštní zacházení s RateLimitError (pokus o vytažení „retry-after“)
+  - APITimeoutError / APIConnectionError => opakování s backoffem
+  - BadRequestError: pokud model neakceptuje temperature/top_p, vynutí se vypnutí
+    sampling parametrů a požadavek se zopakuje
+  - JSON parse error + „length“ finish_reason => navýšení max_tokens a retry
+  - fallback na DEFAULT_OPENAI_MODEL pro stabilnější JSON výstup
+
+
+5) Řazení/mapování sloupců tabulek (CSV) přes OpenAI
+----------------------------------------------------
+- V CSV procesoru se mapují sloupce na interní cíle (např. cislo_dokladu,
+  datum_vystaveni, celkova_cena atd.).
+- Mapování postupuje v krocích:
+  1) přímá shoda názvů
+  2) heuristiky a synonyma (normalizace, typová shoda)
+  3) LLM mapování (pokud je povoleno a je OpenAI key)
+  4) fallback synonyma
+
+- LLM mapování (metoda _ask_llm_for_mapping):
+  - Ze CSV se připraví:
+    - seznam hlaviček
+    - vzorek prvních 10 řádků (odstranění NaN a převod na string/float)
+    - shrnutí každého sloupce (typ + pár vzorků)
+  - Prompt:
+    - system prompt vysvětluje, že model je „mapovač sloupců“ a musí vrátit
+      pouze JSON dle schema.
+    - striktní pravidla: používat jen existující hlavičky, nepřidávat nové,
+      neduplikovat přiřazení, při nejistotě vrátit null, respektovat datové typy.
+  - response_format: json_schema (CsvColumnMapping) se strict=True, kde každé pole
+    je enum [všechny hlavičky] + null.
+  - model/timeout: cfg.openai_model, cfg.openai_timeout_s;
+    top_p/temperature jsou volitelné dle podpory modelu.
+
+- Výsledek z LLM je následně sanitizován:
+  - odstraní se neznámé hlavičky
+  - řeší se duplicity (jeden sloupec → max jedno pole)
+  - konflikt se řeší skórováním podle klíčových slov a typu dat
+
+
+6) Shrnutí komunikace s OpenAI v bodech
+---------------------------------------
+- OpenAI SDK (openai>=1.51.0) je používán přes klienta OpenAI.
+- Volání probíhá přes chat.completions.create s parametry:
+  - model, messages, response_format, timeout (+ temperature/top_p/reasoning_effort)
+  - max_tokens / max_completion_tokens dle typu modelu
+- Pro PDF extrakci se posílají base64 obrázky jako image_url.
+- Odpověď je vynucená jako strict JSON dle schématu (structured outputs).
+- Nad výsledkem probíhá postprocessing, kontrola datumů a částek, případně retry
+  s přísnějšími pravidly.
+- V CSV mapování se posílají pouze hlavičky a vzorové řádky, nikoliv PDF.
+
+
+7) Důležité detaily pro případné vylepšení (fine-tuning, optimalizace)
+---------------------------------------------------------------------
+- Extrakce a mapování jsou oddělené procesy s vlastním promptem a schema.
+- Pro extrakci faktur se používá Vision structured output: schema je striktne
+  definované a do „required“ se zahrnou všechny klíče.
+- Pro CSV mapování je schema definováno tak, že každý interní klíč má enum
+  dostupných hlaviček (neumožňuje „vymýšlet“ nové názvy sloupců).
+- Ověření výstupu (datumy, součty částek) je součástí flow, což umožňuje detekovat
+  nespolehlivý výstup a vyvolat opakovaný request s přísnějším promptem.
+- LLM mapování sloupců je ve výchozím stavu vypnuté a spouští se pouze s explicitním
+  nastavením (csv_enable_llm_mapping).
