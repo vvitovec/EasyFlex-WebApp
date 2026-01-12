@@ -1,170 +1,154 @@
-## EasyFlex – rychlé zpracování faktur (PDF/CSV) a import do ABRA Flexi
+# EasyFlex Web – zpracování faktur v prohlížeči
 
-Jednoduchá desktopová aplikace pro Windows, která:
+EasyFlex Web je webová aplikace postavená na Flasku, která umožňuje nahrávat PDF faktury nebo tabulkové soubory, automaticky z nich vyčíst údaje pomocí OpenAI, data zkontrolovat/upravit a následně importovat do ABRA Flexi. Flask zde zajišťuje webový server, routování stránek, práci se sessions a napojení na uživatelskou autentizaci i databázi. Aplikace je navržena pro více uživatelů, každý má vlastní přihlašovací údaje, nastavení a historii zpracovaných dávek.
 
-- **extrahuje údaje z PDF faktur** pomocí AI (OpenAI Vision),
-- **načte faktury z CSV**,
-- umožní **ruční úpravu polí** v přehledné tabulce,
-- a **naimportuje vybrané faktury do ABRA Flexi**.
-
-### Co aplikace dělá a nedělá
-- **Dělá**: pracuje se souhrnnými částkami DPH (0 %, 12 %, 21 %) a základními údaji faktury (dodavatel, odběratel, datumy, čísla, částky). U CSV podporuje i základní mapování sloupců.
-- **Nedělá**: neřeší položky faktury po řádcích ani žádné dopočty či dorovnání – hodnoty pouze bezpečně „opsává“ tak, jak jsou uvedené na faktuře.
+> V repozitáři je také původní desktopová (Tkinter) aplikace, podle které web vznikl. README se však soustředí pouze na webovou část.
 
 ---
 
-## Požadavky
+## Hlavní schopnosti webové aplikace
 
-- Windows 10/11 (64‑bit)
-- Připojení k internetu pro volání OpenAI a ABRA Flexi
-- Pokud spouštíte ze zdrojového kódu: **Python 3.10+**
-
-Poznámka: Aplikace umí automaticky najít přibalený Poppler (pro převod PDF→obrázky). Pokud Poppler přibalený není, lze jej doinstalovat a cestu nastavit proměnnou `POPPLER_PATH` nebo v `settings.ini` (viz níže).
+- **Přihlášení a správa uživatelů** (admin účet + běžní uživatelé).
+- **Nahrávání PDF nebo tabulek** (CSV/XLSX/XML) a tvorba dávek (batch).
+- **Extrakce údajů z PDF** pomocí OpenAI Vision a následná kontrola v tabulce.
+- **Ruční úpravy hodnot** přímo v UI před importem.
+- **Import do ABRA Flexi** s podporou kontextu firmy, směru a typu dokladu.
+- **Uložení a historie dávek** – možnost k dávkám vracet, filtrovat je a znovu importovat.
+- **Oddělené přihlašovací údaje OpenAI/ABRA pro každého uživatele**.
+- **Podpora SQLite i PostgreSQL** (přepíná se přes `DATABASE_URL`).
 
 ---
 
-## Instalace a spuštění
+## Rychlý start (lokální vývoj)
 
-### Varianta A) Předpřipravené balíčky
-- Windows: rozbalte `EasyFlex-Windows.zip` a spusťte `EasyFlex.exe`.
-- macOS: rozbalte `EasyFlex-macOS.tar.gz`, přetáhněte `EasyFlex.app` do `/Applications` a při prvním spuštění potvrďte, že aplikaci důvěřujete.
-- Nastavení a chyby se ukládají do uživatelského profilu (`%APPDATA%\EasyFlex` na Windows, `~/Library/Application Support/EasyFlex` na macOS).
-
-### Varianta B) Ze zdrojového kódu
-1) Nainstalujte Python 3.10+ a otevřete PowerShell ve složce projektu.
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r EasyFlex/requirements.txt
-python -m EasyFlex.main
+### 1) Virtuální prostředí
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
-Volitelně lze vytvořit EXE:
-
-```powershell
-pip install pyinstaller
-pyinstaller EasyFlex.spec
+### 2) Instalace závislostí
+```bash
+pip install -r webapp/requirements.txt
 ```
 
----
+### 3) Nastavení prostředí
+Vytvořte soubor `.env` v kořeni projektu (nebo nastavte proměnné prostředí):
 
-## Distribuce
+- `EASYFLEX_SECRET_KEY` – tajný klíč pro Flask session
+- `EASYFLEX_ADMIN_PASSWORD` – heslo pro vytvoření admin účtu
+- `DATABASE_URL` (volitelné) – PostgreSQL URL místo SQLite
 
-- Hotové balíčky pro Windows (`EasyFlex-Windows.zip`) i macOS (`EasyFlex-macOS.tar.gz`)
-  lze vyrobit skripty v adresáři `build/`. Přesný postup viz
-  [`DISTRIBUTION.md`](./DISTRIBUTION.md).
-- Každý balíček už obsahuje všechny pythoní závislosti i Poppler – koncoví
-  uživatelé pouze rozbalí archiv a spustí `EasyFlex.exe`, resp. `EasyFlex.app`.
+### 4) Vytvoření admin účtu
+```bash
+EASYFLEX_ADMIN_PASSWORD=<heslo> python -m webapp.create_admin
+```
 
----
+### 5) Spuštění serveru
+```bash
+python -m webapp.app
+```
 
-## První nastavení
-
-1) Otevřete aplikaci a klikněte na tlačítko `Nastavení`.
-2) Zkontrolujte tři záložky:
-   - `Abra`
-     - Server (např. `abra.example.com`), Port (je‑li potřeba), Uživatel, Heslo
-     - Volba „Ověřovat TLS certifikát“ je doporučená.
-   - `Extractor`
-     - Zadejte **OpenAI API Key**. Bez něj je extrakce z PDF vypnuta.
-     - Ostatní hodnoty (model, concurrency, DPI…) jsou předvyplněné a můžete je ponechat.
-   - `Extrakce`
-     - Volitelné chování (např. „Použít číslo dokladu jako variabilní symbol“).
-     - Pokud chcete, můžete povolit „Auto‑import do ABRA“ – import se po extrakci spustí sám.
-     - U CSV lze povolit „LLM mapování sloupců“ (odešle ukázková data do OpenAI).
-
-Klikněte na `Uložit`.
+Aplikace poběží na `http://127.0.0.1:5000/`. Přihlaste se jako `admin` a přejděte na **/settings**, kde nastavíte OpenAI a ABRA přístupové údaje.
 
 ---
 
-## Běžné použití
+## Uživatelské role a přihlášení
 
-1) Vyberte zdroj dat
-   - `Vybrat PDF`: jedno PDF s fakturou
-   - `Vybrat složku`: hromadné zpracování všech PDF ve složce
-  - `Vybrat tabulku`: import faktur z tabulkového souboru (CSV, XLSX, XML)
-
-2) Práce v tabulce
-   - Dvojklik na buňku → ruční úprava hodnoty.
-   - První sloupec „Import“: kliknutím přepínáte, zda se řádek bude importovat (✓/✗).
-   - Pravé tlačítko myši na řádku umožní označit/odznačit všechny.
-
-3) Kontext pro ABRA (horní lišta)
-   - `Firma`: vyberte firmu (lze přidat novou volbou „Nová firma…“).
-   - `Směr`: `faktura-vydana` nebo `faktura-prijata`.
-   - `Typ dokladu`: vyberte nebo přidejte nový typ (uloží se pro danou firmu a směr).
-
-4) Import do ABRA Flexi
-   - Manuálně: tlačítko `Importovat do ABRA`.
-   - Automaticky: povolte v `Nastavení` → `Extrakce` → „Auto‑import do ABRA“.
-
-5) Export do CSV
-   - Tlačítko `Exportovat CSV` uloží aktuální tabulku do souboru.
+- **Admin** je vytvořen při inicializaci (skript `webapp.create_admin`).
+- Admin může spravovat další uživatele a má kontrolu nad výchozími extrakčními parametry.
+- Každý uživatel má vlastní přístupové údaje k OpenAI/ABRA a vlastní historii dávek.
 
 ---
 
-## Kde jsou uložena nastavení a chyby
+## Workflow: od nahrání po import
 
-- Nastavení (`settings.ini`):
-  - EXE (uživatel): `C:\Users\<uživatel>\AppData\Roaming\EasyFlex\settings.ini`
-  - Vývoj (ze zdrojového kódu): `EasyFlex\settings.ini`
-- Chybové JSONy z importu do ABRA:
-  - EXE (uživatel): `C:\Users\<uživatel>\AppData\Roaming\EasyFlex\errors\`
-  - Vývoj: `errors\` (pokud složka existuje), jinak `EasyFlex\errors\`
+1. **Nahrání souborů**
+   - PDF soubory (jednotlivě nebo víc najednou) nebo tabulky (CSV/XLSX/XML).
+
+2. **Extrakce / Import do dávky**
+   - U PDF proběhne extrakce přes OpenAI.
+   - U tabulek se data načtou do dávky a mapují se na interní strukturu.
+
+3. **Kontrola v tabulce**
+   - Každý řádek lze ručně editovat.
+   - Vyberete, které řádky se mají importovat.
+
+4. **Nastavení ABRA kontextu**
+   - Firma, směr (vydaná/přijatá), typ dokladu.
+
+5. **Import do ABRA**
+   - Vybrané řádky se odešlou přes API.
+   - Výsledek importu se zobrazí v UI a případné chyby se uloží.
+
+---
+
+## Konfigurace webové aplikace
+
+### Databáze
+- **Výchozí**: SQLite soubor `webapp/easyflex_web.db`.
+- **PostgreSQL**: nastavte `DATABASE_URL` (např. z Renderu). Aplikace automaticky upraví prefix `postgres://` → `postgresql://`.
+
+### Konfigurační klíče a přístupy
+Většina citlivých údajů se nastavuje **po přihlášení** na stránce `/settings`:
+
+- `OPENAI_API_KEY` – API klíč (per uživatel)
+- `ABRA_SERVER`, `ABRA_PORT`, `ABRA_USERNAME`, `ABRA_PASSWORD`, `ABRA_COMPANY`
+- Volby jako `ABRA_VERIFY_TLS`, kontext firmy, typ dokladu a další
+
+Admin může nastavit výchozí extrakční parametry pro ostatní uživatele (model, DPI, limit stránek apod.).
+
+---
+
+## Práce s dávkami (batch)
+
+- Každé nahrání nebo import z tabulky vytvoří **dávku**.
+- Dávka obsahuje všechny řádky a metadata (název, typ zdroje, datum vytvoření).
+- Dávky lze znovu otevřít, upravit a importovat opakovaně.
+
+---
+
+## Uložení dat, chyb a logů
+
+- **Web DB**: `webapp/easyflex_web.db` (pokud nepoužíváte PostgreSQL).
+- **Chybové JSONy z ABRA importu**: ukládají se do `errors/` nebo do uživatelského profilu (dle prostředí).
+- **Cache extrakce**: v uživatelském profilu `.../EasyFlex/cache`.
 
 ---
 
 ## Ochrana dat a soukromí
 
-- Při extrakci PDF se snímky stránek posílají do služby OpenAI k vyčtení dat.
-- CSV „LLM mapování sloupců“ je ve výchozím stavu vypnuto. Pokud jej zapnete, odešlou se do OpenAI hlavičky a ukázkové řádky – používejte jen, pokud je to v pořádku.
-- API klíč OpenAI a přihlašovací údaje k ABRA se ukládají do `settings.ini` v prostém textu. Chraňte zařízení a přístup k souboru.
+- Při extrakci PDF se obrázky stránek odesílají do OpenAI.
+- LLM mapování sloupců u tabulek je volitelné – pokud je zapnuto, odešlou se ukázková data.
+- Přístupové údaje OpenAI/ABRA jsou ukládány v databázi (`user_settings`).
 
 ---
 
-## Řešení problémů (FAQ)
+## Časté problémy a jejich řešení
 
-- „Tlačítka pro PDF jsou šedá / extrakce nefunguje“
-  - V `Nastavení` → `Extractor` doplňte **OpenAI API Key** a uložte.
+**„Extrakce nefunguje / PDF tlačítka jsou šedá“**
+- Zkontrolujte, zda má uživatel vyplněný `OPENAI_API_KEY` na stránce `/settings`.
 
-- „Chyba převodu PDF“
-  - Aplikace vyžaduje Poppler. V přibalené verzi je obvykle součástí. Pokud není, doinstalujte Poppler a nastavte `POPPLER_PATH` (nebo klíč `poppler_path` v `settings.ini`).
+**„Chyba převodu PDF“**
+- Ujistěte se, že je dostupný Poppler (`pdftoppm`) a že je správně nastaven `POPPLER_PATH`.
 
-- „ABRA: company code is not configured“
-  - V horní liště vyberte `Firma` (případně přidejte „Nová firma…“) a zkuste import znovu. V `Nastavení` → `Abra` vyplňte server/uživatele/heslo.
+**„ABRA server not reachable / 401/403/404“**
+- Zkontrolujte server, port, přihlašovací údaje a TLS v `/settings`.
 
-- „ABRA server not reachable / DNS failed / 401/403/404“
-  - Zkontrolujte `Server`, `Port`, přihlašovací údaje a nastavení TLS v `Nastavení` → `Abra`. Ověřte, zda máte přístup k API ABRA Flexi.
-
-- „Kde najdu detail chyby importu?“
-  - Vytváří se JSON soubory v adresáři `errors` (viz výše). Obsahují požadavek i odpověď serveru.
+**„ABRA: company code is not configured“**
+- Zkontrolujte kontext firmy a typu dokladu v horní liště před importem.
 
 ---
 
-## Tipy
+## Produkční nasazení (stručně)
 
-- Dvojklikem v tabulce můžete opravit nesprávná políčka ještě před importem.
-- Pokud používáte `Auto‑import`, doporučujeme nejdřív otestovat na několika souborech ručně.
-
----
-
-## Webová vrstva (Flask)
-
-Projekt nyní obsahuje jednoduchou webovou aplikaci (Flask) s přihlášením a základním workflow nahrání PDF/tabulky → náhled faktur → import do ABRA. Každý webový uživatel má vlastní OpenAI/ABRA přihlašovací údaje uložené v databázi (nastavují se na stránce `/settings` po přihlášení).
-
-### Rychlý start (dev)
-1. Vytvořte a aktivujte virtuální prostředí: `python -m venv .venv` a `.\.venv\Scripts\activate` (Windows) nebo `source .venv/bin/activate` (macOS/Linux).
-2. Nainstalujte závislosti: `pip install -r EasyFlex/requirements.txt` (nebo jen web část `pip install -r webapp/requirements-web.txt`).
-3. Do `.env` vložte pouze webové tajemství (`EASYFLEX_SECRET_KEY`, `EASYFLEX_ADMIN_PASSWORD`). OpenAI/ABRA klíče se již nečtou z `.env`.
-4. Vytvořte administrátora: `EASYFLEX_ADMIN_PASSWORD=<heslo> python -m webapp.create_admin`. SQLite databáze se uloží do `webapp/easyflex_web.db`. Pokud potřebujete novou schéma (přidali jsme tabulku user settings), můžete starý soubor DB smazat a spustit skript znovu.
-5. Spusťte server: `python -m webapp.app` (nebo `flask --app webapp.app run`). Otevřete `http://127.0.0.1:5000/`, přihlaste se jako `admin` a na stránce `/settings` vyplňte svůj OpenAI API Key a přístup k ABRA.
-6. Pro produkční nasazení lze použít `gunicorn "webapp.app:app"`.
-
-Desktopová aplikace zůstává zachována: `python -m EasyFlex.main`.
+- Produkční server lze spustit přes `gunicorn`:
+```bash
+gunicorn "webapp.app:app"
+```
+- Pro PostgreSQL nastavte `DATABASE_URL`.
+- Doporučeno nastavit silný `EASYFLEX_SECRET_KEY` a zabezpečit přístup k `/settings`.
 
 ---
 
 Vytvořil: Viktor Vítovec
-
-
