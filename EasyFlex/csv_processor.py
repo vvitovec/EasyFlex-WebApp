@@ -684,14 +684,37 @@ class CSVProcessor:
 		for target, expected_label in self._expected_headers_by_target.items():
 			if expected_label in df.columns:
 				mapping[target] = expected_label
+		used_headers = set(mapping.values())
 		# 2) Heuristika pro chybějící
 		remaining = [t for t in self._expected_headers_by_target.keys() if t not in mapping]
-		norm_cols = {c: self._normalize(c) for c in cols}
 		if remaining:
+			norm_cols = {c: self._normalize(c) for c in cols if c not in used_headers}
+			header_to_targets: Dict[str, List[str]] = {}
 			for target in list(remaining):
 				cand = self._heuristic_match(target, norm_cols, df)
-				if cand:
-					mapping[target] = cand
+				if not cand:
+					continue
+				header_to_targets.setdefault(cand, []).append(target)
+			for header, targets in header_to_targets.items():
+				if len(targets) == 1:
+					target = targets[0]
+					mapping[target] = header
+					used_headers.add(header)
+			for header, targets in header_to_targets.items():
+				if len(targets) <= 1 or header in used_headers:
+					continue
+				best_target = self._pick_best_target_for_header(header, targets, df)
+				if best_target:
+					mapping[best_target] = header
+					used_headers.add(header)
+			still_missing = [t for t in remaining if t not in mapping]
+			if still_missing:
+				available_norm = {c: self._normalize(c) for c in cols if c not in used_headers}
+				for target in still_missing:
+					cand = self._heuristic_match(target, available_norm, df)
+					if cand:
+						mapping[target] = cand
+						used_headers.add(cand)
 		existing_headers = set(mapping.values())
 		# 3) LLM – pokud máme klíč a něco chybí, nebo vždy, aby pokryl i jiné formáty
 		cfg = self._get_config()
@@ -1075,5 +1098,3 @@ class CSVProcessor:
 		except Exception as e:  # noqa: BLE001
 			self.logger.warning("OpenAI chyba při mapování: %s", e)
 			return {}
-
-
