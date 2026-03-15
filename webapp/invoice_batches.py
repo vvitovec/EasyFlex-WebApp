@@ -123,14 +123,26 @@ def _combine_warnings(invoice_obj: Any, extra: Iterable[str] | None = None) -> O
 
 def create_batch_from_results(user: User, results: List[Any], source_label: str, source_type: str = "pdf") -> InvoiceBatch:
 	"""Persist ExtractResult objects as a batch."""
-	batch = InvoiceBatch(user=user, source_label=source_label, source_type=source_type)
+	batch = InvoiceBatch(
+		user=user,
+		source_label=source_label,
+		source_type=source_type,
+		processing_status="completed",
+	)
 	db.session.add(batch)
 	db.session.flush()
+	success_count = 0
+	error_count = 0
 	for idx, res in enumerate(results):
 		invoice_dict = _serialize_invoice(getattr(res, "data", None))
 		warning_text = _combine_warnings(getattr(res, "data", None), getattr(res, "warnings", None))
 		if warning_text:
 			set_warning(invoice_dict, warning_text)
+		row_error = getattr(res, "error", None)
+		if invoice_dict:
+			success_count += 1
+		if row_error:
+			error_count += 1
 		source_name = ""
 		if getattr(res, "file_path", None):
 			raw_path = getattr(res, "file_path")
@@ -145,17 +157,39 @@ def create_batch_from_results(user: User, results: List[Any], source_label: str,
 			source=source_name or source_label,
 			invoice_data=invoice_dict,
 			warning=warning_text,
-			error=getattr(res, "error", None),
+			error=row_error,
 			marked_for_import=True,
 		)
 		db.session.add(row)
+	unique_sources = {str((getattr(res, "file_path", None) or "")).strip() for res in results if getattr(res, "file_path", None)}
+	batch.total_files = len(unique_sources) if unique_sources else len(results)
+	batch.processed_files = batch.total_files
+	batch.success_count = success_count
+	batch.error_count = error_count
+	batch.credits_charged = success_count if source_type == "pdf" else 0
+	batch.processing_status = "completed_with_errors" if error_count else "completed"
+	batch.summary_message = (
+		f"Dokončeno: {batch.success_count} úspěšně, {batch.error_count} s chybou, "
+		f"zpracováno {batch.processed_files}/{batch.total_files} souborů."
+	)
 	db.session.commit()
 	return batch
 
 
 def create_batch_from_invoices(user: User, invoices: List[Any], source_label: str, source_type: str = "table") -> InvoiceBatch:
 	"""Persist InvoiceData list (from CSV/XLSX/XML) as a batch."""
-	batch = InvoiceBatch(user=user, source_label=source_label, source_type=source_type)
+	batch = InvoiceBatch(
+		user=user,
+		source_label=source_label,
+		source_type=source_type,
+		processing_status="completed",
+		total_files=1 if invoices else 0,
+		processed_files=1 if invoices else 0,
+		success_count=len(invoices),
+		error_count=0,
+		credits_charged=0,
+		summary_message=f"Načteno {len(invoices)} faktur z tabulky.",
+	)
 	db.session.add(batch)
 	db.session.flush()
 	for idx, inv in enumerate(invoices):

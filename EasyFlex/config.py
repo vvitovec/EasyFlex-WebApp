@@ -530,8 +530,14 @@ def _load_config_uncached() -> AppConfig:
 		(cp.get("extractor", "request_delay", fallback="0.5") if cp.has_section("extractor") else "0.5")
 		or os.getenv("OPENAI_REQUEST_DELAY", "0.5")
 	)
-	openai_timeout_s = int(os.getenv("OPENAI_TIMEOUT_S", "30"))
-	openai_connection_timeout_s = int(os.getenv("OPENAI_CONNECTION_TIMEOUT_S", "10"))
+	openai_timeout_s = int(
+		(cp.get("extractor", "timeout_s", fallback="") if cp.has_section("extractor") else "")
+		or os.getenv("OPENAI_TIMEOUT_S", "90")
+	)
+	openai_connection_timeout_s = int(
+		(cp.get("extractor", "connection_timeout_s", fallback="") if cp.has_section("extractor") else "")
+		or os.getenv("OPENAI_CONNECTION_TIMEOUT_S", "10")
+	)
 
 	# ABRA Flexi
 	abra_server = (

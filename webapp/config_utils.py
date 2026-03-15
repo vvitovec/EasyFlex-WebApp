@@ -17,6 +17,8 @@ EXTRACTOR_OVERRIDE_KEYS = {
 	"dpi",
 	"max_pages",
 	"openai_request_delay",
+	"openai_timeout_s",
+	"openai_connection_timeout_s",
 	"openai_max_retries",
 	"image_max_width",
 	"image_jpeg_quality",
@@ -29,6 +31,8 @@ OVERRIDE_CASTERS = {
 	"dpi": int,
 	"max_pages": int,
 	"openai_request_delay": float,
+	"openai_timeout_s": int,
+	"openai_connection_timeout_s": int,
 	"openai_max_retries": int,
 	"image_max_width": int,
 	"image_jpeg_quality": int,
@@ -106,16 +110,14 @@ def _ensure_base_config() -> AppConfig:
 	return cfg
 
 
-def get_user_config() -> AppConfig:
-	"""Return a deep-copied AppConfig with overrides from current user's settings."""
-	base_cfg = _ensure_base_config()
-	# Ensure settings row exists for current user
-	settings = _ensure_settings_row(current_user, base_cfg)
+def _build_user_config(user: User, base_cfg: AppConfig) -> AppConfig:
+	"""Return a deep-copied AppConfig with overrides from the provided user settings."""
+	settings = _ensure_settings_row(user, base_cfg)
 	admin_settings = _get_admin_settings(base_cfg)
 	# Build per-user copy
 	cfg = deepcopy(base_cfg)
 	# Credentials are per-user only: do not inherit from base config (except extractor for non-admins)
-	if current_user.is_admin:
+	if user.is_admin:
 		cfg.openai_api_key = settings.openai_api_key or None
 	elif admin_settings is not None:
 		cfg.openai_api_key = admin_settings.openai_api_key or None
@@ -133,7 +135,7 @@ def get_user_config() -> AppConfig:
 	user_overrides = dict(settings.config_overrides or {})
 	admin_overrides = dict(admin_settings.config_overrides or {}) if admin_settings else {}
 	# For non-admin users, copy extractor overrides from admin and ignore personal overrides
-	if not current_user.is_admin:
+	if not user.is_admin:
 		for key in EXTRACTOR_OVERRIDE_KEYS:
 			if key in admin_overrides:
 				user_overrides[key] = admin_overrides[key]
@@ -144,3 +146,15 @@ def get_user_config() -> AppConfig:
 		pass
 	_apply_overrides(cfg, user_overrides)
 	return cfg
+
+
+def get_user_config() -> AppConfig:
+	"""Return a deep-copied AppConfig with overrides from current user's settings."""
+	base_cfg = _ensure_base_config()
+	return _build_user_config(current_user, base_cfg)
+
+
+def get_user_config_for_user(user: User) -> AppConfig:
+	"""Return AppConfig for an explicit user (safe to use in background jobs)."""
+	base_cfg = _ensure_base_config()
+	return _build_user_config(user, base_cfg)

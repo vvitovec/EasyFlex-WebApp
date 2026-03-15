@@ -93,6 +93,8 @@ Aplikace poběží na `http://127.0.0.1:5000/`. Přihlaste se jako `admin` a př
 Většina citlivých údajů se nastavuje **po přihlášení** na stránce `/settings`:
 
 - `OPENAI_API_KEY` – API klíč (per uživatel)
+- `OPENAI_TIMEOUT_S` – timeout požadavku na OpenAI (výchozí 90 s, lze přepsat v admin nastavení)
+- `PDF_BATCH_MAX_RUNTIME_S` – max. čas běhu jedné PDF dávky na pozadí (výchozí 3600 s)
 - `ABRA_SERVER`, `ABRA_PORT`, `ABRA_USERNAME`, `ABRA_PASSWORD`, `ABRA_COMPANY`
 - Volby jako `ABRA_VERIFY_TLS`, kontext firmy, typ dokladu a další
 
@@ -144,7 +146,7 @@ Admin může nastavit výchozí extrakční parametry pro ostatní uživatele (m
 
 - Produkční server lze spustit přes `gunicorn`:
 ```bash
-gunicorn "webapp.app:app"
+gunicorn "webapp.app:app" --timeout 180 --graceful-timeout 30 --workers 2
 ```
 - Pro PostgreSQL nastavte `DATABASE_URL`.
 - Doporučeno nastavit silný `EASYFLEX_SECRET_KEY` a zabezpečit přístup k `/settings`.

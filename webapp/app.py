@@ -4,8 +4,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import tempfile
+import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +22,7 @@ from flask import (
 	flash,
 	send_file,
 	abort,
+	jsonify,
 )
 from flask_login import login_required, current_user
 from sqlalchemy.exc import OperationalError
@@ -29,17 +33,17 @@ from EasyFlex.extractor import InvoiceExtractor, ExtractResult
 from EasyFlex.csv_processor import CSVProcessor
 from EasyFlex.abra import import_to_abra
 from EasyFlex.date_helpers import DATE_FIELDS, parse_invoice_date
+from EasyFlex.invoice_warnings import get_warning, set_warning
 from EasyFlex.models import InvoiceData
 
 from .models import init_db, db, User, InvoiceBatch, InvoiceRow
 from .auth import init_auth
-from .config_utils import EXTRACTOR_OVERRIDE_KEYS, get_user_config
+from .config_utils import EXTRACTOR_OVERRIDE_KEYS, get_user_config, get_user_config_for_user
 from .invoice_batches import (
 	DISPLAY_COLUMNS,
 	COLUMN_LABELS,
 	apply_invoice_updates,
 	create_batch_from_invoices,
-	create_batch_from_results,
 	load_batch_for_user,
 	rows_for_display,
 )
@@ -58,6 +62,36 @@ from .abra_context import (
 )
 
 logger = logging.getLogger(__name__)
+
+BATCH_STATUS_QUEUED = "queued"
+BATCH_STATUS_RUNNING = "running"
+BATCH_STATUS_COMPLETED = "completed"
+BATCH_STATUS_COMPLETED_WITH_ERRORS = "completed_with_errors"
+BATCH_STATUS_PARTIAL_TIMEOUT = "partial_timeout"
+BATCH_STATUS_INTERRUPTED = "interrupted"
+BATCH_STATUS_FAILED = "failed"
+
+BATCH_TERMINAL_STATUSES = {
+	BATCH_STATUS_COMPLETED,
+	BATCH_STATUS_COMPLETED_WITH_ERRORS,
+	BATCH_STATUS_PARTIAL_TIMEOUT,
+	BATCH_STATUS_INTERRUPTED,
+	BATCH_STATUS_FAILED,
+}
+
+BATCH_STATUS_LABELS = {
+	BATCH_STATUS_QUEUED: "Ve frontě",
+	BATCH_STATUS_RUNNING: "Zpracovává se",
+	BATCH_STATUS_COMPLETED: "Dokončeno",
+	BATCH_STATUS_COMPLETED_WITH_ERRORS: "Dokončeno s chybami",
+	BATCH_STATUS_PARTIAL_TIMEOUT: "Částečný výsledek (časový limit)",
+	BATCH_STATUS_INTERRUPTED: "Přerušeno",
+	BATCH_STATUS_FAILED: "Selhalo",
+}
+
+_BATCH_THREADS: dict[int, threading.Thread] = {}
+_BATCH_THREADS_LOCK = threading.Lock()
+_DEFAULT_PDF_BATCH_MAX_RUNTIME_S = 60 * 60
 
 
 EDITABLE_FIELDS = [
@@ -157,15 +191,6 @@ def _has_minimal_invoice_data(inv: Dict[str, object]) -> bool:
 	return bool(inv.get("cislo_dokladu") or inv.get("variabilni_symbol") or inv.get("odberatel_jmeno"))
 
 
-def _count_billable_results(results: List[ExtractResult]) -> int:
-	"""Return number of invoices we should bill for (non-empty extraction results)."""
-	count = 0
-	for res in results:
-		if getattr(res, "data", None) is not None:
-			count += 1
-	return count
-
-
 def _deduct_credits(user: User, amount: int) -> int:
 	"""Decrease user credits by amount and persist. Returns remaining credits."""
 	if amount <= 0:
@@ -173,6 +198,307 @@ def _deduct_credits(user: User, amount: int) -> int:
 	user.credits = max(0, int(user.credits or 0) - amount)
 	db.session.commit()
 	return user.credits
+
+
+def _utcnow() -> datetime:
+	return datetime.utcnow()
+
+
+def _batch_status_label(status: Optional[str]) -> str:
+	return BATCH_STATUS_LABELS.get((status or "").strip().lower(), "Neznámý stav")
+
+
+def _is_terminal_batch_status(status: Optional[str]) -> bool:
+	return (status or "").strip().lower() in BATCH_TERMINAL_STATUSES
+
+
+def _load_batch_runtime_limit_s() -> int:
+	raw = (os.getenv("PDF_BATCH_MAX_RUNTIME_S") or "").strip()
+	if not raw:
+		return _DEFAULT_PDF_BATCH_MAX_RUNTIME_S
+	try:
+		value = int(raw)
+	except ValueError:
+		return _DEFAULT_PDF_BATCH_MAX_RUNTIME_S
+	return max(60, value)
+
+
+def _merge_warning_text(invoice_obj: Any, warnings: Optional[List[str]]) -> Optional[str]:
+	parts: list[str] = []
+	raw = get_warning(invoice_obj) if invoice_obj is not None else None
+	if raw:
+		parts.extend(part.strip() for part in str(raw).split("|") if part.strip())
+	for item in warnings or []:
+		text = str(item).strip()
+		if text and text not in parts:
+			parts.append(text)
+	joined = " | ".join(parts)
+	return joined or None
+
+
+def _extract_file_with_retry(
+	extractor: InvoiceExtractor,
+	pdf_path: Path,
+	display_name: str,
+	*,
+	max_attempts: int = 2,
+) -> List[ExtractResult]:
+	"""Extract one PDF with one automatic retry when all attempts fail."""
+	last_results: list[ExtractResult] = []
+	for attempt in range(1, max_attempts + 1):
+		try:
+			file_results = _run_extraction(extractor, pdf_path)
+		except Exception as exc:  # noqa: BLE001
+			logger.exception("Chyba při extrakci PDF %s (pokus %s/%s)", display_name, attempt, max_attempts)
+			file_results = [ExtractResult(file_path=display_name, data=None, error=str(exc))]
+		for res in file_results:
+			res.file_path = display_name
+		last_results = file_results
+		has_success = any(getattr(res, "data", None) is not None for res in file_results)
+		if has_success or attempt >= max_attempts:
+			return file_results
+		logger.warning("PDF %s selhalo bez výsledku, opakuji pokus %s/%s", display_name, attempt + 1, max_attempts)
+	return last_results
+
+
+def _build_batch_summary(
+	batch: InvoiceBatch,
+	*,
+	stop_reason: Optional[str],
+	auto_import_note: Optional[str] = None,
+) -> str:
+	total = int(batch.total_files or 0)
+	processed = int(batch.processed_files or 0)
+	success = int(batch.success_count or 0)
+	errors = int(batch.error_count or 0)
+	charged = int(batch.credits_charged or 0)
+	if stop_reason == "timeout":
+		prefix = "Zpracování bylo ukončeno časovým limitem."
+	elif stop_reason == "credits":
+		prefix = "Zpracování bylo částečně dokončeno – došly kredity."
+	elif stop_reason == "interrupted":
+		prefix = "Zpracování bylo přerušeno."
+	elif stop_reason == "failed":
+		prefix = "Zpracování dávky selhalo."
+	else:
+		prefix = "Zpracování dávky dokončeno."
+	msg = (
+		f"{prefix} Zpracováno {processed}/{total} PDF, úspěšně {success} faktur, "
+		f"chyb {errors}, odečteno {charged} kreditů."
+	)
+	if auto_import_note:
+		msg += f" {auto_import_note}"
+	return msg
+
+
+def _batch_progress_payload(batch: InvoiceBatch, *, row_count: Optional[int] = None) -> dict[str, Any]:
+	status = (batch.processing_status or BATCH_STATUS_COMPLETED).strip().lower()
+	total = max(0, int(batch.total_files or 0))
+	processed = max(0, int(batch.processed_files or 0))
+	success = max(0, int(batch.success_count or 0))
+	errors = max(0, int(batch.error_count or 0))
+	charged = max(0, int(batch.credits_charged or 0))
+	remaining = max(total - processed, 0)
+	if total > 0:
+		progress_pct = int(min(100, round((processed / total) * 100)))
+	elif _is_terminal_batch_status(status):
+		progress_pct = 100
+	else:
+		progress_pct = 0
+	return {
+		"batch_id": batch.id,
+		"status": status,
+		"status_label": _batch_status_label(status),
+		"is_terminal": _is_terminal_batch_status(status),
+		"total_files": total,
+		"processed_files": processed,
+		"remaining_files": remaining,
+		"success_count": success,
+		"error_count": errors,
+		"credits_charged": charged,
+		"progress_percent": progress_pct,
+		"summary_message": batch.summary_message or "",
+		"row_count": int(row_count if row_count is not None else len(batch.rows or [])),
+		"started_at": batch.started_at.isoformat() if batch.started_at else None,
+		"finished_at": batch.finished_at.isoformat() if batch.finished_at else None,
+		"last_heartbeat_at": batch.last_heartbeat_at.isoformat() if batch.last_heartbeat_at else None,
+	}
+
+
+def _run_pdf_batch_job(
+	app: Flask,
+	*,
+	batch_id: int,
+	user_id: int,
+	saved_files: List[tuple[str, str]],
+	job_dir: str,
+	runtime_limit_s: int,
+) -> None:
+	"""Background worker that processes one uploaded PDF batch."""
+	started_perf = time.perf_counter()
+	stop_reason: Optional[str] = None
+	auto_import_note: Optional[str] = None
+	try:
+		with app.app_context():
+			batch = db.session.get(InvoiceBatch, batch_id)
+			user = db.session.get(User, user_id)
+			if batch is None or user is None:
+				return
+			batch.processing_status = BATCH_STATUS_RUNNING
+			batch.started_at = _utcnow()
+			batch.last_heartbeat_at = _utcnow()
+			batch.summary_message = f"Spuštěno zpracování dávky ({batch.total_files} PDF)."
+			db.session.commit()
+
+			cfg = get_user_config_for_user(user)
+			extractor = InvoiceExtractor(config=cfg)
+			last_row_index = db.session.query(db.func.max(InvoiceRow.row_index)).filter(InvoiceRow.batch_id == batch.id).scalar()
+			next_row_index = int(last_row_index) + 1 if last_row_index is not None else 0
+
+			for file_path_str, display_name in saved_files:
+				elapsed = time.perf_counter() - started_perf
+				if runtime_limit_s > 0 and elapsed >= runtime_limit_s:
+					stop_reason = "timeout"
+					break
+
+				db.session.refresh(user)
+				if int(user.credits or 0) <= 0:
+					stop_reason = "credits"
+					break
+
+				file_results = _extract_file_with_retry(extractor, Path(file_path_str), display_name, max_attempts=2)
+				if not file_results:
+					file_results = [ExtractResult(file_path=display_name, data=None, error="Extrakce nevrátila žádná data.")]
+
+				credits_exhausted_during_file = False
+				for res in file_results:
+					res.file_path = display_name
+					data_obj = getattr(res, "data", None)
+					row_error = (getattr(res, "error", None) or "").strip() or None
+					warning_text = _merge_warning_text(data_obj, getattr(res, "warnings", None))
+					invoice_dict: Dict[str, Any] = {}
+
+					if data_obj is not None:
+						if int(user.credits or 0) <= 0:
+							row_error = "Extrakce zastavena: došly kredity pro další faktury v dávce."
+							credits_exhausted_during_file = True
+						else:
+							try:
+								invoice_dict = data_obj.model_dump()
+							except Exception:
+								invoice_dict = {}
+							if warning_text:
+								set_warning(invoice_dict, warning_text)
+							batch.success_count = int(batch.success_count or 0) + 1
+							batch.credits_charged = int(batch.credits_charged or 0) + 1
+							user.credits = max(0, int(user.credits or 0) - 1)
+
+					if not invoice_dict:
+						if row_error is None:
+							row_error = "Extrakce nevrátila použitelná data."
+						batch.error_count = int(batch.error_count or 0) + 1
+
+					db.session.add(
+						InvoiceRow(
+							batch=batch,
+							row_index=next_row_index,
+							source=display_name,
+							invoice_data=invoice_dict,
+							warning=warning_text,
+							error=row_error,
+							marked_for_import=bool(invoice_dict),
+						)
+					)
+					next_row_index += 1
+
+				batch.processed_files = min(
+					int(batch.total_files or len(saved_files)),
+					int(batch.processed_files or 0) + 1,
+				)
+				batch.last_heartbeat_at = _utcnow()
+				db.session.commit()
+
+				if credits_exhausted_during_file:
+					stop_reason = "credits"
+					break
+
+			batch = db.session.get(InvoiceBatch, batch_id)
+			user = db.session.get(User, user_id)
+			if batch is None or user is None:
+				return
+			if stop_reason is None and int(batch.processed_files or 0) < int(batch.total_files or 0):
+				stop_reason = "interrupted"
+
+			if getattr(cfg, "auto_import", False) and int(batch.success_count or 0) > 0:
+				company_code, direction, doc_type_code = current_context(user.settings, base_cfg=cfg)
+				apply_context_to_config(cfg, company_code, direction, doc_type_code)
+				ok, err, skipped = _import_batch(batch, cfg, None)
+				auto_import_note = f"Auto-import: {ok} OK, {err} chyb, {skipped} přeskočeno."
+
+			if stop_reason == "timeout":
+				batch.processing_status = BATCH_STATUS_PARTIAL_TIMEOUT
+			elif stop_reason == "credits":
+				batch.processing_status = BATCH_STATUS_COMPLETED_WITH_ERRORS
+			elif stop_reason == "interrupted":
+				batch.processing_status = BATCH_STATUS_INTERRUPTED
+			elif int(batch.error_count or 0) > 0:
+				batch.processing_status = BATCH_STATUS_COMPLETED_WITH_ERRORS
+			else:
+				batch.processing_status = BATCH_STATUS_COMPLETED
+
+			batch.finished_at = _utcnow()
+			batch.last_heartbeat_at = _utcnow()
+			batch.summary_message = _build_batch_summary(
+				batch,
+				stop_reason=stop_reason,
+				auto_import_note=auto_import_note,
+			)
+			db.session.commit()
+	except Exception as exc:  # noqa: BLE001
+		logger.exception("PDF batch worker selhal (batch_id=%s): %s", batch_id, exc)
+		with app.app_context():
+			try:
+				db.session.rollback()
+				batch = db.session.get(InvoiceBatch, batch_id)
+				if batch is not None:
+					batch.processing_status = BATCH_STATUS_FAILED
+					batch.finished_at = _utcnow()
+					batch.last_heartbeat_at = _utcnow()
+					batch.summary_message = _build_batch_summary(batch, stop_reason="failed")
+					db.session.commit()
+			except Exception:  # noqa: BLE001
+				db.session.rollback()
+	finally:
+		with _BATCH_THREADS_LOCK:
+			_BATCH_THREADS.pop(batch_id, None)
+		shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def _start_pdf_batch_job(
+	app: Flask,
+	*,
+	batch_id: int,
+	user_id: int,
+	saved_files: List[tuple[str, str]],
+	job_dir: str,
+	runtime_limit_s: int,
+) -> None:
+	thread = threading.Thread(
+		target=_run_pdf_batch_job,
+		name=f"pdf-batch-{batch_id}",
+		daemon=True,
+		kwargs={
+			"app": app,
+			"batch_id": batch_id,
+			"user_id": user_id,
+			"saved_files": saved_files,
+			"job_dir": job_dir,
+			"runtime_limit_s": runtime_limit_s,
+		},
+	)
+	with _BATCH_THREADS_LOCK:
+		_BATCH_THREADS[batch_id] = thread
+	thread.start()
 
 
 def _import_batch(batch: InvoiceBatch, cfg: Any, selected_ids: Optional[List[int]]) -> tuple[int, int, int]:
@@ -389,63 +715,68 @@ def create_app() -> Flask:
 			if not pdf_files:
 				flash("V nahraných souborech není žádné PDF.", "warning")
 				return render_template("upload_pdf.html", cfg=cfg)
-			min_required = len(pdf_files)
-			if current_user.credits < min_required:
-				flash(
-					f"Nemáte dostatek kreditů pro zpracování {len(pdf_files)} PDF. "
-					"Otevřete sekci Kredity a doplňte si zůstatek.",
-					"danger",
-				)
-				return redirect(url_for("credits"))
+			job_dir = tempfile.mkdtemp(prefix=f"easyflex-pdf-batch-{current_user.id}-")
+			job_dir_path = Path(job_dir)
 			display_names: list[str] = []
-			results: list[ExtractResult] = []
-			extraction_errors = 0
-			with tempfile.TemporaryDirectory() as tmpdir:
-				tmp_dir_path = Path(tmpdir)
-				used_names: set[str] = set()
-				saved_files: list[tuple[Path, str]] = []
+			used_names: set[str] = set()
+			saved_files: list[tuple[str, str]] = []
+			try:
 				for idx, storage in enumerate(pdf_files):
 					display_name = _normalize_upload_label(storage.filename, idx)
 					display_names.append(display_name)
 					save_name = _dedupe_filename(display_name, used_names, fallback=f"upload-{idx + 1}.pdf")
-					pdf_path = tmp_dir_path / save_name
+					pdf_path = job_dir_path / save_name
 					storage.save(pdf_path)
-					saved_files.append((pdf_path, display_name))
-				extractor = InvoiceExtractor(config=cfg)
-				# Sekvenční zpracování – stabilní paměť i vytížení API/serveru
-				for pdf_path, display_name in saved_files:
-					try:
-						file_results = _run_extraction(extractor, pdf_path)
-					except Exception as exc:  # noqa: BLE001
-						logger.exception("Chyba při extrakci PDF %s", display_name)
-						results.append(ExtractResult(file_path=display_name, data=None, error=str(exc)))
-						extraction_errors += 1
-						continue
-					for res in file_results:
-						res.file_path = display_name
-						if getattr(res, "error", None):
-							extraction_errors += 1
-					results.extend(file_results)
-			billable_results = _count_billable_results(results)
-			if billable_results > current_user.credits:
-				flash(
-					f"Extrakce našla {billable_results} faktur, ale máte k dispozici jen "
-					f"{current_user.credits} kreditů. Dokupte kredity a zkuste to prosím znovu.",
-					"danger",
-				)
-				return redirect(url_for("credits"))
+					saved_files.append((str(pdf_path), display_name))
+			except Exception:  # noqa: BLE001
+				logger.exception("Nepodařilo se uložit nahraná PDF do dočasného úložiště.")
+				shutil.rmtree(job_dir, ignore_errors=True)
+				flash("Nepodařilo se uložit nahrané PDF soubory. Zkuste to prosím znovu.", "danger")
+				return render_template("upload_pdf.html", cfg=cfg)
+
 			source_label = _derive_batch_label(display_names)
-			batch = create_batch_from_results(current_user, results, source_label, source_type="pdf")
-			if extraction_errors:
-				flash(f"Některé soubory obsahují chybu extrakce ({extraction_errors}).", "warning")
-			if billable_results:
-				remaining = _deduct_credits(current_user, billable_results)
-				flash(f"Odečteno {billable_results} kreditů. Aktuální zůstatek: {remaining}.", "info")
-			if getattr(cfg, "auto_import", False):
-				company_code, direction, doc_type_code = current_context(current_user.settings, base_cfg=cfg)
-				apply_context_to_config(cfg, company_code, direction, doc_type_code)
-				_import_batch(batch, cfg, None)
-				flash("Auto-import dokončen (viz statusy níže).", "info")
+			batch = InvoiceBatch(
+				user=current_user,
+				source_label=source_label,
+				source_type="pdf",
+				processing_status=BATCH_STATUS_QUEUED,
+				total_files=len(saved_files),
+				processed_files=0,
+				success_count=0,
+				error_count=0,
+				credits_charged=0,
+				summary_message=f"Dávka čeká na spuštění ({len(saved_files)} PDF).",
+				last_heartbeat_at=_utcnow(),
+			)
+			db.session.add(batch)
+			db.session.commit()
+
+			runtime_limit_s = _load_batch_runtime_limit_s()
+			try:
+				_start_pdf_batch_job(
+					app,
+					batch_id=batch.id,
+					user_id=current_user.id,
+					saved_files=saved_files,
+					job_dir=job_dir,
+					runtime_limit_s=runtime_limit_s,
+				)
+			except Exception as exc:  # noqa: BLE001
+				logger.exception("Nepodařilo se spustit PDF batch worker.")
+				batch.processing_status = BATCH_STATUS_FAILED
+				batch.finished_at = _utcnow()
+				batch.last_heartbeat_at = _utcnow()
+				batch.summary_message = f"Spuštění dávky selhalo: {exc}"
+				db.session.commit()
+				shutil.rmtree(job_dir, ignore_errors=True)
+				flash("Nepodařilo se spustit zpracování na pozadí. Zkuste to prosím znovu.", "danger")
+				return redirect(url_for("view_results", batch_id=batch.id))
+
+			flash(
+				f"Extrakce byla spuštěna na pozadí pro {len(saved_files)} PDF. "
+				"Výsledky se budou průběžně doplňovat.",
+				"info",
+			)
 			return redirect(url_for("view_results", batch_id=batch.id))
 		cfg.enable_multi_invoice_segmentation = segmentation_enabled
 		return render_template("upload_pdf.html", cfg=cfg)
@@ -487,6 +818,12 @@ def create_app() -> Flask:
 				return redirect(url_for("credits"))
 			batch = create_batch_from_invoices(current_user, invoices, filename, source_type="table")
 			remaining = _deduct_credits(current_user, credit_cost)
+			batch.credits_charged = credit_cost
+			batch.summary_message = (
+				f"Z tabulky načteno {invoice_count} faktur. "
+				f"Odečteno {credit_cost} kreditů."
+			)
+			db.session.commit()
 			flash(
 				f"Z tabulky načteno {invoice_count} faktur. Odečteno {credit_cost} kreditů. "
 				f"Aktuální zůstatek: {remaining}.",
@@ -521,10 +858,12 @@ def create_app() -> Flask:
 		doc_types = list_doc_types(current_user, company_code, direction)
 		if doc_type_code and not any(dt.code == doc_type_code for dt in doc_types):
 			doc_type_code = None
+		progress = _batch_progress_payload(batch, row_count=len(rows))
 		return render_template(
 			"results.html",
 			batch=batch,
 			rows=rows,
+			batch_progress=progress,
 			allow_import=True,
 			columns=DISPLAY_COLUMNS,
 			column_labels=COLUMN_LABELS,
@@ -534,6 +873,15 @@ def create_app() -> Flask:
 			selected_direction=direction,
 			selected_doc_type=doc_type_code,
 		)
+
+	@app.route("/results/<int:batch_id>/progress")
+	@login_required
+	def batch_progress(batch_id: int):
+		batch = InvoiceBatch.query.filter_by(id=batch_id, user_id=current_user.id).first()
+		if batch is None:
+			abort(404)
+		row_count = db.session.query(db.func.count(InvoiceRow.id)).filter(InvoiceRow.batch_id == batch.id).scalar() or 0
+		return jsonify(_batch_progress_payload(batch, row_count=int(row_count)))
 
 	@app.route("/invoice/<int:row_id>/edit", methods=["GET", "POST"])
 	@login_required
@@ -672,6 +1020,8 @@ def create_app() -> Flask:
 					("max_tokens", "max_tokens"),
 					("dpi", "pdf_dpi"),
 					("max_pages", "max_pages"),
+					("openai_timeout_s", "timeout_s"),
+					("openai_connection_timeout_s", "connection_timeout_s"),
 					("openai_max_retries", "max_retries"),
 					("image_max_width", "image_max_width"),
 					("image_jpeg_quality", "image_jpeg_quality"),

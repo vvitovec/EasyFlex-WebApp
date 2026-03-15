@@ -6,8 +6,39 @@
 	{% if batch %}
 		<p class="muted">Zdroj: {{ batch.source_label or 'nahraný soubor' }} • Vytvořeno {{ batch.created_at }}</p>
 	{% endif %}
+	{% if batch and batch_progress %}
+		<div
+			class="batch-progress-card"
+			data-batch-progress
+			data-progress-url="{{ url_for('batch_progress', batch_id=batch.id) }}"
+			data-view-url="{{ url_for('view_results', batch_id=batch.id) }}"
+			data-status="{{ batch_progress.status }}"
+			data-processed="{{ batch_progress.processed_files }}"
+			data-row-count="{{ batch_progress.row_count }}"
+			data-terminal="{% if batch_progress.is_terminal %}1{% else %}0{% endif %}"
+		>
+			<div class="batch-progress-head">
+				<strong id="batch-status-label">{{ batch_progress.status_label }}</strong>
+				<span id="batch-progress-text">{{ batch_progress.processed_files }}/{{ batch_progress.total_files }} PDF</span>
+			</div>
+			<div class="batch-progress-track">
+				<div class="batch-progress-fill" id="batch-progress-fill" style="width: {{ batch_progress.progress_percent }}%;"></div>
+			</div>
+			<div class="batch-progress-meta">
+				<span>Úspěšně: <strong id="batch-success-count">{{ batch_progress.success_count }}</strong></span>
+				<span>Chyby: <strong id="batch-error-count">{{ batch_progress.error_count }}</strong></span>
+				<span>Kredity: <strong id="batch-credits-count">{{ batch_progress.credits_charged }}</strong></span>
+				<span>Zbývá souborů: <strong id="batch-remaining-count">{{ batch_progress.remaining_files }}</strong></span>
+			</div>
+			<p class="muted" id="batch-summary-text">{{ batch_progress.summary_message or "Čeká na zpracování…" }}</p>
+		</div>
+	{% endif %}
 	{% if not rows %}
-		<p>Žádné výsledky k zobrazení.</p>
+		{% if batch_progress and not batch_progress.is_terminal %}
+			<p>Zatím nejsou k dispozici žádné řádky. Výsledky se objeví průběžně během zpracování.</p>
+		{% else %}
+			<p>Žádné výsledky k zobrazení.</p>
+		{% endif %}
 	{% else %}
 	<form id="import-form" method="post" action="{{ url_for('import_abra_route', batch_id=batch.id) }}">
 		<div class="context-bar">
@@ -146,6 +177,58 @@
 		const contextRefreshUrl = "{{ url_for('view_results', batch_id=batch.id) }}";
 		const toggleAllBtn = document.getElementById('toggle-all-import');
 		const importCheckboxSelector = 'input[name="import_row_ids"]';
+		const progressRoot = document.querySelector('[data-batch-progress]');
+		const progressUrl = progressRoot ? progressRoot.dataset.progressUrl : null;
+		const progressViewUrl = progressRoot ? progressRoot.dataset.viewUrl : null;
+		const progressLabelEl = document.getElementById('batch-status-label');
+		const progressTextEl = document.getElementById('batch-progress-text');
+		const progressFillEl = document.getElementById('batch-progress-fill');
+		const progressSummaryEl = document.getElementById('batch-summary-text');
+		const progressSuccessEl = document.getElementById('batch-success-count');
+		const progressErrorEl = document.getElementById('batch-error-count');
+		const progressCreditsEl = document.getElementById('batch-credits-count');
+		const progressRemainingEl = document.getElementById('batch-remaining-count');
+		let lastKnownStatus = progressRoot ? (progressRoot.dataset.status || "") : "";
+		let lastKnownProcessed = progressRoot ? Number(progressRoot.dataset.processed || "0") : 0;
+		let lastKnownRowCount = progressRoot ? Number(progressRoot.dataset.rowCount || "0") : 0;
+		let lastReloadAt = Date.now();
+
+		function updateProgress(payload) {
+			if (!payload || !progressRoot) return;
+			if (progressLabelEl) progressLabelEl.textContent = payload.status_label || payload.status || "";
+			if (progressTextEl) progressTextEl.textContent = `${payload.processed_files}/${payload.total_files} PDF`;
+			if (progressFillEl) progressFillEl.style.width = `${payload.progress_percent || 0}%`;
+			if (progressSummaryEl) progressSummaryEl.textContent = payload.summary_message || "";
+			if (progressSuccessEl) progressSuccessEl.textContent = String(payload.success_count || 0);
+			if (progressErrorEl) progressErrorEl.textContent = String(payload.error_count || 0);
+			if (progressCreditsEl) progressCreditsEl.textContent = String(payload.credits_charged || 0);
+			if (progressRemainingEl) progressRemainingEl.textContent = String(payload.remaining_files || 0);
+		}
+
+		async function pollProgress() {
+			if (!progressUrl) return;
+			try {
+				const response = await fetch(progressUrl, { cache: "no-store" });
+				if (!response.ok) return;
+				const payload = await response.json();
+				updateProgress(payload);
+				const now = Date.now();
+				const changed =
+					(payload.status !== lastKnownStatus) ||
+					(Number(payload.processed_files || 0) !== lastKnownProcessed) ||
+					(Number(payload.row_count || 0) !== lastKnownRowCount);
+				if (changed && progressViewUrl && (now - lastReloadAt) > 4000) {
+					lastReloadAt = now;
+					window.location.href = progressViewUrl;
+					return;
+				}
+				lastKnownStatus = payload.status || "";
+				lastKnownProcessed = Number(payload.processed_files || 0);
+				lastKnownRowCount = Number(payload.row_count || 0);
+			} catch (_err) {
+				// Polling errors should not break interactions on this page.
+			}
+		}
 
 		function syncCompanyFormContext() {
 			if (!companyForm) return;
@@ -216,6 +299,11 @@
 			});
 			getImportCheckboxes().forEach(cb => cb.addEventListener('change', updateToggleLabel));
 			updateToggleLabel();
+		}
+
+		if (progressRoot && progressRoot.dataset.terminal !== "1") {
+			pollProgress();
+			setInterval(pollProgress, 3000);
 		}
 
 		const dateColumns = new Set(["datum_vystaveni", "datum_duzp", "datum_splatnosti"]);

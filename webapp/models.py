@@ -107,6 +107,16 @@ class InvoiceBatch(db.Model):
 	source_label = db.Column(db.String(255), nullable=True)
 	source_type = db.Column(db.String(32), nullable=True)  # e.g., pdf/table
 	created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+	processing_status = db.Column(db.String(32), nullable=False, default="completed", server_default=text("'completed'"))
+	total_files = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
+	processed_files = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
+	success_count = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
+	error_count = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
+	credits_charged = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
+	started_at = db.Column(db.DateTime, nullable=True)
+	finished_at = db.Column(db.DateTime, nullable=True)
+	last_heartbeat_at = db.Column(db.DateTime, nullable=True)
+	summary_message = db.Column(db.Text, nullable=True)
 
 	user = db.relationship("User", back_populates="batches")
 	rows = db.relationship("InvoiceRow", back_populates="batch", cascade="all, delete-orphan")
@@ -145,3 +155,43 @@ def init_db(app) -> None:
 			table_name = '"user"' if engine.dialect.name == "postgresql" else "user"
 			with engine.begin() as conn:
 				conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN credits INTEGER DEFAULT 100 NOT NULL"))
+		batch_columns = {col["name"] for col in insp.get_columns("invoice_batch")}
+		with engine.begin() as conn:
+			if "processing_status" not in batch_columns:
+				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN processing_status VARCHAR(32) DEFAULT 'completed' NOT NULL"))
+			if "total_files" not in batch_columns:
+				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN total_files INTEGER DEFAULT 0 NOT NULL"))
+			if "processed_files" not in batch_columns:
+				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN processed_files INTEGER DEFAULT 0 NOT NULL"))
+			if "success_count" not in batch_columns:
+				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN success_count INTEGER DEFAULT 0 NOT NULL"))
+			if "error_count" not in batch_columns:
+				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN error_count INTEGER DEFAULT 0 NOT NULL"))
+			if "credits_charged" not in batch_columns:
+				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN credits_charged INTEGER DEFAULT 0 NOT NULL"))
+			if "started_at" not in batch_columns:
+				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN started_at TIMESTAMP"))
+			if "finished_at" not in batch_columns:
+				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN finished_at TIMESTAMP"))
+			if "last_heartbeat_at" not in batch_columns:
+				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN last_heartbeat_at TIMESTAMP"))
+			if "summary_message" not in batch_columns:
+				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN summary_message TEXT"))
+			# Normalize nulls in legacy rows and ensure defaults are usable in UI/progress.
+			conn.execute(text(
+				"UPDATE invoice_batch "
+				"SET processing_status = COALESCE(NULLIF(processing_status, ''), 'completed'), "
+				"total_files = COALESCE(total_files, 0), "
+				"processed_files = COALESCE(processed_files, 0), "
+				"success_count = COALESCE(success_count, 0), "
+				"error_count = COALESCE(error_count, 0), "
+				"credits_charged = COALESCE(credits_charged, 0)"
+			))
+			# If the process restarted while batch processing was in-flight, expose partial results as interrupted.
+			conn.execute(text(
+				"UPDATE invoice_batch "
+				"SET processing_status = 'interrupted', "
+				"finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP), "
+				"summary_message = COALESCE(summary_message, 'Zpracování bylo přerušeno restartem serveru.') "
+				"WHERE processing_status IN ('queued', 'running')"
+			))

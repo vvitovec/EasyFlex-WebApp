@@ -3,13 +3,13 @@
 {% block content %}
 <div class="card">
 	<h2>Nahrát PDF faktury</h2>
-	<p>Vyberte jedno nebo více PDF s fakturami nebo rovnou celou složku. Extrakce proběhne po nahrání.</p>
-	<p class="muted">Soubory se zpracují postupně, takže se server zbytečně nepřetěžuje. Během zpracování prosím nezavírejte okno.</p>
+	<p>Vyberte jedno nebo více PDF s fakturami nebo rovnou celou složku. Extrakce poběží na pozadí a výsledky se budou průběžně doplňovat.</p>
+	<p class="muted">Po odeslání budete přesměrováni na stránku výsledků, kde uvidíte stav dávky v reálném čase.</p>
 	<p><strong>Cena:</strong> 1 kredit za každou fakturu z PDF. Aktuální zůstatek: {{ current_user.credits or 0 }} kreditů.</p>
 	{% if error %}
 		<div class="flash danger">{{ error }}</div>
 	{% endif %}
-	<form method="post" enctype="multipart/form-data" class="form show-loading" data-loading-message="Probíhá extrakce… prosím nezavírejte okno.">
+	<form method="post" enctype="multipart/form-data" class="form show-loading" data-loading-message="Zakládám dávku pro zpracování na pozadí…">
 		<label for="pdfs">PDF soubory</label>
 		<input id="pdfs" name="pdfs" type="file" accept="application/pdf" multiple required>
 		<label class="checkbox-inline">
@@ -46,9 +46,9 @@
 			if (!form) return;
 			const count = input.files ? input.files.length : 0;
 			if (count > 1) {
-				form.dataset.loadingMessage = `Zpracovávám ${count} PDF… prosím nezavírejte okno.`;
+				form.dataset.loadingMessage = `Zakládám dávku pro ${count} PDF…`;
 			} else {
-				form.dataset.loadingMessage = "Probíhá extrakce… prosím nezavírejte okno.";
+				form.dataset.loadingMessage = "Zakládám dávku pro zpracování na pozadí…";
 			}
 		});
 	})();

@@ -63,6 +63,12 @@
 					<label for="max_pages">Max Pages</label>
 					<input id="max_pages" name="max_pages" type="number" value="{{ cfg.max_pages }}">
 
+					<label for="timeout_s">OpenAI timeout (s)</label>
+					<input id="timeout_s" name="timeout_s" type="number" min="10" value="{{ cfg.openai_timeout_s }}">
+
+					<label for="connection_timeout_s">OpenAI connection timeout (s)</label>
+					<input id="connection_timeout_s" name="connection_timeout_s" type="number" min="3" value="{{ cfg.openai_connection_timeout_s }}">
+
 					<label for="request_delay">Request Delay (s)</label>
 					<input id="request_delay" name="request_delay" type="number" step="0.1" value="{{ cfg.openai_request_delay }}">
 
