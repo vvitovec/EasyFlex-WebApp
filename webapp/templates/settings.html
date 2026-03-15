@@ -51,6 +51,16 @@
 					<label for="openai_model">Model</label>
 					<input id="openai_model" name="openai_model" type="text" value="{{ cfg.openai_model }}">
 
+					<label for="reasoning_effort">Reasoning effort</label>
+					<select id="reasoning_effort" name="reasoning_effort">
+						{% set current_reasoning = (cfg.openai_reasoning_effort or 'medium')|lower %}
+						<option value="minimal" {% if current_reasoning == 'minimal' %}selected{% endif %}>minimal</option>
+						<option value="low" {% if current_reasoning == 'low' %}selected{% endif %}>low</option>
+						<option value="medium" {% if current_reasoning == 'medium' %}selected{% endif %}>medium</option>
+						<option value="high" {% if current_reasoning == 'high' %}selected{% endif %}>high</option>
+						<option value="none" {% if current_reasoning == 'none' %}selected{% endif %}>none</option>
+					</select>
+
 					<label for="concurrency">Concurrency</label>
 					<input id="concurrency" name="concurrency" type="number" value="{{ cfg.concurrency }}">
 

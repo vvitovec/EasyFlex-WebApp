@@ -441,7 +441,7 @@ class InvoiceExtractor:
 		}
 
 	async def _call_openai_segment_page(self, image_b64: str) -> Dict:
-		"""Zavolá OpenAI pro klasifikaci jedné stránky (segmentační fáze) s lehkou retry logikou."""
+		"""Zavolá OpenAI pro klasifikaci jedné stránky (segmentační fáze) s retry logikou."""
 		client = self._get_client()
 		messages = [
 			{
@@ -475,6 +475,9 @@ class InvoiceExtractor:
 		fallback_model = DEFAULT_OPENAI_MODEL
 		used_fallback = False
 		sampling_forced_off = False
+		reasoning_forced_off = False
+		current_max_tokens = max(256, min(self.max_tokens, 1024))
+		max_segment_tokens = 2048
 		for attempt in range(self.max_retries + 1):
 			try:
 				token_param = "max_completion_tokens" if "gpt-5" in str(current_model) else "max_tokens"
@@ -487,18 +490,75 @@ class InvoiceExtractor:
 				if model_supports_sampling_params(current_model) and not sampling_forced_off:
 					request_kwargs["temperature"] = 0
 					request_kwargs["top_p"] = self.top_p
-				if self.reasoning_effort and "gpt-5" in str(current_model):
-					request_kwargs["reasoning_effort"] = self.reasoning_effort
-				request_kwargs[token_param] = min(128, self.max_tokens)
-				resp = await asyncio.to_thread(
-					lambda: client.chat.completions.create(**request_kwargs)
+				if self.reasoning_effort and "gpt-5" in str(current_model) and not reasoning_forced_off:
+					# Segmentace je jednoduchá klasifikace; minimalizuj reasoning režii.
+					request_kwargs["reasoning_effort"] = "minimal"
+				request_kwargs[token_param] = current_max_tokens
+				resp = await asyncio.wait_for(
+					asyncio.to_thread(
+						lambda: client.chat.completions.create(**request_kwargs)
+					),
+					timeout=self.timeout_s + 5,
 				)
 				choice = resp.choices[0]
+				finish_reason = getattr(choice, "finish_reason", None)
 				parsed = getattr(getattr(choice, "message", None), "parsed", None)
 				if parsed is not None:
 					return parsed  # type: ignore[return-value]
-				content = choice.message.content  # type: ignore[attr-defined]
-				return self._try_parse_json_payload(content)
+				content = getattr(getattr(choice, "message", None), "content", None)
+				try:
+					return self._try_parse_json_payload(content)
+				except json.JSONDecodeError as e:
+					last_exception = e
+					if finish_reason == "length" and current_max_tokens < max_segment_tokens:
+						current_max_tokens = min(current_max_tokens * 2, max_segment_tokens)
+						delay = self._calculate_backoff_delay(attempt)
+						logger.warning(
+							"Segmentace JSON utnutá kvůli tokenům (attempt %d/%d), zvyšuji na %s a čekám %.1fs",
+							attempt + 1,
+							self.max_retries + 1,
+							current_max_tokens,
+							delay,
+						)
+						await asyncio.sleep(delay)
+						continue
+					# Občas model vrátí prázdný text bez explicitního finish_reason=length.
+					if not self._normalize_message_content(content) and current_max_tokens < max_segment_tokens:
+						current_max_tokens = min(current_max_tokens * 2, max_segment_tokens)
+						delay = self._calculate_backoff_delay(attempt)
+						logger.warning(
+							"Segmentace vrátila prázdný výstup (attempt %d/%d), opakuji s %s tokeny po %.1fs",
+							attempt + 1,
+							self.max_retries + 1,
+							current_max_tokens,
+							delay,
+						)
+						await asyncio.sleep(delay)
+						continue
+					if attempt < self.max_retries:
+						delay = self._calculate_backoff_delay(attempt)
+						logger.warning(
+							"Segmentace vrátila nevalidní JSON (attempt %d/%d), opakuji po %.1fs",
+							attempt + 1,
+							self.max_retries + 1,
+							delay,
+						)
+						await asyncio.sleep(delay)
+						continue
+					if not used_fallback and current_model != fallback_model:
+						previous_model = current_model
+						current_model = fallback_model
+						used_fallback = True
+						delay = self._calculate_backoff_delay(attempt)
+						logger.warning(
+							"Segmentace JSON nevalidní na modelu %s, přepínám na %s po %.1fs",
+							previous_model,
+							fallback_model,
+							delay,
+						)
+						await asyncio.sleep(delay)
+						continue
+					raise
 			except asyncio.TimeoutError as e:
 				last_exception = e
 				if attempt < self.max_retries:
@@ -532,18 +592,43 @@ class InvoiceExtractor:
 					)
 					await asyncio.sleep(delay)
 					continue
+				if not reasoning_forced_off and self._reasoning_effort_unsupported(e):
+					reasoning_forced_off = True
+					delay = self._calculate_backoff_delay(attempt)
+					logger.warning(
+						"Model %s nepodporuje reasoning_effort (segmentace), opakuji bez něj po %.1fs",
+						current_model,
+						delay,
+					)
+					await asyncio.sleep(delay)
+					continue
 				if not used_fallback and current_model != fallback_model:
+					previous_model = current_model
 					current_model = fallback_model
 					used_fallback = True
 					delay = self._calculate_backoff_delay(attempt)
+					logger.warning(
+						"Segmentace BadRequest na modelu %s, přepínám na fallback %s po %.1fs",
+						previous_model,
+						fallback_model,
+						delay,
+					)
 					await asyncio.sleep(delay)
 					continue
 				raise
 			except Exception as e:  # noqa: BLE001
+				last_exception = e
 				if not used_fallback and current_model != fallback_model:
+					previous_model = current_model
 					current_model = fallback_model
 					used_fallback = True
 					delay = self._calculate_backoff_delay(attempt)
+					logger.warning(
+						"Segmentace výjimka na modelu %s, přepínám na fallback %s po %.1fs",
+						previous_model,
+						fallback_model,
+						delay,
+					)
 					await asyncio.sleep(delay)
 					continue
 				raise
@@ -611,14 +696,29 @@ class InvoiceExtractor:
 				current_start, current_key = seg.page_index, seg.doc_key
 				continue
 
+			key_changed_confidently = (
+				seg.doc_key is not None
+				and current_key is not None
+				and seg.doc_key != current_key
+				and seg.confidence >= 0.6
+			)
+
 			if role == "middle":
 				if current_start is None:
 					current_start, current_key = seg.page_index, seg.doc_key
 				else:
 					# Pokud se klíč výrazně změní, uzavři a začni novou skupinu
-					if seg.doc_key and current_key and seg.doc_key != current_key and seg.confidence >= 0.6:
+					if key_changed_confidently:
 						groups.append((current_start, seg.page_index - 1, current_key))
 						current_start, current_key = seg.page_index, seg.doc_key
+				continue
+
+			if role == "unknown":
+				if current_start is None:
+					current_start, current_key = seg.page_index, seg.doc_key
+				elif key_changed_confidently:
+					groups.append((current_start, seg.page_index - 1, current_key))
+					current_start, current_key = seg.page_index, seg.doc_key
 				continue
 
 			if role == "end":
@@ -1011,31 +1111,57 @@ class InvoiceExtractor:
 		}
 		return schema
 
-	def _try_parse_json_payload(self, content: Optional[str]) -> Dict:
-		"""Try to parse JSON payload from assistant content with several fallbacks."""
+	def _normalize_message_content(self, content: Any) -> Optional[str]:
+		"""Normalize SDK message content variants into plain text."""
 		if content is None:
+			return None
+		if isinstance(content, str):
+			text = content
+		elif isinstance(content, list):
+			chunks: List[str] = []
+			for item in content:
+				if isinstance(item, str):
+					chunks.append(item)
+					continue
+				if isinstance(item, dict):
+					value = item.get("text")
+					if isinstance(value, str):
+						chunks.append(value)
+			text = "\n".join(chunks)
+		elif isinstance(content, dict):
+			value = content.get("text")
+			text = value if isinstance(value, str) else json.dumps(content, ensure_ascii=False)
+		else:
+			text = str(content)
+		text = text.strip()
+		return text or None
+
+	def _try_parse_json_payload(self, content: Any) -> Dict:
+		"""Try to parse JSON payload from assistant content with several fallbacks."""
+		text = self._normalize_message_content(content)
+		if text is None:
 			raise json.JSONDecodeError("Empty content", "", 0)
 		# 1) Direct parse
 		try:
-			return json.loads(content)
+			return json.loads(text)
 		except json.JSONDecodeError:
 			pass
 		# 2) Fenced ```json ... ```
-		m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", content, re.IGNORECASE)
+		m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", text, re.IGNORECASE)
 		if m:
 			return json.loads(m.group(1))
 		# 3) Any fenced code
-		m = re.search(r"```[a-zA-Z]*\s*(\{[\s\S]*?\})\s*```", content)
+		m = re.search(r"```[a-zA-Z]*\s*(\{[\s\S]*?\})\s*```", text)
 		if m:
 			return json.loads(m.group(1))
 		# 4) Extract first balanced-looking JSON object
-		start = content.find("{")
-		end = content.rfind("}")
+		start = text.find("{")
+		end = text.rfind("}")
 		if start != -1 and end != -1 and end > start:
-			candidate = content[start : end + 1]
+			candidate = text[start : end + 1]
 			return json.loads(candidate)
 		# No luck
-		raise json.JSONDecodeError("Unable to parse JSON from content", content, 0)
+		raise json.JSONDecodeError("Unable to parse JSON from content", text, 0)
 
 	def _sampling_params_unsupported(self, exc: Exception) -> bool:
 		"""Detect OpenAI errors complaining about temperature/top_p being unsupported."""
@@ -1060,6 +1186,30 @@ class InvoiceExtractor:
 		parts.append(str(exc))
 		text = " ".join(p for p in parts if p).lower()
 		return ("temperature" in text or "top_p" in text) and ("unsupported" in text or "does not support" in text)
+
+	def _reasoning_effort_unsupported(self, exc: Exception) -> bool:
+		"""Detect OpenAI errors complaining about unsupported reasoning_effort."""
+		if not isinstance(exc, BadRequestError):
+			return False
+		parts: List[str] = []
+		try:
+			body = getattr(exc, "body", None)
+			if body:
+				parts.append(json.dumps(body, ensure_ascii=False))
+		except Exception:
+			pass
+		try:
+			resp = getattr(exc, "response", None)
+			if resp is not None and hasattr(resp, "json"):
+				parts.append(json.dumps(resp.json(), ensure_ascii=False))
+		except Exception:
+			pass
+		message = getattr(exc, "message", None)
+		if message:
+			parts.append(str(message))
+		parts.append(str(exc))
+		text = " ".join(p for p in parts if p).lower()
+		return "reasoning_effort" in text and ("unsupported" in text or "does not support" in text or "invalid" in text)
 
 	async def _call_openai(
 		self,
@@ -1128,6 +1278,7 @@ class InvoiceExtractor:
 		current_max_tokens = self.max_tokens
 		used_fallback_model = False
 		sampling_forced_off = False
+		reasoning_forced_off = False
 		for attempt in range(self.max_retries + 1):
 			try:
 				token_param = "max_completion_tokens" if "gpt-5" in str(current_model) else "max_tokens"
@@ -1140,7 +1291,7 @@ class InvoiceExtractor:
 				if model_supports_sampling_params(current_model) and not sampling_forced_off:
 					request_kwargs["temperature"] = self.temperature
 					request_kwargs["top_p"] = self.top_p
-				if self.reasoning_effort and "gpt-5" in str(current_model):
+				if self.reasoning_effort and "gpt-5" in str(current_model) and not reasoning_forced_off:
 					request_kwargs["reasoning_effort"] = self.reasoning_effort
 				request_kwargs[token_param] = current_max_tokens
 				# Use asyncio.wait_for to implement timeout
@@ -1180,6 +1331,16 @@ class InvoiceExtractor:
 						current_model = fallback_model
 						used_fallback_model = True
 						delay = self._calculate_backoff_delay(attempt)
+						await asyncio.sleep(delay)
+						continue
+					if attempt < self.max_retries:
+						delay = self._calculate_backoff_delay(attempt)
+						logger.warning(
+							"Model vrátil nevalidní JSON (attempt %d/%d), opakuji po %.1fs",
+							attempt + 1,
+							self.max_retries + 1,
+							delay,
+						)
 						await asyncio.sleep(delay)
 						continue
 					# No more fallbacks -> propagate
@@ -1230,6 +1391,18 @@ class InvoiceExtractor:
 					delay = self._calculate_backoff_delay(attempt)
 					logger.warning(
 						"Model %s nepodporuje temperature/top_p, opakuji bez těchto parametrů (attempt %d/%d) po %.1fs",
+						current_model,
+						attempt + 1,
+						self.max_retries + 1,
+						delay,
+					)
+					await asyncio.sleep(delay)
+					continue
+				if not reasoning_forced_off and self._reasoning_effort_unsupported(e):
+					reasoning_forced_off = True
+					delay = self._calculate_backoff_delay(attempt)
+					logger.warning(
+						"Model %s nepodporuje reasoning_effort, opakuji bez tohoto parametru (attempt %d/%d) po %.1fs",
 						current_model,
 						attempt + 1,
 						self.max_retries + 1,

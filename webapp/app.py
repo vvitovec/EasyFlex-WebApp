@@ -1015,6 +1015,7 @@ def create_app() -> Flask:
 
 			if current_user.is_admin:
 				_set_override("openai_model", (request.form.get("openai_model") or "").strip() or None)
+				_set_override("openai_reasoning_effort", (request.form.get("reasoning_effort") or "").strip() or None)
 				for int_field, form_key in (
 					("concurrency", "concurrency"),
 					("max_tokens", "max_tokens"),

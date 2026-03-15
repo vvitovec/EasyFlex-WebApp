@@ -90,8 +90,13 @@ def model_supports_sampling_params(model_name: Optional[str]) -> bool:
 	if not model_name:
 		return True
 	model_lower = str(model_name).lower()
-	# Reasoning models (o1/o3 or models containing 'reasoning') currently force the default temperature/top_p
-	if model_lower.startswith("o1") or model_lower.startswith("o3") or "reasoning" in model_lower:
+	# Reasoning-style models (including GPT-5 family) currently force default sampling params.
+	if (
+		model_lower.startswith("o1")
+		or model_lower.startswith("o3")
+		or model_lower.startswith("gpt-5")
+		or "reasoning" in model_lower
+	):
 		return False
 	return True
 

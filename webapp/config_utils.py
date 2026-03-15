@@ -12,6 +12,7 @@ from .models import UserSettings, User, db
 
 EXTRACTOR_OVERRIDE_KEYS = {
 	"openai_model",
+	"openai_reasoning_effort",
 	"concurrency",
 	"max_tokens",
 	"dpi",
@@ -26,6 +27,7 @@ EXTRACTOR_OVERRIDE_KEYS = {
 
 OVERRIDE_CASTERS = {
 	"openai_model": str,
+	"openai_reasoning_effort": str,
 	"concurrency": int,
 	"max_tokens": int,
 	"dpi": int,
