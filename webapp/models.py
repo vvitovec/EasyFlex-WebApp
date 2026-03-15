@@ -2,13 +2,54 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
+import time
 from sqlalchemy import inspect, text
+from sqlalchemy.exc import OperationalError
 
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
 
 db = SQLAlchemy()
+logger = logging.getLogger(__name__)
+
+
+def _is_retryable_migration_error(exc: Exception) -> bool:
+	message = str(exc).lower()
+	return (
+		"statement timeout" in message
+		or "lock timeout" in message
+		or "deadlock detected" in message
+		or "canceling statement due to statement timeout" in message
+	)
+
+
+def _execute_migration_sql(engine, sql: str, *, attempts: int = 8, delay_s: float = 1.5) -> None:
+	"""Execute a migration statement with retries for transient DB lock/timeout errors."""
+	last_exc: Exception | None = None
+	for attempt in range(1, attempts + 1):
+		try:
+			with engine.begin() as conn:
+				if engine.dialect.name == "postgresql":
+					# Keep DDL from being killed by low per-role statement timeout during deploy.
+					conn.execute(text("SET LOCAL statement_timeout = 0"))
+					conn.execute(text("SET LOCAL lock_timeout = '4s'"))
+				conn.execute(text(sql))
+			return
+		except OperationalError as exc:
+			last_exc = exc
+			if not _is_retryable_migration_error(exc) or attempt >= attempts:
+				raise
+			logger.warning(
+				"DB migration statement retry %s/%s due to lock/timeout: %s",
+				attempt,
+				attempts,
+				sql,
+			)
+			time.sleep(delay_s)
+	if last_exc is not None:
+		raise last_exc
 
 
 class User(db.Model, UserMixin):
@@ -151,54 +192,41 @@ def init_db(app) -> None:
 		insp = inspect(engine)
 		columns = {col["name"] for col in insp.get_columns("user_settings")}
 		if "config_overrides" not in columns:
-			with engine.begin() as conn:
-				conn.execute(text("ALTER TABLE user_settings ADD COLUMN config_overrides TEXT"))
+			_execute_migration_sql(engine, "ALTER TABLE user_settings ADD COLUMN config_overrides TEXT")
 		user_columns = {col["name"] for col in insp.get_columns("user")}
 		if "credits" not in user_columns:
 			table_name = '"user"' if engine.dialect.name == "postgresql" else "user"
-			with engine.begin() as conn:
-				conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN credits INTEGER DEFAULT 100 NOT NULL"))
+			_execute_migration_sql(engine, f"ALTER TABLE {table_name} ADD COLUMN credits INTEGER DEFAULT 100 NOT NULL")
 		batch_columns = {col["name"] for col in insp.get_columns("invoice_batch")}
+		if "processing_status" not in batch_columns:
+			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN processing_status VARCHAR(32) DEFAULT 'completed' NOT NULL")
+		if "total_files" not in batch_columns:
+			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN total_files INTEGER DEFAULT 0 NOT NULL")
+		if "processed_files" not in batch_columns:
+			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN processed_files INTEGER DEFAULT 0 NOT NULL")
+		if "processed_invoices" not in batch_columns:
+			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN processed_invoices INTEGER DEFAULT 0 NOT NULL")
+		if "total_invoices_estimate" not in batch_columns:
+			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN total_invoices_estimate INTEGER DEFAULT 0 NOT NULL")
+		if "current_phase" not in batch_columns:
+			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN current_phase VARCHAR(64)")
+		if "success_count" not in batch_columns:
+			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN success_count INTEGER DEFAULT 0 NOT NULL")
+		if "error_count" not in batch_columns:
+			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN error_count INTEGER DEFAULT 0 NOT NULL")
+		if "credits_charged" not in batch_columns:
+			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN credits_charged INTEGER DEFAULT 0 NOT NULL")
+		if "started_at" not in batch_columns:
+			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN started_at TIMESTAMP")
+		if "finished_at" not in batch_columns:
+			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN finished_at TIMESTAMP")
+		if "last_heartbeat_at" not in batch_columns:
+			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN last_heartbeat_at TIMESTAMP")
+		if "summary_message" not in batch_columns:
+			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN summary_message TEXT")
+		# If the process restarted while batch processing was in-flight, expose partial results as interrupted.
+		# Keep this update narrowly scoped to avoid heavy startup scans.
 		with engine.begin() as conn:
-			if "processing_status" not in batch_columns:
-				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN processing_status VARCHAR(32) DEFAULT 'completed' NOT NULL"))
-			if "total_files" not in batch_columns:
-				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN total_files INTEGER DEFAULT 0 NOT NULL"))
-			if "processed_files" not in batch_columns:
-				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN processed_files INTEGER DEFAULT 0 NOT NULL"))
-			if "processed_invoices" not in batch_columns:
-				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN processed_invoices INTEGER DEFAULT 0 NOT NULL"))
-			if "total_invoices_estimate" not in batch_columns:
-				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN total_invoices_estimate INTEGER DEFAULT 0 NOT NULL"))
-			if "current_phase" not in batch_columns:
-				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN current_phase VARCHAR(64)"))
-			if "success_count" not in batch_columns:
-				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN success_count INTEGER DEFAULT 0 NOT NULL"))
-			if "error_count" not in batch_columns:
-				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN error_count INTEGER DEFAULT 0 NOT NULL"))
-			if "credits_charged" not in batch_columns:
-				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN credits_charged INTEGER DEFAULT 0 NOT NULL"))
-			if "started_at" not in batch_columns:
-				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN started_at TIMESTAMP"))
-			if "finished_at" not in batch_columns:
-				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN finished_at TIMESTAMP"))
-			if "last_heartbeat_at" not in batch_columns:
-				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN last_heartbeat_at TIMESTAMP"))
-			if "summary_message" not in batch_columns:
-				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN summary_message TEXT"))
-			# Normalize nulls in legacy rows and ensure defaults are usable in UI/progress.
-			conn.execute(text(
-				"UPDATE invoice_batch "
-				"SET processing_status = COALESCE(NULLIF(processing_status, ''), 'completed'), "
-				"total_files = COALESCE(total_files, 0), "
-				"processed_files = COALESCE(processed_files, 0), "
-				"processed_invoices = COALESCE(processed_invoices, 0), "
-				"total_invoices_estimate = COALESCE(total_invoices_estimate, total_files, 0), "
-				"success_count = COALESCE(success_count, 0), "
-				"error_count = COALESCE(error_count, 0), "
-				"credits_charged = COALESCE(credits_charged, 0)"
-			))
-			# If the process restarted while batch processing was in-flight, expose partial results as interrupted.
 			conn.execute(text(
 				"UPDATE invoice_batch "
 				"SET processing_status = 'interrupted', "
