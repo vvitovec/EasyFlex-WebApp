@@ -1,6 +1,7 @@
 """Database models for the EasyFlex web application."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
 import logging
 import time
@@ -13,6 +14,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 db = SQLAlchemy()
 logger = logging.getLogger(__name__)
+_MIGRATION_ADVISORY_LOCK_KEY = 724019631
 
 
 def _is_retryable_migration_error(exc: Exception) -> bool:
@@ -25,7 +27,21 @@ def _is_retryable_migration_error(exc: Exception) -> bool:
 	)
 
 
-def _execute_migration_sql(engine, sql: str, *, attempts: int = 8, delay_s: float = 1.5) -> None:
+@contextmanager
+def _schema_migration_lock(engine):
+	"""Serialise startup schema changes across processes on PostgreSQL."""
+	if engine.dialect.name != "postgresql":
+		yield
+		return
+	with engine.connect() as conn:
+		conn.execute(text("SELECT pg_advisory_lock(:lock_key)"), {"lock_key": _MIGRATION_ADVISORY_LOCK_KEY})
+		try:
+			yield
+		finally:
+			conn.execute(text("SELECT pg_advisory_unlock(:lock_key)"), {"lock_key": _MIGRATION_ADVISORY_LOCK_KEY})
+
+
+def _execute_migration_sql(engine, sql: str, *, attempts: int = 20, delay_s: float = 2.0) -> None:
 	"""Execute a migration statement with retries for transient DB lock/timeout errors."""
 	last_exc: Exception | None = None
 	for attempt in range(1, attempts + 1):
@@ -34,7 +50,7 @@ def _execute_migration_sql(engine, sql: str, *, attempts: int = 8, delay_s: floa
 				if engine.dialect.name == "postgresql":
 					# Keep DDL from being killed by low per-role statement timeout during deploy.
 					conn.execute(text("SET LOCAL statement_timeout = 0"))
-					conn.execute(text("SET LOCAL lock_timeout = '4s'"))
+					conn.execute(text("SET LOCAL lock_timeout = '15s'"))
 				conn.execute(text(sql))
 			return
 		except OperationalError as exc:
@@ -50,6 +66,16 @@ def _execute_migration_sql(engine, sql: str, *, attempts: int = 8, delay_s: floa
 			time.sleep(delay_s)
 	if last_exc is not None:
 		raise last_exc
+
+
+def _ensure_counter_column(engine, *, table_name: str, column_name: str) -> None:
+	"""Ensure integer counter column exists with default 0, using lock-safe steps on PostgreSQL."""
+	if engine.dialect.name == "postgresql":
+		_execute_migration_sql(engine, f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column_name} INTEGER")
+		_execute_migration_sql(engine, f"ALTER TABLE {table_name} ALTER COLUMN {column_name} SET DEFAULT 0")
+		_execute_migration_sql(engine, f"UPDATE {table_name} SET {column_name} = 0 WHERE {column_name} IS NULL")
+		return
+	_execute_migration_sql(engine, f"ALTER TABLE {table_name} ADD COLUMN {column_name} INTEGER DEFAULT 0 NOT NULL")
 
 
 class User(db.Model, UserMixin):
@@ -186,51 +212,52 @@ def init_db(app) -> None:
 	"""Initialise SQLAlchemy and create tables."""
 	db.init_app(app)
 	with app.app_context():
-		db.create_all()
-		# Lightweight migration: add config_overrides column if absent (SQLite only)
 		engine = db.engine
-		insp = inspect(engine)
-		columns = {col["name"] for col in insp.get_columns("user_settings")}
-		if "config_overrides" not in columns:
-			_execute_migration_sql(engine, "ALTER TABLE user_settings ADD COLUMN config_overrides TEXT")
-		user_columns = {col["name"] for col in insp.get_columns("user")}
-		if "credits" not in user_columns:
-			table_name = '"user"' if engine.dialect.name == "postgresql" else "user"
-			_execute_migration_sql(engine, f"ALTER TABLE {table_name} ADD COLUMN credits INTEGER DEFAULT 100 NOT NULL")
-		batch_columns = {col["name"] for col in insp.get_columns("invoice_batch")}
-		if "processing_status" not in batch_columns:
-			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN processing_status VARCHAR(32) DEFAULT 'completed' NOT NULL")
-		if "total_files" not in batch_columns:
-			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN total_files INTEGER DEFAULT 0 NOT NULL")
-		if "processed_files" not in batch_columns:
-			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN processed_files INTEGER DEFAULT 0 NOT NULL")
-		if "processed_invoices" not in batch_columns:
-			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN processed_invoices INTEGER DEFAULT 0 NOT NULL")
-		if "total_invoices_estimate" not in batch_columns:
-			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN total_invoices_estimate INTEGER DEFAULT 0 NOT NULL")
-		if "current_phase" not in batch_columns:
-			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN current_phase VARCHAR(64)")
-		if "success_count" not in batch_columns:
-			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN success_count INTEGER DEFAULT 0 NOT NULL")
-		if "error_count" not in batch_columns:
-			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN error_count INTEGER DEFAULT 0 NOT NULL")
-		if "credits_charged" not in batch_columns:
-			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN credits_charged INTEGER DEFAULT 0 NOT NULL")
-		if "started_at" not in batch_columns:
-			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN started_at TIMESTAMP")
-		if "finished_at" not in batch_columns:
-			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN finished_at TIMESTAMP")
-		if "last_heartbeat_at" not in batch_columns:
-			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN last_heartbeat_at TIMESTAMP")
-		if "summary_message" not in batch_columns:
-			_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN summary_message TEXT")
-		# If the process restarted while batch processing was in-flight, expose partial results as interrupted.
-		# Keep this update narrowly scoped to avoid heavy startup scans.
-		with engine.begin() as conn:
-			conn.execute(text(
-				"UPDATE invoice_batch "
-				"SET processing_status = 'interrupted', "
-				"finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP), "
-				"summary_message = COALESCE(summary_message, 'Zpracování bylo přerušeno restartem serveru.') "
-				"WHERE processing_status IN ('queued', 'running')"
-			))
+		with _schema_migration_lock(engine):
+			db.create_all()
+			# Lightweight migration: add config_overrides column if absent (SQLite only)
+			insp = inspect(engine)
+			columns = {col["name"] for col in insp.get_columns("user_settings")}
+			if "config_overrides" not in columns:
+				_execute_migration_sql(engine, "ALTER TABLE user_settings ADD COLUMN config_overrides TEXT")
+			user_columns = {col["name"] for col in insp.get_columns("user")}
+			if "credits" not in user_columns:
+				table_name = '"user"' if engine.dialect.name == "postgresql" else "user"
+				_execute_migration_sql(engine, f"ALTER TABLE {table_name} ADD COLUMN credits INTEGER DEFAULT 100 NOT NULL")
+			batch_columns = {col["name"] for col in insp.get_columns("invoice_batch")}
+			if "processing_status" not in batch_columns:
+				_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN processing_status VARCHAR(32) DEFAULT 'completed' NOT NULL")
+			if "total_files" not in batch_columns:
+				_ensure_counter_column(engine, table_name="invoice_batch", column_name="total_files")
+			if "processed_files" not in batch_columns:
+				_ensure_counter_column(engine, table_name="invoice_batch", column_name="processed_files")
+			if "processed_invoices" not in batch_columns:
+				_ensure_counter_column(engine, table_name="invoice_batch", column_name="processed_invoices")
+			if "total_invoices_estimate" not in batch_columns:
+				_ensure_counter_column(engine, table_name="invoice_batch", column_name="total_invoices_estimate")
+			if "current_phase" not in batch_columns:
+				_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN current_phase VARCHAR(64)")
+			if "success_count" not in batch_columns:
+				_ensure_counter_column(engine, table_name="invoice_batch", column_name="success_count")
+			if "error_count" not in batch_columns:
+				_ensure_counter_column(engine, table_name="invoice_batch", column_name="error_count")
+			if "credits_charged" not in batch_columns:
+				_ensure_counter_column(engine, table_name="invoice_batch", column_name="credits_charged")
+			if "started_at" not in batch_columns:
+				_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN started_at TIMESTAMP")
+			if "finished_at" not in batch_columns:
+				_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN finished_at TIMESTAMP")
+			if "last_heartbeat_at" not in batch_columns:
+				_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN last_heartbeat_at TIMESTAMP")
+			if "summary_message" not in batch_columns:
+				_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN summary_message TEXT")
+			# If the process restarted while batch processing was in-flight, expose partial results as interrupted.
+			# Keep this update narrowly scoped to avoid heavy startup scans.
+			with engine.begin() as conn:
+				conn.execute(text(
+					"UPDATE invoice_batch "
+					"SET processing_status = 'interrupted', "
+					"finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP), "
+					"summary_message = COALESCE(summary_message, 'Zpracování bylo přerušeno restartem serveru.') "
+					"WHERE processing_status IN ('queued', 'running')"
+				))
