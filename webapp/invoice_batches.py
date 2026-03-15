@@ -128,6 +128,7 @@ def create_batch_from_results(user: User, results: List[Any], source_label: str,
 		source_label=source_label,
 		source_type=source_type,
 		processing_status="completed",
+		current_phase="done",
 	)
 	db.session.add(batch)
 	db.session.flush()
@@ -164,6 +165,8 @@ def create_batch_from_results(user: User, results: List[Any], source_label: str,
 	unique_sources = {str((getattr(res, "file_path", None) or "")).strip() for res in results if getattr(res, "file_path", None)}
 	batch.total_files = len(unique_sources) if unique_sources else len(results)
 	batch.processed_files = batch.total_files
+	batch.processed_invoices = len(results)
+	batch.total_invoices_estimate = len(results)
 	batch.success_count = success_count
 	batch.error_count = error_count
 	batch.credits_charged = success_count if source_type == "pdf" else 0
@@ -185,6 +188,9 @@ def create_batch_from_invoices(user: User, invoices: List[Any], source_label: st
 		processing_status="completed",
 		total_files=1 if invoices else 0,
 		processed_files=1 if invoices else 0,
+		processed_invoices=len(invoices),
+		total_invoices_estimate=len(invoices),
+		current_phase="done",
 		success_count=len(invoices),
 		error_count=0,
 		credits_charged=0,

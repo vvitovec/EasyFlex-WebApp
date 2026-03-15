@@ -28,6 +28,7 @@ from .config import AppConfig, DEFAULT_OPENAI_MODEL, load_config, get_cache_dir,
 from .invoice_processor import process_invoice_data
 from .date_helpers import DATE_FIELDS, DATE_FRIENDLY, domysleni_chybejicich_datumu
 from .invoice_warnings import get_warning
+from .currency_utils import normalize_currency, resolve_currency
 
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,7 @@ class InvoiceExtractor:
 		request_delay: Optional[float] = None,
 		timeout_s: Optional[int] = None,
 		connection_timeout_s: Optional[int] = None,
+		invoice_runtime_limit_s: Optional[int] = None,
 		image_max_width: Optional[int] = None,
 		image_jpeg_quality: Optional[int] = None,
 	):
@@ -108,6 +110,7 @@ class InvoiceExtractor:
 			"request_delay": request_delay is not None,
 			"timeout_s": timeout_s is not None,
 			"connection_timeout_s": connection_timeout_s is not None,
+			"invoice_runtime_limit_s": invoice_runtime_limit_s is not None,
 			"image_max_width": image_max_width is not None,
 			"image_jpeg_quality": image_jpeg_quality is not None,
 		}
@@ -132,13 +135,24 @@ class InvoiceExtractor:
 		self.request_delay = float(request_delay if request_delay is not None else cfg.openai_request_delay)
 		self.timeout_s = int(timeout_s if timeout_s is not None else cfg.openai_timeout_s)
 		self.connection_timeout_s = int(connection_timeout_s if connection_timeout_s is not None else cfg.openai_connection_timeout_s)
+		invoice_limit_env = os.getenv("OPENAI_INVOICE_RUNTIME_LIMIT_S")
+		invoice_limit_default = max(60, self.timeout_s * 2)
+		if invoice_runtime_limit_s is not None:
+			self.invoice_runtime_limit_s = max(15, int(invoice_runtime_limit_s))
+		elif invoice_limit_env:
+			try:
+				self.invoice_runtime_limit_s = max(15, int(invoice_limit_env))
+			except ValueError:
+				self.invoice_runtime_limit_s = invoice_limit_default
+		else:
+			self.invoice_runtime_limit_s = invoice_limit_default
 		self._last_request_time = 0.0
 		self._cache: Dict[str, Dict[str, Any]] = {}  # Cache pro výsledky extrakce
 		self._cache_dir: Path = get_cache_dir()
 		self.image_max_width = int(image_max_width if image_max_width is not None else getattr(cfg, "image_max_width", 1600))
 		self.image_jpeg_quality = int(image_jpeg_quality if image_jpeg_quality is not None else getattr(cfg, "image_jpeg_quality", 85))
 		logger.info(
-			"InvoiceExtractor init: model=%s, max_pages=%s, dpi=%s, conc=%s, max_tokens=%s, max_retries=%s, timeout=%ss",
+			"InvoiceExtractor init: model=%s, max_pages=%s, dpi=%s, conc=%s, max_tokens=%s, max_retries=%s, timeout=%ss, invoice_limit=%ss",
 			self.model,
 			self.max_pages,
 			self.dpi,
@@ -146,6 +160,7 @@ class InvoiceExtractor:
 			self.max_tokens,
 			self.max_retries,
 			self.timeout_s,
+			self.invoice_runtime_limit_s,
 		)
 
 	def update_config(self, config: AppConfig) -> None:
@@ -187,18 +202,35 @@ class InvoiceExtractor:
 			self.timeout_s = int(config.openai_timeout_s)
 		if not self._override_flags.get("connection_timeout_s"):
 			self.connection_timeout_s = int(config.openai_connection_timeout_s)
+		if not self._override_flags.get("invoice_runtime_limit_s"):
+			invoice_limit_env = os.getenv("OPENAI_INVOICE_RUNTIME_LIMIT_S")
+			if invoice_limit_env:
+				try:
+					self.invoice_runtime_limit_s = max(15, int(invoice_limit_env))
+				except ValueError:
+					self.invoice_runtime_limit_s = max(60, self.timeout_s * 2)
+			else:
+				self.invoice_runtime_limit_s = max(60, self.timeout_s * 2)
 		if not self._override_flags.get("image_max_width"):
 			self.image_max_width = int(getattr(config, "image_max_width", self.image_max_width))
 		if not self._override_flags.get("image_jpeg_quality"):
 			self.image_jpeg_quality = int(getattr(config, "image_jpeg_quality", self.image_jpeg_quality))
 
-	async def extract_auto(self, pdf_path: str) -> List[ExtractResult]:
+	async def extract_auto(
+		self,
+		pdf_path: str,
+		on_result: Optional[Callable[[ExtractResult], None]] = None,
+	) -> List[ExtractResult]:
 		"""Rozhodne dle konfigurace, zda provést jednoduchou extrakci nebo dvoufázovou (segmentace → skupiny)."""
 		cfg = self._config
 		if getattr(cfg, "enable_multi_invoice_segmentation", False):
-			return await self.extract_from_pdf_multi_segmented(pdf_path)
+			return await self.extract_from_pdf_multi_segmented(pdf_path, on_result=on_result)
 		else:
 			res = await self.extract_from_pdf(pdf_path)
+			setattr(res, "_invoice_group_index", 1)
+			setattr(res, "_invoice_group_total", 1)
+			if on_result is not None:
+				on_result(res)
 			return [res]
 
 	def _get_cache_key(self, pdf_path: str) -> str:
@@ -296,7 +328,11 @@ class InvoiceExtractor:
 			# Limit number of pages sent to the model
 			images = images[: self.max_pages]
 			b64_images = [self._pil_image_to_base64(img) for img in images]
-			payload, warnings = await self._run_vision_extraction(b64_images)
+			invoice_deadline = time.monotonic() + max(15, self.invoice_runtime_limit_s)
+			payload, warnings = await self._run_vision_extraction(
+				b64_images,
+				invoice_deadline_monotonic=invoice_deadline,
+			)
 
 			# Apply extraction options from config
 			cfg = self._config
@@ -369,7 +405,11 @@ class InvoiceExtractor:
 		logger.info("Batch done: %s files", total)
 		return results
 
-	async def extract_from_pdf_multi_segmented(self, pdf_path: str) -> List[ExtractResult]:
+	async def extract_from_pdf_multi_segmented(
+		self,
+		pdf_path: str,
+		on_result: Optional[Callable[[ExtractResult], None]] = None,
+	) -> List[ExtractResult]:
 		"""Dvoufázová extrakce: 1) segmentace stránek → 2) extrakce po skupinách stránek.
 
 		Vrací list výsledků (jedna položka = jedna faktura nalezená v PDF).
@@ -386,13 +426,21 @@ class InvoiceExtractor:
 			# Pokud segmentace nic nenašla, fallback na klasickou extrakci
 			if not groups:
 				logger.warning("Segmentace nenašla žádné skupiny, fallback na single extrakci: %s", pdf_path)
-				return [await self.extract_from_pdf(pdf_path)]
+				res = await self.extract_from_pdf(pdf_path)
+				setattr(res, "_invoice_group_index", 1)
+				setattr(res, "_invoice_group_total", 1)
+				return [res]
 
 			results: List[ExtractResult] = []
-			for start_idx, end_idx, _doc_key in groups:
+			total_groups = len(groups)
+			for group_idx, (start_idx, end_idx, _doc_key) in enumerate(groups, start=1):
 				subset = images[start_idx : end_idx + 1]
 				res = await self._extract_from_images(subset, pdf_path)
+				setattr(res, "_invoice_group_index", group_idx)
+				setattr(res, "_invoice_group_total", total_groups)
 				results.append(res)
+				if on_result is not None:
+					on_result(res)
 
 			logger.info("Dvoufázová extrakce OK: %s → %d faktur", pdf_path, len(results))
 			return results
@@ -407,7 +455,11 @@ class InvoiceExtractor:
 		try:
 			images = images[: self.max_pages]
 			b64_images = [self._pil_image_to_base64(img) for img in images]
-			payload, warnings = await self._run_vision_extraction(b64_images)
+			invoice_deadline = time.monotonic() + max(15, self.invoice_runtime_limit_s)
+			payload, warnings = await self._run_vision_extraction(
+				b64_images,
+				invoice_deadline_monotonic=invoice_deadline,
+			)
 
 			cfg = self._config
 			day_first = getattr(cfg, "date_day_first", True)
@@ -880,8 +932,13 @@ class InvoiceExtractor:
 			image.save(buffer, format="PNG")
 		return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-	async def _run_vision_extraction(self, images_b64: List[str]) -> Tuple[Dict, List[str]]:
-		payload = await self._call_openai(images_b64)
+	async def _run_vision_extraction(
+		self,
+		images_b64: List[str],
+		*,
+		invoice_deadline_monotonic: Optional[float] = None,
+	) -> Tuple[Dict, List[str]]:
+		payload = await self._call_openai(images_b64, invoice_deadline_monotonic=invoice_deadline_monotonic)
 		payload = self._postprocess_payload(payload)
 		payload, invalid_fields, suspect_fields = self._normalize_dates(payload)
 		amounts_ok, amount_issues = self._check_amount_consistency(payload)
@@ -897,6 +954,7 @@ class InvoiceExtractor:
 				images_b64,
 				strict_dates=needs_strict_dates,
 				strict_amounts=needs_strict_amounts,
+				invoice_deadline_monotonic=invoice_deadline_monotonic,
 			)
 			payload = self._postprocess_payload(payload_retry)
 			payload, invalid_fields, suspect_fields = self._normalize_dates(payload)
@@ -909,8 +967,19 @@ class InvoiceExtractor:
 	def _postprocess_payload(self, payload: Dict) -> Dict:
 		if isinstance(payload, dict) and "polozky" in payload and "položky" not in payload:
 			payload["položky"] = payload.pop("polozky")
+		self._normalize_currency(payload)
 		self._ensure_zero_amount_defaults(payload)
 		return payload
+
+	def _normalize_currency(self, payload: Dict[str, Any]) -> None:
+		raw_currency = payload.get("mena")
+		normalized = normalize_currency(raw_currency)
+		if normalized:
+			payload["mena"] = normalized
+			return
+		if raw_currency not in (None, "", "null"):
+			logger.warning("Neznámá/nejednoznačná měna '%s' ve výstupu extrakce; použita CZK.", raw_currency)
+		payload["mena"] = resolve_currency(None, None, fallback="CZK")
 
 	def _ensure_zero_amount_defaults(self, payload: Dict[str, Any]) -> None:
 		for field in ZERO_DEFAULT_FIELDS:
@@ -1216,6 +1285,7 @@ class InvoiceExtractor:
 		images_b64: List[str],
 		strict_dates: bool = False,
 		strict_amounts: bool = False,
+		invoice_deadline_monotonic: Optional[float] = None,
 	) -> Dict:
 		"""Call OpenAI with images and return parsed JSON dict with robust retry logic and timeout."""
 		client = self._get_client()
@@ -1224,7 +1294,9 @@ class InvoiceExtractor:
 			"Pravidla: (1) čti jen údaje jasně vytištěné na faktuře, nic nepočítej a neodvozuj; (2) částky převeď na čísla s tečkou, "
 			"bez měnových symbolů a tisícových oddělovačů; (3) datumy vrať jako YYYY-MM-DD, pokud nejdou bezpečně přečíst, dej null; "
 			"(4) pole 'položky' vždy null; (5) oprav drobné OCR záměny (0/O, I/1, čárka/tečka) jen pokud je jistota, při nejistotě vrať null; "
-			"(6) pokud zjistíš rozpory nebo nejasné částky, ponech sporná pole null; (7) nepřidávej žádné další klíče ani text. "
+			"(6) pokud zjistíš rozpory nebo nejasné částky, ponech sporná pole null; (7) měnu vrať jen CZK nebo EUR: "
+			"EUR pouze při explicitním EUR/€, CZK pouze při explicitním CZK/Kč, jinak null; "
+			"(8) nepřidávej žádné další klíče ani text. "
 			"Extrahuj číslo dokladu, variabilní symbol, dodavatel/odběratel (název, adresa, stát, IČ, DIČ), datumy vystavení/DUZP/splatnosti, měnu, "
 			"a částky zaklad_dane_0/12/21, vyse_dph_12/21, celkova_cena."
 		)
@@ -1279,9 +1351,29 @@ class InvoiceExtractor:
 		used_fallback_model = False
 		sampling_forced_off = False
 		reasoning_forced_off = False
+		current_reasoning_effort = self.reasoning_effort
+		empty_content_streak = 0
+
+		def _remaining_invoice_budget_s() -> Optional[float]:
+			if invoice_deadline_monotonic is None:
+				return None
+			return invoice_deadline_monotonic - time.monotonic()
+
+		def _raise_if_invoice_budget_exhausted() -> None:
+			remaining_s = _remaining_invoice_budget_s()
+			if remaining_s is not None and remaining_s <= 0:
+				raise asyncio.TimeoutError(
+					f"Invoice runtime limit exceeded ({self.invoice_runtime_limit_s}s)."
+				)
+
 		for attempt in range(self.max_retries + 1):
 			try:
+				_raise_if_invoice_budget_exhausted()
 				token_param = "max_completion_tokens" if "gpt-5" in str(current_model) else "max_tokens"
+				request_timeout = self.timeout_s + 5
+				remaining_s = _remaining_invoice_budget_s()
+				if remaining_s is not None:
+					request_timeout = max(1.0, min(float(request_timeout), float(remaining_s) + 1.0))
 				request_kwargs = {
 					"model": current_model,
 					"messages": messages,
@@ -1291,15 +1383,15 @@ class InvoiceExtractor:
 				if model_supports_sampling_params(current_model) and not sampling_forced_off:
 					request_kwargs["temperature"] = self.temperature
 					request_kwargs["top_p"] = self.top_p
-				if self.reasoning_effort and "gpt-5" in str(current_model) and not reasoning_forced_off:
-					request_kwargs["reasoning_effort"] = self.reasoning_effort
+				if current_reasoning_effort and "gpt-5" in str(current_model) and not reasoning_forced_off:
+					request_kwargs["reasoning_effort"] = current_reasoning_effort
 				request_kwargs[token_param] = current_max_tokens
 				# Use asyncio.wait_for to implement timeout
 				resp = await asyncio.wait_for(
 					asyncio.to_thread(
 						lambda: client.chat.completions.create(**request_kwargs)
 					),
-					timeout=self.timeout_s + 5  # Add buffer for asyncio overhead
+					timeout=request_timeout,
 				)
 				choice = resp.choices[0]
 				finish_reason = getattr(choice, "finish_reason", None)
@@ -1312,10 +1404,35 @@ class InvoiceExtractor:
 					return self._try_parse_json_payload(content)
 				except json.JSONDecodeError as exc:
 					logger.error("Nepodařilo se zpracovat JSON výstup: %s", exc)
+					is_empty_content = "empty content" in str(exc).lower()
+					if is_empty_content:
+						empty_content_streak += 1
+					else:
+						empty_content_streak = 0
+					if (
+						is_empty_content
+						and "gpt-5" in str(current_model)
+						and current_reasoning_effort
+						and current_reasoning_effort != "minimal"
+					):
+						current_reasoning_effort = "minimal"
+						logger.warning(
+							"Model %s vrátil prázdný obsah; přepínám reasoning_effort na minimal.",
+							current_model,
+						)
+					if is_empty_content and empty_content_streak >= 2 and "gpt-5" in str(current_model):
+						raise RuntimeError(
+							"OpenAI vrátil opakovaně prázdný obsah (2x). Pokus faktury byl ukončen."
+						)
 					# If output was cut due to token limit, increase and retry
 					if finish_reason == "length" and current_max_tokens < 4096:
 						current_max_tokens = min(current_max_tokens * 2, 4096)
 						delay = self._calculate_backoff_delay(attempt)
+						remaining_s = _remaining_invoice_budget_s()
+						if remaining_s is not None and remaining_s <= delay:
+							raise asyncio.TimeoutError(
+								f"Invoice runtime limit exceeded ({self.invoice_runtime_limit_s}s)."
+							)
 						logger.warning(
 							"Výstup utnut kvůli limitu tokenů (attempt %d/%d), zvyšuji na %s a čekám %.1fs",
 							attempt + 1,
@@ -1331,10 +1448,20 @@ class InvoiceExtractor:
 						current_model = fallback_model
 						used_fallback_model = True
 						delay = self._calculate_backoff_delay(attempt)
+						remaining_s = _remaining_invoice_budget_s()
+						if remaining_s is not None and remaining_s <= delay:
+							raise asyncio.TimeoutError(
+								f"Invoice runtime limit exceeded ({self.invoice_runtime_limit_s}s)."
+							)
 						await asyncio.sleep(delay)
 						continue
 					if attempt < self.max_retries:
 						delay = self._calculate_backoff_delay(attempt)
+						remaining_s = _remaining_invoice_budget_s()
+						if remaining_s is not None and remaining_s <= delay:
+							raise asyncio.TimeoutError(
+								f"Invoice runtime limit exceeded ({self.invoice_runtime_limit_s}s)."
+							)
 						logger.warning(
 							"Model vrátil nevalidní JSON (attempt %d/%d), opakuji po %.1fs",
 							attempt + 1,
@@ -1350,6 +1477,10 @@ class InvoiceExtractor:
 				last_exception = asyncio.TimeoutError("Request timeout")
 				if attempt < self.max_retries:
 					delay = self._calculate_backoff_delay(attempt)
+					remaining_s = _remaining_invoice_budget_s()
+					if remaining_s is not None and remaining_s <= delay:
+						logger.error("Invoice runtime limit dosažen během retry timeoutu.")
+						raise
 					logger.warning("Request timeout (attempt %d/%d), čekám %.1fs", 
 						attempt + 1, self.max_retries + 1, delay)
 					await asyncio.sleep(delay)
@@ -1364,6 +1495,10 @@ class InvoiceExtractor:
 					# Extract retry-after from error if available
 					retry_after = self._extract_retry_after(str(e))
 					delay = max(retry_after, self._calculate_backoff_delay(attempt))
+					remaining_s = _remaining_invoice_budget_s()
+					if remaining_s is not None and remaining_s <= delay:
+						logger.error("Invoice runtime limit dosažen během rate-limit retry.")
+						raise
 					logger.warning("Rate limit hit (attempt %d/%d), čekám %.1fs: %s", 
 						attempt + 1, self.max_retries + 1, delay, str(e))
 					await asyncio.sleep(delay)
@@ -1376,6 +1511,10 @@ class InvoiceExtractor:
 				last_exception = e
 				if attempt < self.max_retries:
 					delay = self._calculate_backoff_delay(attempt)
+					remaining_s = _remaining_invoice_budget_s()
+					if remaining_s is not None and remaining_s <= delay:
+						logger.error("Invoice runtime limit dosažen během API retry.")
+						raise
 					logger.warning("API chyba (attempt %d/%d), čekám %.1fs: %s", 
 						attempt + 1, self.max_retries + 1, delay, str(e))
 					await asyncio.sleep(delay)
@@ -1389,6 +1528,11 @@ class InvoiceExtractor:
 				if not sampling_forced_off and self._sampling_params_unsupported(e):
 					sampling_forced_off = True
 					delay = self._calculate_backoff_delay(attempt)
+					remaining_s = _remaining_invoice_budget_s()
+					if remaining_s is not None and remaining_s <= delay:
+						raise asyncio.TimeoutError(
+							f"Invoice runtime limit exceeded ({self.invoice_runtime_limit_s}s)."
+						)
 					logger.warning(
 						"Model %s nepodporuje temperature/top_p, opakuji bez těchto parametrů (attempt %d/%d) po %.1fs",
 						current_model,
@@ -1401,6 +1545,11 @@ class InvoiceExtractor:
 				if not reasoning_forced_off and self._reasoning_effort_unsupported(e):
 					reasoning_forced_off = True
 					delay = self._calculate_backoff_delay(attempt)
+					remaining_s = _remaining_invoice_budget_s()
+					if remaining_s is not None and remaining_s <= delay:
+						raise asyncio.TimeoutError(
+							f"Invoice runtime limit exceeded ({self.invoice_runtime_limit_s}s)."
+						)
 					logger.warning(
 						"Model %s nepodporuje reasoning_effort, opakuji bez tohoto parametru (attempt %d/%d) po %.1fs",
 						current_model,

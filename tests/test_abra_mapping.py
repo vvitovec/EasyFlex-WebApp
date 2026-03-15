@@ -70,7 +70,30 @@ def test_map_invoice_json_infers_due_date_and_warnings() -> None:
 	body = _map_invoice_json(faktura, None, cfg)
 	assert body["datVyst"] == "2024-05-01"
 	assert body["datSplat"] == "2024-05-01"
+	assert body["mena"] == "code:CZK"
 	assert "podkladUpozorneni" not in body
+
+
+def test_map_invoice_json_sets_currency_reference_for_eur() -> None:
+	cfg = _make_config(infer_missing_dates=False)
+	faktura = {
+		"cislo_dokladu": "F-2024-002",
+		"datum_vystaveni": "2024-05-01",
+		"mena": "€",
+	}
+	body = _map_invoice_json(faktura, None, cfg)
+	assert body["mena"] == "code:EUR"
+
+
+def test_map_invoice_json_falls_back_currency_to_czk_for_unknown() -> None:
+	cfg = _make_config(infer_missing_dates=False)
+	faktura = {
+		"cislo_dokladu": "F-2024-003",
+		"datum_vystaveni": "2024-05-01",
+		"mena": "USD",
+	}
+	body = _map_invoice_json(faktura, None, cfg)
+	assert body["mena"] == "code:CZK"
 
 
 class _DummyResponse:
@@ -443,3 +466,12 @@ def test_header_has_no_typSzbDphK_with_multiple_rates() -> None:
 	entry = payload["winstrom"]["faktura-vydana"][0]
 	assert "typSzbDphK" not in entry
 
+
+def test_payload_contains_currency_reference_and_no_exchange_rate_fields() -> None:
+	cfg = _make_config(abra_doc_endpoint="faktura-vydana")
+	invoice = {"cislo_dokladu": "CURR-1", "mena": "EUR"}
+	payload = _build_invoice_payload(invoice, cfg, None, "faktura-vydana")
+	entry = payload["winstrom"]["faktura-vydana"][0]
+	assert entry.get("mena") == "code:EUR"
+	assert "kurz" not in entry
+	assert "kurzMnozstvi" not in entry

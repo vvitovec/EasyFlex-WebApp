@@ -1,7 +1,7 @@
 import asyncio
 
 from EasyFlex.config import AppConfig, model_supports_sampling_params
-from EasyFlex.extractor import InvoiceExtractor, SegmentInfo
+from EasyFlex.extractor import InvoiceExtractor, SegmentInfo, ExtractResult
 
 
 def _make_config(**overrides) -> AppConfig:
@@ -109,6 +109,20 @@ def test_try_parse_json_payload_accepts_structured_content_list() -> None:
 	assert payload["role"] == "single"
 
 
+def test_postprocess_payload_normalizes_currency_variants() -> None:
+	extractor = InvoiceExtractor(config=_make_config(), api_key="sk-test")
+	payload = {"mena": "€", "zaklad_dane_12": "100"}
+	normalized = extractor._postprocess_payload(payload)
+	assert normalized["mena"] == "EUR"
+
+
+def test_postprocess_payload_falls_back_to_czk_for_unknown_currency() -> None:
+	extractor = InvoiceExtractor(config=_make_config(), api_key="sk-test")
+	payload = {"mena": "usd", "zaklad_dane_12": "100"}
+	normalized = extractor._postprocess_payload(payload)
+	assert normalized["mena"] == "CZK"
+
+
 def test_segment_page_retries_on_empty_json_with_higher_token_budget(monkeypatch) -> None:
 	extractor = InvoiceExtractor(config=_make_config(max_tokens=300, openai_max_retries=2), api_key="sk-test")
 	scripted = [
@@ -147,3 +161,87 @@ def test_build_groups_from_segments_splits_unknown_on_confident_key_change() -> 
 	]
 	groups = extractor._build_groups_from_segments(segments)
 	assert groups == [(0, 0, "INV-1"), (1, 2, "INV-2")]
+
+
+def test_call_openai_stops_after_two_empty_contents_on_gpt5(monkeypatch) -> None:
+	extractor = InvoiceExtractor(config=_make_config(openai_max_retries=5), api_key="sk-test")
+	scripted = [
+		_FakeResponse(_FakeChoice(content="", finish_reason=None)),
+		_FakeResponse(_FakeChoice(content="", finish_reason=None)),
+	]
+	completions = _FakeCompletions(scripted)
+	client = _FakeClient(completions)
+
+	async def _noop():
+		return None
+
+	monkeypatch.setattr(extractor, "_get_client", lambda: client)
+	monkeypatch.setattr(extractor, "_throttle_request", _noop)
+	monkeypatch.setattr(extractor, "_calculate_backoff_delay", lambda _attempt: 0.0)
+
+	try:
+		asyncio.run(extractor._call_openai(["ZmFrZS1pbWFnZQ=="]))
+		assert False, "Expected RuntimeError for repeated empty content"
+	except RuntimeError as exc:
+		assert "prázdný obsah" in str(exc).lower()
+	assert len(completions.calls) == 2
+	assert completions.calls[0].get("reasoning_effort") == "medium"
+	assert completions.calls[1].get("reasoning_effort") == "minimal"
+
+
+def test_call_openai_respects_invoice_runtime_deadline(monkeypatch) -> None:
+	extractor = InvoiceExtractor(
+		config=_make_config(openai_max_retries=0, openai_timeout_s=30),
+		api_key="sk-test",
+		invoice_runtime_limit_s=1,
+	)
+
+	async def _noop():
+		return None
+
+	monkeypatch.setattr(extractor, "_throttle_request", _noop)
+	monkeypatch.setattr(extractor, "_get_client", lambda: _FakeClient(_FakeCompletions([])))
+
+	try:
+		asyncio.run(
+			extractor._call_openai(
+				["ZmFrZS1pbWFnZQ=="],
+				invoice_deadline_monotonic=0.0,
+			)
+		)
+		assert False, "Expected timeout due to exhausted invoice runtime budget"
+	except asyncio.TimeoutError as exc:
+		assert "runtime limit" in str(exc).lower()
+
+
+def test_extract_auto_streams_group_results(monkeypatch) -> None:
+	extractor = InvoiceExtractor(
+		config=_make_config(enable_multi_invoice_segmentation=True),
+		api_key="sk-test",
+	)
+
+	async def _fake_pdf_to_images(_pdf_path: str):
+		return [object(), object(), object()]
+
+	async def _fake_segment_images(_images):
+		return []
+
+	def _fake_build_groups(_segments):
+		return [(0, 0, None), (1, 1, None), (2, 2, None)]
+
+	async def _fake_extract_from_images(_images, pdf_path: str):
+		return ExtractResult(file_path=pdf_path, data=None, error="mock-error")
+
+	monkeypatch.setattr(extractor, "_pdf_to_images", _fake_pdf_to_images)
+	monkeypatch.setattr(extractor, "_segment_images", _fake_segment_images)
+	monkeypatch.setattr(extractor, "_build_groups_from_segments", _fake_build_groups)
+	monkeypatch.setattr(extractor, "_extract_from_images", _fake_extract_from_images)
+
+	streamed_indexes = []
+
+	def _on_result(res):
+		streamed_indexes.append(getattr(res, "_invoice_group_index", None))
+
+	results = asyncio.run(extractor.extract_auto("dummy.pdf", on_result=_on_result))
+	assert len(results) == 3
+	assert streamed_indexes == [1, 2, 3]

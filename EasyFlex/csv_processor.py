@@ -27,6 +27,7 @@ from .models import InvoiceData
 from .invoice_warnings import append_warnings
 from .config import DEFAULT_OPENAI_MODEL, load_config, AppConfig, model_supports_sampling_params
 from .date_helpers import parse_invoice_date, domysleni_chybejicich_datumu
+from .currency_utils import infer_currency_from_texts, normalize_currency, resolve_currency, strip_known_currency_markers
 from charset_normalizer import from_path as cn_from_path
 
 
@@ -165,6 +166,12 @@ FIELD_SPECS: Dict[str, Dict[str, Any]] = {
 		"keywords": [["celkem", "uhrad"], ["celkova", "castka"], ["total", "amount"], ["gross", "total"], ["amount", "due"], ["grand", "total"]],
 		"type": "number",
 	},
+	"mena": {
+		"label": "Měna",
+		"description": "Měna dokladu (podporováno CZK nebo EUR).",
+		"keywords": [["mena"], ["currency"], ["curr"], ["currency", "code"], ["invoice", "currency"], ["kod", "meny"]],
+		"type": "string",
+	},
 	"psc": {
 		"label": "PSČ",
 		"description": "PSČ odběratele (použije se pro doplnění adresy).",
@@ -189,6 +196,7 @@ FALLBACK_SYNONYMS: Dict[str, List[str]] = {
 	"datum_splatnosti": ["splatnost"],
 	"datum_duzp": ["duzp"],
 	"celkova_cena": ["celkem s dph", "celkem s dani"],
+	"mena": ["mena", "currency", "curr", "currency code", "kod meny"],
 	"zaklad_dane_21": ["celkem bez dph", "zaklad dane"],
 	"vyse_dph_21": ["dph"],
 }
@@ -582,13 +590,19 @@ class CSVProcessor:
 				invoice_data.odberatel_adresa = f"{addr}, {psc} {mesto}".strip().strip(', ')
 
 			# Finanční údaje (bez DPH) dle sazeb – pouze opsané hodnoty, bez výpočtů
-			zaklad_0 = self._safe_float(self._safe_get(row, "Základ daně 0 %"))
-			zaklad_12 = self._safe_float(self._safe_get(row, "Částka celkem bez DPH v sazbě 12%"))
-			zaklad_21 = self._safe_float(self._safe_get(row, "Částka celkem bez DPH v sazbě 21%"))
+			zaklad_0_raw = self._safe_get(row, "Základ daně 0 %")
+			zaklad_12_raw = self._safe_get(row, "Částka celkem bez DPH v sazbě 12%")
+			zaklad_21_raw = self._safe_get(row, "Částka celkem bez DPH v sazbě 21%")
+			vyse_dph_12_raw = self._safe_get(row, "DPH 12 %")
+			vyse_dph_21_raw = self._safe_get(row, "DPH 21 %")
+			celkem_raw = self._safe_get(row, "Celkem k úhradě")
 
-			vyse_dph_12 = self._safe_float(self._safe_get(row, "DPH 12 %"))
-			vyse_dph_21 = self._safe_float(self._safe_get(row, "DPH 21 %"))
-			celkem = self._safe_float(self._safe_get(row, "Celkem k úhradě"))
+			zaklad_0 = self._safe_float(zaklad_0_raw)
+			zaklad_12 = self._safe_float(zaklad_12_raw)
+			zaklad_21 = self._safe_float(zaklad_21_raw)
+			vyse_dph_12 = self._safe_float(vyse_dph_12_raw)
+			vyse_dph_21 = self._safe_float(vyse_dph_21_raw)
+			celkem = self._safe_float(celkem_raw)
 
 			invoice_data.zaklad_dane_0 = zaklad_0
 			invoice_data.zaklad_dane_12 = zaklad_12
@@ -597,9 +611,41 @@ class CSVProcessor:
 			invoice_data.vyse_dph_21 = vyse_dph_21
 			invoice_data.celkova_cena = celkem
 
+			# Měna: explicitní sloupec > inference z částek > fallback CZK
+			explicit_currency_raw = self._safe_get(row, "Měna")
+			explicit_currency = normalize_currency(explicit_currency_raw)
+			inferred_currency, inferred_conflict = infer_currency_from_texts(
+				[
+					zaklad_0_raw,
+					zaklad_12_raw,
+					zaklad_21_raw,
+					vyse_dph_12_raw,
+					vyse_dph_21_raw,
+					celkem_raw,
+				]
+			)
+			final_currency = resolve_currency(explicit_currency, inferred_currency, fallback="CZK")
+			invoice_data.mena = final_currency
+
+			currency_warnings: List[str] = []
+			if explicit_currency_raw and not explicit_currency:
+				if inferred_currency:
+					currency_warnings.append(
+						f"Neznámá měna '{explicit_currency_raw}' ve sloupci Měna; použita odvozená měna {inferred_currency}."
+					)
+				else:
+					currency_warnings.append(
+						f"Neznámá měna '{explicit_currency_raw}' ve sloupci Měna; použita výchozí měna CZK."
+					)
+			if inferred_conflict and not explicit_currency:
+				currency_warnings.append("Měna v částkách je nejednoznačná (obsahuje CZK i EUR); použita výchozí měna CZK.")
+			if explicit_currency and inferred_currency and explicit_currency != inferred_currency:
+				currency_warnings.append(
+					f"Konflikt měny mezi sloupcem Měna ({explicit_currency}) a částkami ({inferred_currency}); použita měna ze sloupce Měna."
+				)
+
 			# Nově položky nevytváříme – pracujeme jen s horními souhrny
 			invoice_data.položky = None
-			invoice_data.mena = "CZK"
 
 			date_payload = {
 				"datum_vystaveni": invoice_data.datum_vystaveni,
@@ -613,6 +659,7 @@ class CSVProcessor:
 			invoice_data.datum_splatnosti = date_payload.get("datum_splatnosti")
 			invoice_data.datum_duzp = date_payload.get("datum_duzp")
 			append_warnings(invoice_data, inferred_warnings)
+			append_warnings(invoice_data, currency_warnings)
 			if row_number <= 5:
 				preview = {
 					"cislo_dokladu": invoice_data.cislo_dokladu,
@@ -636,7 +683,7 @@ class CSVProcessor:
 		if not value:
 			return None
 		try:
-			clean_value = str(value)
+			clean_value = strip_known_currency_markers(value)
 			# Remove currency symbols and spaces
 			clean_value = re.sub(r"[\s\u00A0\u202F]", "", clean_value)
 			# Replace comma decimal separator with dot

@@ -14,6 +14,7 @@ from .models import InvoiceData, InvoiceItem, VATRate
 from .invoice_warnings import get_warning
 from .invoice_processor import should_use_items_logic
 from .date_helpers import domysleni_chybejicich_datumu
+from .currency_utils import currency_reference, normalize_currency
 
 
 logger = logging.getLogger(__name__)
@@ -1028,6 +1029,9 @@ def _build_invoice_payload(
 	else:
 		logger.info("Používám původní logiku pro ABRA export")
 		body["polozkyDokladu"] = _build_positions_from_totals(faktura_dict)
+	# Kurz neposíláme; měna je mapována přes relation "mena".
+	body.pop("kurz", None)
+	body.pop("kurzMnozstvi", None)
 
 	body.update(_prepare_buyer_section(faktura_dict, partner_ref))
 	payload = _wrap_winstrom(doc_endpoint, body)
@@ -1043,6 +1047,7 @@ def _map_invoice_json(faktura: Union[Dict[str, Any], InvoiceData], series_map: O
 		cislo_dokladu = faktura.cislo_dokladu
 		variabilni_symbol = faktura.variabilni_symbol
 		datum_duzp = faktura.datum_duzp
+		mena_raw = faktura.mena
 		warning_value = get_warning(faktura)
 	else:
 		dat_vyst = faktura.get("datum_vystaveni")
@@ -1050,6 +1055,7 @@ def _map_invoice_json(faktura: Union[Dict[str, Any], InvoiceData], series_map: O
 		cislo_dokladu = faktura.get("cislo_dokladu")
 		variabilni_symbol = faktura.get("variabilni_symbol")
 		datum_duzp = faktura.get("datum_duzp")
+		mena_raw = faktura.get("mena")
 		warning_value = get_warning(faktura)
 	
 	# Apply extraction options from config, včetně domyšlení datumů, pokud je zapnuto
@@ -1072,7 +1078,10 @@ def _map_invoice_json(faktura: Union[Dict[str, Any], InvoiceData], series_map: O
 		"datVyst": dat_vyst,
 		"duzpPuv": datum_duzp,
 		"datSplat": dat_splat,
+		"mena": currency_reference(mena_raw, fallback="CZK"),
 	}
+	if mena_raw not in (None, "", "null") and not normalize_currency(mena_raw):
+		logger.warning("ABRA: neplatná měna '%s' normalizována na CZK.", mena_raw)
 	warning_items: list[str] = []
 
 	def _consume_warning_value(value: Any) -> None:

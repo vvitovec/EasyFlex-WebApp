@@ -14,6 +14,7 @@
 			data-view-url="{{ url_for('view_results', batch_id=batch.id) }}"
 			data-status="{{ batch_progress.status }}"
 			data-processed="{{ batch_progress.processed_files }}"
+			data-processed-invoices="{{ batch_progress.processed_invoices }}"
 			data-row-count="{{ batch_progress.row_count }}"
 			data-terminal="{% if batch_progress.is_terminal %}1{% else %}0{% endif %}"
 		>
@@ -21,16 +22,22 @@
 				<strong id="batch-status-label">{{ batch_progress.status_label }}</strong>
 				<span id="batch-progress-text">{{ batch_progress.processed_files }}/{{ batch_progress.total_files }} PDF</span>
 			</div>
+			<div class="batch-progress-head">
+				<strong id="batch-phase-label">{{ batch_progress.current_phase_label }}</strong>
+				<span id="batch-invoice-progress-text">{{ batch_progress.processed_invoices }}/{{ batch_progress.total_invoices_estimate }} faktur</span>
+			</div>
 			<div class="batch-progress-track">
-				<div class="batch-progress-fill" id="batch-progress-fill" style="width: {{ batch_progress.progress_percent }}%;"></div>
+				<div class="batch-progress-fill" id="batch-progress-fill" style="width: {{ batch_progress.invoice_progress_percent }}%;"></div>
 			</div>
 			<div class="batch-progress-meta">
 				<span>Úspěšně: <strong id="batch-success-count">{{ batch_progress.success_count }}</strong></span>
 				<span>Chyby: <strong id="batch-error-count">{{ batch_progress.error_count }}</strong></span>
 				<span>Kredity: <strong id="batch-credits-count">{{ batch_progress.credits_charged }}</strong></span>
 				<span>Zbývá souborů: <strong id="batch-remaining-count">{{ batch_progress.remaining_files }}</strong></span>
+				<span>Zbývá faktur (odhad): <strong id="batch-remaining-invoices-count">{{ batch_progress.remaining_invoices }}</strong></span>
 			</div>
 			<p class="muted" id="batch-summary-text">{{ batch_progress.summary_message or "Čeká na zpracování…" }}</p>
+			<p class="muted" id="batch-heartbeat-text">Poslední heartbeat: {{ batch_progress.last_heartbeat_at or "—" }}</p>
 		</div>
 	{% endif %}
 	{% if not rows %}
@@ -182,14 +189,19 @@
 		const progressViewUrl = progressRoot ? progressRoot.dataset.viewUrl : null;
 		const progressLabelEl = document.getElementById('batch-status-label');
 		const progressTextEl = document.getElementById('batch-progress-text');
+		const progressPhaseEl = document.getElementById('batch-phase-label');
+		const progressInvoiceTextEl = document.getElementById('batch-invoice-progress-text');
 		const progressFillEl = document.getElementById('batch-progress-fill');
 		const progressSummaryEl = document.getElementById('batch-summary-text');
+		const progressHeartbeatEl = document.getElementById('batch-heartbeat-text');
 		const progressSuccessEl = document.getElementById('batch-success-count');
 		const progressErrorEl = document.getElementById('batch-error-count');
 		const progressCreditsEl = document.getElementById('batch-credits-count');
 		const progressRemainingEl = document.getElementById('batch-remaining-count');
+		const progressRemainingInvoicesEl = document.getElementById('batch-remaining-invoices-count');
 		let lastKnownStatus = progressRoot ? (progressRoot.dataset.status || "") : "";
 		let lastKnownProcessed = progressRoot ? Number(progressRoot.dataset.processed || "0") : 0;
+		let lastKnownProcessedInvoices = progressRoot ? Number(progressRoot.dataset.processedInvoices || "0") : 0;
 		let lastKnownRowCount = progressRoot ? Number(progressRoot.dataset.rowCount || "0") : 0;
 		let lastReloadAt = Date.now();
 
@@ -197,12 +209,16 @@
 			if (!payload || !progressRoot) return;
 			if (progressLabelEl) progressLabelEl.textContent = payload.status_label || payload.status || "";
 			if (progressTextEl) progressTextEl.textContent = `${payload.processed_files}/${payload.total_files} PDF`;
-			if (progressFillEl) progressFillEl.style.width = `${payload.progress_percent || 0}%`;
+			if (progressPhaseEl) progressPhaseEl.textContent = payload.current_phase_label || "Zpracování";
+			if (progressInvoiceTextEl) progressInvoiceTextEl.textContent = `${payload.processed_invoices || 0}/${payload.total_invoices_estimate || 0} faktur`;
+			if (progressFillEl) progressFillEl.style.width = `${payload.invoice_progress_percent || 0}%`;
 			if (progressSummaryEl) progressSummaryEl.textContent = payload.summary_message || "";
+			if (progressHeartbeatEl) progressHeartbeatEl.textContent = `Poslední heartbeat: ${payload.last_heartbeat_at || "—"}`;
 			if (progressSuccessEl) progressSuccessEl.textContent = String(payload.success_count || 0);
 			if (progressErrorEl) progressErrorEl.textContent = String(payload.error_count || 0);
 			if (progressCreditsEl) progressCreditsEl.textContent = String(payload.credits_charged || 0);
 			if (progressRemainingEl) progressRemainingEl.textContent = String(payload.remaining_files || 0);
+			if (progressRemainingInvoicesEl) progressRemainingInvoicesEl.textContent = String(payload.remaining_invoices || 0);
 		}
 
 		async function pollProgress() {
@@ -216,6 +232,7 @@
 				const changed =
 					(payload.status !== lastKnownStatus) ||
 					(Number(payload.processed_files || 0) !== lastKnownProcessed) ||
+					(Number(payload.processed_invoices || 0) !== lastKnownProcessedInvoices) ||
 					(Number(payload.row_count || 0) !== lastKnownRowCount);
 				if (changed && progressViewUrl && (now - lastReloadAt) > 4000) {
 					lastReloadAt = now;
@@ -224,6 +241,7 @@
 				}
 				lastKnownStatus = payload.status || "";
 				lastKnownProcessed = Number(payload.processed_files || 0);
+				lastKnownProcessedInvoices = Number(payload.processed_invoices || 0);
 				lastKnownRowCount = Number(payload.row_count || 0);
 			} catch (_err) {
 				// Polling errors should not break interactions on this page.

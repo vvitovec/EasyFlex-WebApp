@@ -110,6 +110,9 @@ class InvoiceBatch(db.Model):
 	processing_status = db.Column(db.String(32), nullable=False, default="completed", server_default=text("'completed'"))
 	total_files = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
 	processed_files = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
+	processed_invoices = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
+	total_invoices_estimate = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
+	current_phase = db.Column(db.String(64), nullable=True)
 	success_count = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
 	error_count = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
 	credits_charged = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
@@ -163,6 +166,12 @@ def init_db(app) -> None:
 				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN total_files INTEGER DEFAULT 0 NOT NULL"))
 			if "processed_files" not in batch_columns:
 				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN processed_files INTEGER DEFAULT 0 NOT NULL"))
+			if "processed_invoices" not in batch_columns:
+				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN processed_invoices INTEGER DEFAULT 0 NOT NULL"))
+			if "total_invoices_estimate" not in batch_columns:
+				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN total_invoices_estimate INTEGER DEFAULT 0 NOT NULL"))
+			if "current_phase" not in batch_columns:
+				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN current_phase VARCHAR(64)"))
 			if "success_count" not in batch_columns:
 				conn.execute(text("ALTER TABLE invoice_batch ADD COLUMN success_count INTEGER DEFAULT 0 NOT NULL"))
 			if "error_count" not in batch_columns:
@@ -183,6 +192,8 @@ def init_db(app) -> None:
 				"SET processing_status = COALESCE(NULLIF(processing_status, ''), 'completed'), "
 				"total_files = COALESCE(total_files, 0), "
 				"processed_files = COALESCE(processed_files, 0), "
+				"processed_invoices = COALESCE(processed_invoices, 0), "
+				"total_invoices_estimate = COALESCE(total_invoices_estimate, total_files, 0), "
 				"success_count = COALESCE(success_count, 0), "
 				"error_count = COALESCE(error_count, 0), "
 				"credits_charged = COALESCE(credits_charged, 0)"

@@ -10,7 +10,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from dotenv import load_dotenv
 from flask import (
@@ -89,9 +89,23 @@ BATCH_STATUS_LABELS = {
 	BATCH_STATUS_FAILED: "Selhalo",
 }
 
+_BATCH_PHASE_LABELS = {
+	"queued": "Ve frontě",
+	"initializing": "Inicializace",
+	"extracting": "Extrakce PDF",
+	"persisting": "Ukládání výsledků",
+	"importing": "Auto-import do ABRA",
+	"finalizing": "Dokončení dávky",
+	"done": "Hotovo",
+}
+
 _BATCH_THREADS: dict[int, threading.Thread] = {}
 _BATCH_THREADS_LOCK = threading.Lock()
 _DEFAULT_PDF_BATCH_MAX_RUNTIME_S = 60 * 60
+_DEFAULT_DB_COMMIT_RETRY_ATTEMPTS = 3
+_DEFAULT_HEARTBEAT_INTERVAL_S = 8
+
+_DbResultT = TypeVar("_DbResultT")
 
 
 EDITABLE_FIELDS = [
@@ -127,14 +141,19 @@ FLOAT_FIELDS = {
 }
 
 
-def _run_extraction(extractor: InvoiceExtractor, pdf_path: Path) -> List[ExtractResult]:
+def _run_extraction(
+	extractor: InvoiceExtractor,
+	pdf_path: Path,
+	*,
+	on_result: Optional[Callable[[ExtractResult], None]] = None,
+) -> List[ExtractResult]:
 	"""Run async extractor in a blocking context."""
 	try:
-		return asyncio.run(extractor.extract_auto(str(pdf_path)))
+		return asyncio.run(extractor.extract_auto(str(pdf_path), on_result=on_result))
 	except RuntimeError:
 		loop = asyncio.new_event_loop()
 		try:
-			return loop.run_until_complete(extractor.extract_auto(str(pdf_path)))
+			return loop.run_until_complete(extractor.extract_auto(str(pdf_path), on_result=on_result))
 		finally:
 			loop.close()
 
@@ -208,6 +227,10 @@ def _batch_status_label(status: Optional[str]) -> str:
 	return BATCH_STATUS_LABELS.get((status or "").strip().lower(), "Neznámý stav")
 
 
+def _batch_phase_label(phase: Optional[str]) -> str:
+	return _BATCH_PHASE_LABELS.get((phase or "").strip().lower(), "Zpracování")
+
+
 def _is_terminal_batch_status(status: Optional[str]) -> bool:
 	return (status or "").strip().lower() in BATCH_TERMINAL_STATUSES
 
@@ -236,25 +259,146 @@ def _merge_warning_text(invoice_obj: Any, warnings: Optional[List[str]]) -> Opti
 	return joined or None
 
 
+def _db_retry_sleep(attempt_number: int) -> float:
+	return min(2.0, 0.35 * attempt_number)
+
+
+def _run_db_read_with_retry(
+	operation_name: str,
+	reader: Callable[[], _DbResultT],
+	*,
+	max_attempts: int = _DEFAULT_DB_COMMIT_RETRY_ATTEMPTS,
+) -> _DbResultT:
+	last_exc: Optional[OperationalError] = None
+	for attempt in range(1, max_attempts + 1):
+		try:
+			return reader()
+		except OperationalError as exc:
+			last_exc = exc
+			db.session.rollback()
+			if attempt >= max_attempts:
+				raise
+			delay = _db_retry_sleep(attempt)
+			logger.warning(
+				"DB read selhal (%s, attempt %s/%s), opakuji za %.2fs",
+				operation_name,
+				attempt,
+				max_attempts,
+				delay,
+			)
+			time.sleep(delay)
+		finally:
+			db.session.remove()
+	if last_exc is not None:
+		raise last_exc
+	raise RuntimeError(f"DB read selhal: {operation_name}")
+
+
+def _run_db_write_with_retry(
+	operation_name: str,
+	writer: Callable[[], _DbResultT],
+	*,
+	max_attempts: int = _DEFAULT_DB_COMMIT_RETRY_ATTEMPTS,
+) -> _DbResultT:
+	last_exc: Optional[OperationalError] = None
+	for attempt in range(1, max_attempts + 1):
+		try:
+			result = writer()
+			db.session.commit()
+			return result
+		except OperationalError as exc:
+			last_exc = exc
+			db.session.rollback()
+			if attempt >= max_attempts:
+				raise
+			delay = _db_retry_sleep(attempt)
+			logger.warning(
+				"DB commit selhal (%s, attempt %s/%s), opakuji za %.2fs",
+				operation_name,
+				attempt,
+				max_attempts,
+				delay,
+			)
+			time.sleep(delay)
+		except Exception:
+			db.session.rollback()
+			raise
+		finally:
+			db.session.remove()
+	if last_exc is not None:
+		raise last_exc
+	raise RuntimeError(f"DB write selhal: {operation_name}")
+
+
+def _batch_heartbeat_worker(app: Flask, *, batch_id: int, stop_event: threading.Event) -> None:
+	while not stop_event.wait(_DEFAULT_HEARTBEAT_INTERVAL_S):
+		with app.app_context():
+			try:
+				should_continue = _run_db_write_with_retry(
+					f"heartbeat batch {batch_id}",
+					lambda: _touch_batch_heartbeat(batch_id),
+				)
+			except Exception:
+				logger.warning("Heartbeat update selhal (batch_id=%s)", batch_id, exc_info=True)
+				continue
+			if not should_continue:
+				return
+
+
+def _touch_batch_heartbeat(batch_id: int) -> bool:
+	batch = db.session.get(InvoiceBatch, batch_id)
+	if batch is None:
+		return False
+	if _is_terminal_batch_status(batch.processing_status):
+		return False
+	batch.last_heartbeat_at = _utcnow()
+	return True
+
+
 def _extract_file_with_retry(
 	extractor: InvoiceExtractor,
 	pdf_path: Path,
 	display_name: str,
 	*,
+	on_result: Optional[Callable[[ExtractResult], None]] = None,
 	max_attempts: int = 2,
 ) -> List[ExtractResult]:
 	"""Extract one PDF with one automatic retry when all attempts fail."""
 	last_results: list[ExtractResult] = []
 	for attempt in range(1, max_attempts + 1):
+		attempt_results: list[ExtractResult] = []
+		streaming_started = False
+
+		def _collect_result(res: ExtractResult) -> None:
+			nonlocal streaming_started
+			res.file_path = display_name
+			attempt_results.append(res)
+			if on_result is None:
+				return
+			if not streaming_started:
+				if getattr(res, "data", None) is None:
+					return
+				for buffered in attempt_results:
+					on_result(buffered)
+				streaming_started = True
+				return
+			on_result(res)
+
 		try:
-			file_results = _run_extraction(extractor, pdf_path)
+			file_results = _run_extraction(extractor, pdf_path, on_result=_collect_result)
 		except Exception as exc:  # noqa: BLE001
 			logger.exception("Chyba při extrakci PDF %s (pokus %s/%s)", display_name, attempt, max_attempts)
 			file_results = [ExtractResult(file_path=display_name, data=None, error=str(exc))]
+			attempt_results = file_results
+		if attempt_results and not file_results:
+			file_results = attempt_results
 		for res in file_results:
 			res.file_path = display_name
 		last_results = file_results
 		has_success = any(getattr(res, "data", None) is not None for res in file_results)
+		if on_result is not None and (has_success or attempt >= max_attempts) and not streaming_started:
+			for res in file_results:
+				on_result(res)
 		if has_success or attempt >= max_attempts:
 			return file_results
 		logger.warning("PDF %s selhalo bez výsledku, opakuji pokus %s/%s", display_name, attempt + 1, max_attempts)
@@ -266,16 +410,21 @@ def _build_batch_summary(
 	*,
 	stop_reason: Optional[str],
 	auto_import_note: Optional[str] = None,
+	extra_note: Optional[str] = None,
 ) -> str:
 	total = int(batch.total_files or 0)
 	processed = int(batch.processed_files or 0)
 	success = int(batch.success_count or 0)
 	errors = int(batch.error_count or 0)
 	charged = int(batch.credits_charged or 0)
+	processed_invoices = int(batch.processed_invoices or 0)
+	total_invoices = max(int(batch.total_invoices_estimate or 0), processed_invoices)
 	if stop_reason == "timeout":
 		prefix = "Zpracování bylo ukončeno časovým limitem."
 	elif stop_reason == "credits":
 		prefix = "Zpracování bylo částečně dokončeno – došly kredity."
+	elif stop_reason == "db_error":
+		prefix = "Zpracování bylo ukončeno kvůli výpadku databáze. Dílčí výsledky byly zachovány."
 	elif stop_reason == "interrupted":
 		prefix = "Zpracování bylo přerušeno."
 	elif stop_reason == "failed":
@@ -286,8 +435,12 @@ def _build_batch_summary(
 		f"{prefix} Zpracováno {processed}/{total} PDF, úspěšně {success} faktur, "
 		f"chyb {errors}, odečteno {charged} kreditů."
 	)
+	if total_invoices > 0:
+		msg += f" Průběh faktur: {processed_invoices}/{total_invoices}."
 	if auto_import_note:
 		msg += f" {auto_import_note}"
+	if extra_note:
+		msg += f" {extra_note}"
 	return msg
 
 
@@ -299,12 +452,24 @@ def _batch_progress_payload(batch: InvoiceBatch, *, row_count: Optional[int] = N
 	errors = max(0, int(batch.error_count or 0))
 	charged = max(0, int(batch.credits_charged or 0))
 	remaining = max(total - processed, 0)
+	processed_invoices = max(0, int(batch.processed_invoices or 0))
+	total_invoices_estimate = max(total, int(batch.total_invoices_estimate or 0))
+	if processed_invoices > total_invoices_estimate:
+		total_invoices_estimate = processed_invoices
+	remaining_invoices = max(total_invoices_estimate - processed_invoices, 0)
+	phase = (batch.current_phase or "").strip().lower()
 	if total > 0:
 		progress_pct = int(min(100, round((processed / total) * 100)))
 	elif _is_terminal_batch_status(status):
 		progress_pct = 100
 	else:
 		progress_pct = 0
+	if total_invoices_estimate > 0:
+		invoice_progress_pct = int(min(100, round((processed_invoices / total_invoices_estimate) * 100)))
+	elif _is_terminal_batch_status(status):
+		invoice_progress_pct = 100
+	else:
+		invoice_progress_pct = 0
 	return {
 		"batch_id": batch.id,
 		"status": status,
@@ -313,16 +478,263 @@ def _batch_progress_payload(batch: InvoiceBatch, *, row_count: Optional[int] = N
 		"total_files": total,
 		"processed_files": processed,
 		"remaining_files": remaining,
+		"processed_invoices": processed_invoices,
+		"total_invoices_estimate": total_invoices_estimate,
+		"remaining_invoices": remaining_invoices,
 		"success_count": success,
 		"error_count": errors,
 		"credits_charged": charged,
 		"progress_percent": progress_pct,
+		"invoice_progress_percent": invoice_progress_pct,
+		"current_phase": phase,
+		"current_phase_label": _batch_phase_label(phase),
 		"summary_message": batch.summary_message or "",
 		"row_count": int(row_count if row_count is not None else len(batch.rows or [])),
 		"started_at": batch.started_at.isoformat() if batch.started_at else None,
 		"finished_at": batch.finished_at.isoformat() if batch.finished_at else None,
 		"last_heartbeat_at": batch.last_heartbeat_at.isoformat() if batch.last_heartbeat_at else None,
 	}
+
+
+def _start_batch_run(*, batch_id: int, user_id: int, file_count: int) -> bool:
+	batch = db.session.get(InvoiceBatch, batch_id)
+	user = db.session.get(User, user_id)
+	if batch is None or user is None:
+		return False
+	batch.processing_status = BATCH_STATUS_RUNNING
+	batch.started_at = _utcnow()
+	batch.last_heartbeat_at = _utcnow()
+	batch.current_phase = "initializing"
+	if int(batch.total_files or 0) <= 0:
+		batch.total_files = file_count
+	min_estimate = max(1, int(batch.total_files or file_count)) if file_count > 0 else 0
+	batch.total_invoices_estimate = max(int(batch.total_invoices_estimate or 0), min_estimate)
+	batch.summary_message = f"Spuštěno zpracování dávky ({batch.total_files} PDF)."
+	return True
+
+
+def _load_user_cfg(user_id: int):
+	user = db.session.get(User, user_id)
+	if user is None:
+		return None
+	return get_user_config_for_user(user)
+
+
+def _load_user_credits(user_id: int) -> int:
+	user = db.session.get(User, user_id)
+	if user is None:
+		return 0
+	return max(0, int(user.credits or 0))
+
+
+def _update_batch_phase(*, batch_id: int, phase: str, summary: Optional[str] = None) -> bool:
+	batch = db.session.get(InvoiceBatch, batch_id)
+	if batch is None:
+		return False
+	batch.current_phase = phase
+	batch.last_heartbeat_at = _utcnow()
+	if summary is not None:
+		batch.summary_message = summary
+	return True
+
+
+def _update_invoice_estimate_for_file(
+	*,
+	batch_id: int,
+	file_invoice_estimate: int,
+	remaining_files: int,
+	source_label: str,
+) -> bool:
+	batch = db.session.get(InvoiceBatch, batch_id)
+	if batch is None:
+		return False
+	processed_invoices = int(batch.processed_invoices or 0)
+	minimum_estimate = processed_invoices + max(1, int(file_invoice_estimate or 1)) + max(0, remaining_files)
+	batch.total_invoices_estimate = max(int(batch.total_invoices_estimate or 0), minimum_estimate)
+	batch.current_phase = "persisting"
+	batch.last_heartbeat_at = _utcnow()
+	batch.summary_message = f"Ukládám výsledky z PDF: {source_label}"
+	return True
+
+
+def _persist_invoice_row(
+	*,
+	batch_id: int,
+	user_id: int,
+	row_index: int,
+	source: str,
+	invoice_data: Dict[str, Any],
+	warning_text: Optional[str],
+	row_error: Optional[str],
+) -> Dict[str, bool]:
+	batch = db.session.get(InvoiceBatch, batch_id)
+	user = db.session.get(User, user_id)
+	if batch is None or user is None:
+		return {
+			"aborted": True,
+			"row_persisted": False,
+			"row_already_exists": False,
+			"credits_exhausted": False,
+		}
+	existing_row = (
+		db.session.query(InvoiceRow.id)
+		.filter(InvoiceRow.batch_id == batch_id, InvoiceRow.row_index == row_index)
+		.scalar()
+	)
+	if existing_row is not None:
+		batch.last_heartbeat_at = _utcnow()
+		return {
+			"aborted": False,
+			"row_persisted": False,
+			"row_already_exists": True,
+			"credits_exhausted": False,
+		}
+
+	local_invoice = dict(invoice_data or {})
+	local_error = (row_error or "").strip() or None
+	credits_exhausted = False
+
+	if local_invoice:
+		if int(user.credits or 0) <= 0:
+			local_invoice = {}
+			local_error = "Extrakce zastavena: došly kredity pro další faktury v dávce."
+			credits_exhausted = True
+		else:
+			batch.success_count = int(batch.success_count or 0) + 1
+			batch.credits_charged = int(batch.credits_charged or 0) + 1
+			user.credits = max(0, int(user.credits or 0) - 1)
+
+	if not local_invoice:
+		if local_error is None:
+			local_error = "Extrakce nevrátila použitelná data."
+		batch.error_count = int(batch.error_count or 0) + 1
+
+	batch.processed_invoices = int(batch.processed_invoices or 0) + 1
+	batch.total_invoices_estimate = max(int(batch.total_invoices_estimate or 0), int(batch.processed_invoices or 0))
+	batch.current_phase = "persisting"
+	batch.last_heartbeat_at = _utcnow()
+
+	db.session.add(
+		InvoiceRow(
+			batch=batch,
+			row_index=row_index,
+			source=source,
+			invoice_data=local_invoice,
+			warning=warning_text,
+			error=local_error,
+			marked_for_import=bool(local_invoice),
+		)
+	)
+	return {
+		"aborted": False,
+		"row_persisted": True,
+		"row_already_exists": False,
+		"credits_exhausted": credits_exhausted,
+	}
+
+
+def _mark_file_processed(*, batch_id: int, processed_files_target: int, remaining_files: int) -> bool:
+	batch = db.session.get(InvoiceBatch, batch_id)
+	if batch is None:
+		return False
+	batch.processed_files = max(int(batch.processed_files or 0), int(processed_files_target or 0))
+	minimum_estimate = int(batch.processed_invoices or 0) + max(0, int(remaining_files or 0))
+	batch.total_invoices_estimate = max(int(batch.total_invoices_estimate or 0), minimum_estimate)
+	batch.last_heartbeat_at = _utcnow()
+	if not _is_terminal_batch_status(batch.processing_status):
+		batch.current_phase = "extracting"
+	batch.summary_message = (
+		f"Průběžně uloženo {int(batch.processed_invoices or 0)} faktur, "
+		f"zpracováno {batch.processed_files}/{batch.total_files} PDF."
+	)
+	return True
+
+
+def _load_batch_snapshot(batch_id: int) -> Optional[Dict[str, int]]:
+	batch = db.session.get(InvoiceBatch, batch_id)
+	if batch is None:
+		return None
+	return {
+		"total_files": int(batch.total_files or 0),
+		"processed_files": int(batch.processed_files or 0),
+		"success_count": int(batch.success_count or 0),
+	}
+
+
+def _finalize_batch_processing(
+	*,
+	batch_id: int,
+	stop_reason: Optional[str],
+	auto_import_note: Optional[str],
+	extra_note: Optional[str],
+) -> bool:
+	batch = db.session.get(InvoiceBatch, batch_id)
+	if batch is None:
+		return False
+	row_count = (
+		db.session.query(db.func.count(InvoiceRow.id))
+		.filter(InvoiceRow.batch_id == batch_id)
+		.scalar()
+		or 0
+	)
+	resolved_stop_reason = stop_reason
+	if resolved_stop_reason is None and int(batch.processed_files or 0) < int(batch.total_files or 0):
+		resolved_stop_reason = "interrupted"
+
+	if resolved_stop_reason == "timeout":
+		status = BATCH_STATUS_PARTIAL_TIMEOUT
+	elif resolved_stop_reason == "credits":
+		status = BATCH_STATUS_COMPLETED_WITH_ERRORS
+	elif resolved_stop_reason == "interrupted":
+		status = BATCH_STATUS_INTERRUPTED
+	elif resolved_stop_reason == "db_error":
+		status = BATCH_STATUS_COMPLETED_WITH_ERRORS if int(row_count) > 0 else BATCH_STATUS_FAILED
+	elif int(batch.error_count or 0) > 0:
+		status = BATCH_STATUS_COMPLETED_WITH_ERRORS
+	else:
+		status = BATCH_STATUS_COMPLETED
+
+	if status == BATCH_STATUS_FAILED and resolved_stop_reason != "failed":
+		resolved_stop_reason = "failed"
+	elif resolved_stop_reason is None:
+		resolved_stop_reason = "done"
+
+	batch.processing_status = status
+	batch.current_phase = "done"
+	batch.finished_at = _utcnow()
+	batch.last_heartbeat_at = _utcnow()
+	batch.summary_message = _build_batch_summary(
+		batch,
+		stop_reason=resolved_stop_reason,
+		auto_import_note=auto_import_note,
+		extra_note=extra_note,
+	)
+	return True
+
+
+def _finalize_batch_crash(*, batch_id: int) -> bool:
+	batch = db.session.get(InvoiceBatch, batch_id)
+	if batch is None:
+		return False
+	row_count = (
+		db.session.query(db.func.count(InvoiceRow.id))
+		.filter(InvoiceRow.batch_id == batch_id)
+		.scalar()
+		or 0
+	)
+	if int(row_count) > 0:
+		batch.processing_status = BATCH_STATUS_COMPLETED_WITH_ERRORS
+		stop_reason = "interrupted"
+		extra = "Proces byl neočekávaně ukončen, ale částečné výsledky zůstaly dostupné."
+	else:
+		batch.processing_status = BATCH_STATUS_FAILED
+		stop_reason = "failed"
+		extra = "Proces byl neočekávaně ukončen."
+	batch.current_phase = "done"
+	batch.finished_at = _utcnow()
+	batch.last_heartbeat_at = _utcnow()
+	batch.summary_message = _build_batch_summary(batch, stop_reason=stop_reason, extra_note=extra)
+	return True
 
 
 def _run_pdf_batch_job(
@@ -338,137 +750,249 @@ def _run_pdf_batch_job(
 	started_perf = time.perf_counter()
 	stop_reason: Optional[str] = None
 	auto_import_note: Optional[str] = None
+	extra_summary_note: Optional[str] = None
+	heartbeat_stop = threading.Event()
+	heartbeat_thread = threading.Thread(
+		target=_batch_heartbeat_worker,
+		name=f"pdf-batch-heartbeat-{batch_id}",
+		daemon=True,
+		kwargs={"app": app, "batch_id": batch_id, "stop_event": heartbeat_stop},
+	)
+	heartbeat_thread.start()
+
 	try:
 		with app.app_context():
-			batch = db.session.get(InvoiceBatch, batch_id)
-			user = db.session.get(User, user_id)
-			if batch is None or user is None:
+			started_ok = _run_db_write_with_retry(
+				f"batch {batch_id} start",
+				lambda: _start_batch_run(batch_id=batch_id, user_id=user_id, file_count=len(saved_files)),
+			)
+			if not started_ok:
 				return
-			batch.processing_status = BATCH_STATUS_RUNNING
-			batch.started_at = _utcnow()
-			batch.last_heartbeat_at = _utcnow()
-			batch.summary_message = f"Spuštěno zpracování dávky ({batch.total_files} PDF)."
-			db.session.commit()
 
-			cfg = get_user_config_for_user(user)
+			cfg = _run_db_read_with_retry(
+				f"batch {batch_id} load user config",
+				lambda: _load_user_cfg(user_id),
+			)
+			if cfg is None:
+				return
 			extractor = InvoiceExtractor(config=cfg)
-			last_row_index = db.session.query(db.func.max(InvoiceRow.row_index)).filter(InvoiceRow.batch_id == batch.id).scalar()
-			next_row_index = int(last_row_index) + 1 if last_row_index is not None else 0
 
-			for file_path_str, display_name in saved_files:
+			last_row_index = _run_db_read_with_retry(
+				f"batch {batch_id} load row index",
+				lambda: db.session.query(db.func.max(InvoiceRow.row_index))
+				.filter(InvoiceRow.batch_id == batch_id)
+				.scalar(),
+			)
+			next_row_index = int(last_row_index) + 1 if last_row_index is not None else 0
+			total_files = len(saved_files)
+
+			for file_idx, (file_path_str, display_name) in enumerate(saved_files, start=1):
 				elapsed = time.perf_counter() - started_perf
 				if runtime_limit_s > 0 and elapsed >= runtime_limit_s:
 					stop_reason = "timeout"
 					break
 
-				db.session.refresh(user)
-				if int(user.credits or 0) <= 0:
-					stop_reason = "credits"
-					break
-
-				file_results = _extract_file_with_retry(extractor, Path(file_path_str), display_name, max_attempts=2)
-				if not file_results:
-					file_results = [ExtractResult(file_path=display_name, data=None, error="Extrakce nevrátila žádná data.")]
-
-				credits_exhausted_during_file = False
-				for res in file_results:
-					res.file_path = display_name
-					data_obj = getattr(res, "data", None)
-					row_error = (getattr(res, "error", None) or "").strip() or None
-					warning_text = _merge_warning_text(data_obj, getattr(res, "warnings", None))
-					invoice_dict: Dict[str, Any] = {}
-
-					if data_obj is not None:
-						if int(user.credits or 0) <= 0:
-							row_error = "Extrakce zastavena: došly kredity pro další faktury v dávce."
-							credits_exhausted_during_file = True
-						else:
-							try:
-								invoice_dict = data_obj.model_dump()
-							except Exception:
-								invoice_dict = {}
-							if warning_text:
-								set_warning(invoice_dict, warning_text)
-							batch.success_count = int(batch.success_count or 0) + 1
-							batch.credits_charged = int(batch.credits_charged or 0) + 1
-							user.credits = max(0, int(user.credits or 0) - 1)
-
-					if not invoice_dict:
-						if row_error is None:
-							row_error = "Extrakce nevrátila použitelná data."
-						batch.error_count = int(batch.error_count or 0) + 1
-
-					db.session.add(
-						InvoiceRow(
-							batch=batch,
-							row_index=next_row_index,
-							source=display_name,
-							invoice_data=invoice_dict,
-							warning=warning_text,
-							error=row_error,
-							marked_for_import=bool(invoice_dict),
-						)
+				try:
+					_run_db_write_with_retry(
+						f"batch {batch_id} heartbeat before file",
+						lambda: _update_batch_phase(
+							batch_id=batch_id,
+							phase="extracting",
+							summary=(
+								f"Zpracovávám PDF {file_idx}/{total_files}: {display_name}. "
+								"Výsledky budou ukládány po jednotlivých fakturách."
+							),
+						),
 					)
-					next_row_index += 1
+				except OperationalError as exc:
+					stop_reason = "db_error"
+					extra_summary_note = f"DB chyba při aktualizaci průběhu: {exc}"
+					break
 
-				batch.processed_files = min(
-					int(batch.total_files or len(saved_files)),
-					int(batch.processed_files or 0) + 1,
+				credits_available = _run_db_read_with_retry(
+					f"batch {batch_id} check credits",
+					lambda: _load_user_credits(user_id),
 				)
-				batch.last_heartbeat_at = _utcnow()
-				db.session.commit()
-
-				if credits_exhausted_during_file:
+				if credits_available <= 0:
 					stop_reason = "credits"
 					break
 
-			batch = db.session.get(InvoiceBatch, batch_id)
-			user = db.session.get(User, user_id)
-			if batch is None or user is None:
+				remaining_files_after = max(total_files - file_idx, 0)
+				file_estimate_locked = False
+
+				def _persist_stream_result(res: ExtractResult) -> None:
+					nonlocal next_row_index, stop_reason, extra_summary_note, file_estimate_locked
+					if stop_reason in {"db_error", "credits", "timeout", "interrupted"}:
+						return
+					elapsed_local = time.perf_counter() - started_perf
+					if runtime_limit_s > 0 and elapsed_local >= runtime_limit_s:
+						stop_reason = "timeout"
+						return
+
+					group_total_hint = int(getattr(res, "_invoice_group_total", 0) or 0)
+					if group_total_hint > 0 and not file_estimate_locked:
+						try:
+							_run_db_write_with_retry(
+								f"batch {batch_id} update streaming invoice estimate",
+								lambda: _update_invoice_estimate_for_file(
+									batch_id=batch_id,
+									file_invoice_estimate=group_total_hint,
+									remaining_files=remaining_files_after,
+									source_label=display_name,
+								),
+							)
+							file_estimate_locked = True
+						except OperationalError as exc:
+							stop_reason = "db_error"
+							extra_summary_note = f"DB chyba při stream aktualizaci odhadu: {exc}"
+							return
+
+					res.file_path = display_name
+					data_obj_local = getattr(res, "data", None)
+					row_error_local = (getattr(res, "error", None) or "").strip() or None
+					warning_text_local = _merge_warning_text(data_obj_local, getattr(res, "warnings", None))
+					invoice_payload_local: Dict[str, Any] = {}
+					if data_obj_local is not None:
+						try:
+							invoice_payload_local = data_obj_local.model_dump()
+						except Exception:
+							invoice_payload_local = {}
+						if warning_text_local and invoice_payload_local:
+							set_warning(invoice_payload_local, warning_text_local)
+
+					row_index_for_insert = next_row_index
+					try:
+						persist_info = _run_db_write_with_retry(
+							f"batch {batch_id} persist row {row_index_for_insert}",
+							lambda: _persist_invoice_row(
+								batch_id=batch_id,
+								user_id=user_id,
+								row_index=row_index_for_insert,
+								source=display_name,
+								invoice_data=invoice_payload_local,
+								warning_text=warning_text_local,
+								row_error=row_error_local,
+							),
+						)
+					except OperationalError as exc:
+						stop_reason = "db_error"
+						extra_summary_note = f"DB chyba při ukládání výsledku: {exc}"
+						return
+
+					if persist_info.get("aborted"):
+						stop_reason = "interrupted"
+						return
+					if persist_info.get("row_persisted") or persist_info.get("row_already_exists"):
+						next_row_index += 1
+					if persist_info.get("credits_exhausted"):
+						stop_reason = "credits"
+
+				db.session.remove()
+				file_results = _extract_file_with_retry(
+					extractor,
+					Path(file_path_str),
+					display_name,
+					on_result=_persist_stream_result,
+					max_attempts=2,
+				)
+				if not file_results:
+					file_results = [
+						ExtractResult(
+							file_path=display_name,
+							data=None,
+							error="Extrakce nevrátila žádná data.",
+						)
+					]
+
+				file_invoice_estimate = max(1, len(file_results))
+				try:
+					_run_db_write_with_retry(
+						f"batch {batch_id} update invoice estimate",
+						lambda: _update_invoice_estimate_for_file(
+							batch_id=batch_id,
+							file_invoice_estimate=file_invoice_estimate,
+							remaining_files=remaining_files_after,
+							source_label=display_name,
+						),
+					)
+				except OperationalError as exc:
+					stop_reason = "db_error"
+					extra_summary_note = f"DB chyba při aktualizaci odhadu faktur: {exc}"
+					break
+
+				if stop_reason == "db_error":
+					break
+
+				target_processed_files = min(total_files, file_idx)
+				try:
+					_run_db_write_with_retry(
+						f"batch {batch_id} mark file processed",
+						lambda: _mark_file_processed(
+							batch_id=batch_id,
+							processed_files_target=target_processed_files,
+							remaining_files=max(total_files - target_processed_files, 0),
+						),
+					)
+				except OperationalError as exc:
+					stop_reason = "db_error"
+					extra_summary_note = f"DB chyba při ukládání průběhu souboru: {exc}"
+					break
+
+				if stop_reason in {"credits", "timeout", "interrupted"}:
+					break
+
+			batch_state = _run_db_read_with_retry(
+				f"batch {batch_id} final state snapshot",
+				lambda: _load_batch_snapshot(batch_id),
+			)
+			if batch_state is None:
 				return
-			if stop_reason is None and int(batch.processed_files or 0) < int(batch.total_files or 0):
+
+			if stop_reason is None and batch_state["processed_files"] < batch_state["total_files"]:
 				stop_reason = "interrupted"
 
-			if getattr(cfg, "auto_import", False) and int(batch.success_count or 0) > 0:
-				company_code, direction, doc_type_code = current_context(user.settings, base_cfg=cfg)
-				apply_context_to_config(cfg, company_code, direction, doc_type_code)
-				ok, err, skipped = _import_batch(batch, cfg, None)
-				auto_import_note = f"Auto-import: {ok} OK, {err} chyb, {skipped} přeskočeno."
+			if stop_reason != "db_error" and getattr(cfg, "auto_import", False) and batch_state["success_count"] > 0:
+				try:
+					_run_db_write_with_retry(
+						f"batch {batch_id} set importing phase",
+						lambda: _update_batch_phase(
+							batch_id=batch_id,
+							phase="importing",
+							summary="Probíhá automatický import do ABRA.",
+						),
+					)
+					batch_for_import = db.session.get(InvoiceBatch, batch_id)
+					user_for_import = db.session.get(User, user_id)
+					if batch_for_import is not None and user_for_import is not None:
+						company_code, direction, doc_type_code = current_context(user_for_import.settings, base_cfg=cfg)
+						apply_context_to_config(cfg, company_code, direction, doc_type_code)
+						ok, err, skipped = _import_batch(batch_for_import, cfg, None)
+						auto_import_note = f"Auto-import: {ok} OK, {err} chyb, {skipped} přeskočeno."
+				finally:
+					db.session.remove()
 
-			if stop_reason == "timeout":
-				batch.processing_status = BATCH_STATUS_PARTIAL_TIMEOUT
-			elif stop_reason == "credits":
-				batch.processing_status = BATCH_STATUS_COMPLETED_WITH_ERRORS
-			elif stop_reason == "interrupted":
-				batch.processing_status = BATCH_STATUS_INTERRUPTED
-			elif int(batch.error_count or 0) > 0:
-				batch.processing_status = BATCH_STATUS_COMPLETED_WITH_ERRORS
-			else:
-				batch.processing_status = BATCH_STATUS_COMPLETED
-
-			batch.finished_at = _utcnow()
-			batch.last_heartbeat_at = _utcnow()
-			batch.summary_message = _build_batch_summary(
-				batch,
-				stop_reason=stop_reason,
-				auto_import_note=auto_import_note,
+			_run_db_write_with_retry(
+				f"batch {batch_id} finalize",
+				lambda: _finalize_batch_processing(
+					batch_id=batch_id,
+					stop_reason=stop_reason,
+					auto_import_note=auto_import_note,
+					extra_note=extra_summary_note,
+				),
 			)
-			db.session.commit()
 	except Exception as exc:  # noqa: BLE001
 		logger.exception("PDF batch worker selhal (batch_id=%s): %s", batch_id, exc)
 		with app.app_context():
 			try:
-				db.session.rollback()
-				batch = db.session.get(InvoiceBatch, batch_id)
-				if batch is not None:
-					batch.processing_status = BATCH_STATUS_FAILED
-					batch.finished_at = _utcnow()
-					batch.last_heartbeat_at = _utcnow()
-					batch.summary_message = _build_batch_summary(batch, stop_reason="failed")
-					db.session.commit()
+				_run_db_write_with_retry(
+					f"batch {batch_id} crash finalize",
+					lambda: _finalize_batch_crash(batch_id=batch_id),
+				)
 			except Exception:  # noqa: BLE001
 				db.session.rollback()
 	finally:
+		heartbeat_stop.set()
+		heartbeat_thread.join(timeout=1.0)
 		with _BATCH_THREADS_LOCK:
 			_BATCH_THREADS.pop(batch_id, None)
 		shutil.rmtree(job_dir, ignore_errors=True)
@@ -742,6 +1266,9 @@ def create_app() -> Flask:
 				processing_status=BATCH_STATUS_QUEUED,
 				total_files=len(saved_files),
 				processed_files=0,
+				processed_invoices=0,
+				total_invoices_estimate=max(1, len(saved_files)),
+				current_phase="queued",
 				success_count=0,
 				error_count=0,
 				credits_charged=0,

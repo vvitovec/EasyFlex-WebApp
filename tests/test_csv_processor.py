@@ -35,6 +35,7 @@ def _assert_sample_invoice(invoice) -> None:
 	assert "11000" in (invoice.odberatel_adresa or "")
 	assert invoice.zaklad_dane_12 == 100.0
 	assert invoice.zaklad_dane_21 == 200.0
+	assert invoice.mena == "CZK"
 
 
 def test_csv_row_mapping_infers_due_date_and_warnings() -> None:
@@ -216,6 +217,84 @@ def test_column_mapping_handles_supplier_customer_synonyms() -> None:
 	assert invoice.vyse_dph_12 == 12.0
 	assert invoice.vyse_dph_21 == 42.0
 	assert invoice.celkova_cena == 354.0
+
+
+def test_currency_from_explicit_column_is_normalized() -> None:
+	processor = CSVProcessor(config=_config_with(infer_missing_dates=False))
+	df = pd.DataFrame(
+		{
+			"Číslo faktury": ["EUR-1"],
+			"Jméno": ["ACME"],
+			"Měna": ["€"],
+			"Celkem k úhradě": ["1 234,56 EUR"],
+		}
+	)
+	processor._column_map = processor._infer_column_map(df)
+	invoice = processor._map_row_to_invoice_data(df.iloc[0], 1)
+	assert invoice is not None
+	assert invoice.mena == "EUR"
+	assert invoice.celkova_cena == 1234.56
+
+
+def test_currency_is_inferred_from_amount_symbols_when_column_missing() -> None:
+	processor = CSVProcessor(config=_config_with(infer_missing_dates=False))
+	df = pd.DataFrame(
+		{
+			"Číslo faktury": ["EUR-2"],
+			"Jméno": ["ACME"],
+			"Částka celkem bez DPH v sazbě 21%": ["100,00 EUR"],
+			"Celkem k úhradě": ["121,00 €"],
+		}
+	)
+	processor._column_map = processor._infer_column_map(df)
+	invoice = processor._map_row_to_invoice_data(df.iloc[0], 1)
+	assert invoice is not None
+	assert invoice.mena == "EUR"
+	assert invoice.zaklad_dane_21 == 100.0
+	assert invoice.celkova_cena == 121.0
+
+
+def test_currency_conflict_prefers_explicit_column_and_warns() -> None:
+	processor = CSVProcessor(config=_config_with(infer_missing_dates=False))
+	df = pd.DataFrame(
+		{
+			"Číslo faktury": ["MIX-1"],
+			"Jméno": ["ACME"],
+			"Měna": ["CZK"],
+			"Celkem k úhradě": ["121,00 €"],
+		}
+	)
+	processor._column_map = processor._infer_column_map(df)
+	invoice = processor._map_row_to_invoice_data(df.iloc[0], 1)
+	assert invoice is not None
+	assert invoice.mena == "CZK"
+	warning_text = get_warning(invoice, "") or ""
+	assert "Konflikt měny" in warning_text
+
+
+def test_unknown_explicit_currency_falls_back_to_czk_and_warns() -> None:
+	processor = CSVProcessor(config=_config_with(infer_missing_dates=False))
+	df = pd.DataFrame(
+		{
+			"Číslo faktury": ["USD-1"],
+			"Jméno": ["ACME"],
+			"Měna": ["USD"],
+			"Celkem k úhradě": ["121,00"],
+		}
+	)
+	processor._column_map = processor._infer_column_map(df)
+	invoice = processor._map_row_to_invoice_data(df.iloc[0], 1)
+	assert invoice is not None
+	assert invoice.mena == "CZK"
+	warning_text = get_warning(invoice, "") or ""
+	assert "Neznámá měna" in warning_text
+
+
+def test_safe_float_removes_known_currency_markers() -> None:
+	processor = CSVProcessor(config=_config_with(infer_missing_dates=False))
+	assert processor._safe_float("1 234,56 Kč") == 1234.56
+	assert processor._safe_float("1 234,56 EUR") == 1234.56
+	assert processor._safe_float("€1 234,56") == 1234.56
 
 
 def _write_sample_xlsx(path) -> None:

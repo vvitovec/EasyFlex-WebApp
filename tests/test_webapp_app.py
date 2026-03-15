@@ -150,6 +150,9 @@ def test_batch_progress_endpoint_returns_json(monkeypatch, tmp_path) -> None:
 			processing_status="running",
 			total_files=3,
 			processed_files=1,
+			processed_invoices=2,
+			total_invoices_estimate=5,
+			current_phase="persisting",
 			success_count=1,
 			error_count=0,
 			credits_charged=1,
@@ -178,5 +181,26 @@ def test_batch_progress_endpoint_returns_json(monkeypatch, tmp_path) -> None:
 	assert payload["status"] == "running"
 	assert payload["total_files"] == 3
 	assert payload["processed_files"] == 1
+	assert payload["processed_invoices"] == 2
+	assert payload["total_invoices_estimate"] == 5
+	assert payload["current_phase"] == "persisting"
 	assert payload["row_count"] == 1
 	assert payload["is_terminal"] is False
+
+
+def test_db_write_retry_retries_operational_error(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+	call_state = {"calls": 0}
+
+	def _writer():
+		call_state["calls"] += 1
+		if call_state["calls"] == 1:
+			raise OperationalError("SELECT 1", {}, Exception("boom"))
+		return "ok"
+
+	with app.app_context():
+		result = app_module._run_db_write_with_retry("test writer", _writer, max_attempts=2)
+	assert result == "ok"
+	assert call_state["calls"] == 2
