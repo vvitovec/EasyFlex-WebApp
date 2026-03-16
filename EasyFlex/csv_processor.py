@@ -248,12 +248,13 @@ class CSVProcessor:
 		self.logger.info("Načtena tabulka: %s, řádků: %s", source_label, len(df))
 		df = df.copy()
 		if isinstance(df.columns, pd.MultiIndex):
-			df.columns = [
+			raw_columns = [
 				" ".join(str(part) for part in col if part not in (None, "")) or "sloupec"
 				for col in df.columns
 			]
 		else:
-			df.columns = [str(col) for col in df.columns]
+			raw_columns = [str(col) for col in df.columns]
+		df.columns = [self._clean_header_name(col) for col in raw_columns]
 
 		# Infer column mapping before iterating rows (LLM-assisted with fallback)
 		self._column_map = self._infer_column_map(df)
@@ -783,6 +784,12 @@ class CSVProcessor:
 		# 4) Fallback synonyma pro zbylé cílové klíče
 		self._apply_synonym_fallback(mapping, df, existing_headers)
 		return mapping
+
+	def _clean_header_name(self, header: Any) -> str:
+		"""Očistí název hlavičky o BOM a okolní whitespace/uvozovky."""
+		value = str(header or "")
+		value = value.replace("\ufeff", "").strip().strip('"')
+		return value or "sloupec"
 
 	def _normalize(self, s: str) -> str:
 		val = str(s or "").replace("\ufeff", "").strip().strip('"').lower()

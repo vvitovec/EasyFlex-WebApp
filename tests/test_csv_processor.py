@@ -130,6 +130,15 @@ def test_process_table_file_reads_csv(tmp_path) -> None:
 	_assert_sample_invoice(invoices[0])
 
 
+def test_process_table_file_reads_utf8_bom_csv(tmp_path) -> None:
+	processor = CSVProcessor()
+	csv_path = tmp_path / "sample-bom.csv"
+	_sample_dataframe().to_csv(csv_path, index=False, encoding="utf-8-sig")
+	invoices = processor.process_table_file(str(csv_path))
+	assert len(invoices) == 1
+	_assert_sample_invoice(invoices[0])
+
+
 def test_process_table_file_reads_excel(tmp_path) -> None:
 	processor = CSVProcessor()
 	xlsx_path = tmp_path / "sample.xlsx"
