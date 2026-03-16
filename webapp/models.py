@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime
 import logging
+import re
 import time
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import OperationalError
@@ -15,6 +16,102 @@ from werkzeug.security import generate_password_hash, check_password_hash
 db = SQLAlchemy()
 logger = logging.getLogger(__name__)
 _MIGRATION_ADVISORY_LOCK_KEY = 724019631
+_MIGRATION_MIN_XACT_AGE_FOR_TERMINATE_S = 60
+_ALTER_TABLE_RE = re.compile(
+	r"^\s*ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<table>(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*))?)(?=\s|$)",
+	re.IGNORECASE,
+)
+_ADD_COLUMN_IF_NOT_EXISTS_RE = re.compile(
+	r"^\s*ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<table>(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*))?)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(?P<column>(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*))(?=\s|$)",
+	re.IGNORECASE,
+)
+
+
+def _unquote_identifier(name: str) -> str:
+	name = (name or "").strip()
+	if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
+		return name[1:-1].replace('""', '"')
+	return name
+
+
+def _split_table_ref(table_ref: str) -> tuple[str | None, str]:
+	raw = (table_ref or "").strip()
+	parts = [part.strip() for part in raw.split(".") if part.strip()]
+	if len(parts) >= 2:
+		return _unquote_identifier(parts[-2]), _unquote_identifier(parts[-1])
+	return None, _unquote_identifier(parts[-1] if parts else raw)
+
+
+def _extract_alter_table_target(sql: str) -> str | None:
+	match = _ALTER_TABLE_RE.match(sql or "")
+	return match.group("table") if match else None
+
+
+def _extract_add_column_if_not_exists_target(sql: str) -> tuple[str, str] | None:
+	match = _ADD_COLUMN_IF_NOT_EXISTS_RE.match(sql or "")
+	if not match:
+		return None
+	return match.group("table"), match.group("column")
+
+
+def _column_exists(engine, *, table_ref: str, column_name: str) -> bool:
+	schema, table = _split_table_ref(table_ref)
+	if not table:
+		return False
+	normalized_column = _unquote_identifier(column_name)
+	columns = {col["name"] for col in inspect(engine).get_columns(table, schema=schema)}
+	return normalized_column in columns
+
+
+def _terminate_stale_table_lock_holders(engine, *, table_ref: str, min_xact_age_s: int) -> int:
+	"""Terminate stale same-user transactions that still hold locks on the target table."""
+	if engine.dialect.name != "postgresql":
+		return 0
+	schema, table = _split_table_ref(table_ref)
+	if not table:
+		return 0
+	with engine.begin() as conn:
+		rows = conn.execute(
+			text(
+				"""
+				SELECT DISTINCT
+					a.pid,
+					a.state,
+					EXTRACT(EPOCH FROM (NOW() - a.xact_start))::INTEGER AS xact_age_s
+				FROM pg_locks l
+				JOIN pg_class c ON c.oid = l.relation
+				JOIN pg_namespace n ON n.oid = c.relnamespace
+				JOIN pg_stat_activity a ON a.pid = l.pid
+				WHERE l.granted
+				  AND a.pid <> pg_backend_pid()
+				  AND a.datname = current_database()
+				  AND a.usename = current_user
+				  AND a.xact_start IS NOT NULL
+				  AND NOW() - a.xact_start > make_interval(secs => :min_age_s)
+				  AND c.relname = :table_name
+				  AND (:schema_name IS NULL OR n.nspname = :schema_name)
+				ORDER BY a.xact_start
+				"""
+			),
+			{
+				"table_name": table,
+				"schema_name": schema,
+				"min_age_s": int(min_xact_age_s),
+			},
+		).fetchall()
+		terminated = 0
+		for row in rows:
+			was_terminated = bool(conn.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": int(row.pid)}).scalar())
+			if was_terminated:
+				terminated += 1
+				logger.warning(
+					"Terminated stale DB session pid=%s (state=%s, xact_age=%ss) blocking migration on %s",
+					row.pid,
+					row.state,
+					row.xact_age_s,
+					table_ref,
+				)
+		return terminated
 
 
 def _is_retryable_migration_error(exc: Exception) -> bool:
@@ -44,6 +141,7 @@ def _schema_migration_lock(engine):
 def _execute_migration_sql(engine, sql: str, *, attempts: int = 20, delay_s: float = 2.0) -> None:
 	"""Execute a migration statement with retries for transient DB lock/timeout errors."""
 	last_exc: Exception | None = None
+	alter_table_target = _extract_alter_table_target(sql) if engine.dialect.name == "postgresql" else None
 	for attempt in range(1, attempts + 1):
 		try:
 			with engine.begin() as conn:
@@ -55,7 +153,39 @@ def _execute_migration_sql(engine, sql: str, *, attempts: int = 20, delay_s: flo
 			return
 		except OperationalError as exc:
 			last_exc = exc
-			if not _is_retryable_migration_error(exc) or attempt >= attempts:
+			retryable = _is_retryable_migration_error(exc)
+			if retryable and engine.dialect.name == "postgresql" and alter_table_target and attempt >= 3:
+				try:
+					_terminate_stale_table_lock_holders(
+						engine,
+						table_ref=alter_table_target,
+						min_xact_age_s=_MIGRATION_MIN_XACT_AGE_FOR_TERMINATE_S,
+					)
+				except Exception:
+					logger.warning(
+						"Unable to terminate stale lock holders for migration target %s",
+						alter_table_target,
+						exc_info=True,
+					)
+			if not retryable:
+				raise
+			if attempt >= attempts:
+				add_col_target = _extract_add_column_if_not_exists_target(sql)
+				if add_col_target is not None:
+					table_ref, column_name = add_col_target
+					try:
+						if _column_exists(engine, table_ref=table_ref, column_name=column_name):
+							logger.warning(
+								"Migration statement hit lock timeouts, but target column already exists: %s",
+								sql,
+							)
+							return
+					except Exception:
+						logger.warning(
+							"Unable to verify target column existence after migration timeout: %s",
+							sql,
+							exc_info=True,
+						)
 				raise
 			logger.warning(
 				"DB migration statement retry %s/%s due to lock/timeout: %s",
