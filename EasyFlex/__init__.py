@@ -1,1 +1,1 @@
-# Marks this directory as a Python package.
+"""Shared EasyFlex domain logic used by the web application."""
