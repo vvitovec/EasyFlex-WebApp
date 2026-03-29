@@ -2,7 +2,7 @@
 
 EasyFlex Web je webová aplikace postavená na Flasku, která umožňuje nahrávat PDF faktury nebo tabulkové soubory, automaticky z nich vyčíst údaje pomocí OpenAI, data zkontrolovat/upravit a následně importovat do ABRA Flexi. Flask zde zajišťuje webový server, routování stránek, práci se sessions a napojení na uživatelskou autentizaci i databázi. Aplikace je navržena pro více uživatelů, každý má vlastní přihlašovací údaje, nastavení a historii zpracovaných dávek.
 
-> V repozitáři je také původní desktopová (Tkinter) aplikace, podle které web vznikl. README se však soustředí pouze na webovou část.
+Adresář `EasyFlex/` dnes slouží jako sdílené aplikační jádro pro webovou vrstvu `webapp/` (extrakce, mapování dat, ABRA integrace, pomocné modely).
 
 ---
 
@@ -132,7 +132,7 @@ Admin může nastavit výchozí extrakční parametry pro ostatní uživatele (m
 - Zkontrolujte, zda má uživatel vyplněný `OPENAI_API_KEY` na stránce `/settings`.
 
 **„Chyba převodu PDF“**
-- Ujistěte se, že je dostupný Poppler (`pdftoppm`) a že je správně nastaven `POPPLER_PATH`.
+- Ujistěte se, že je v prostředí dostupný Poppler (`pdftoppm`) a případně nastavte `POPPLER_PATH`. Repo už neobsahuje přibalený desktopový Poppler bundle.
 
 **„ABRA server not reachable / 401/403/404“**
 - Zkontrolujte server, port, přihlašovací údaje a TLS v `/settings`.

@@ -1,119 +1,213 @@
 {% extends "base.html" %}
 
 {% block content %}
-<div class="card">
-	<h2>Nápověda &ndash; EasyFlex Web</h2>
-	<p class="muted">Průvodce, jak využít všechny funkce aplikace od prvního přístupu až po import do ABRA Flexi.</p>
-
-	<section class="help-section">
-		<h3>Rychlý start</h3>
-		<ol>
-			<li>Založení účtu a reset hesla probíhá <strong>výhradně přes podporu</strong>: napište na {{ contact_email }} nebo volejte {{ contact_phone }}.</li>
-			<li>Přihlaste se a v sekci <strong>Kredity</strong> zkontrolujte zůstatek (noví uživatelé startují se 100 kredity). Minimální dobití je 100 kreditů za 50 Kč podle údajů v sekci Kredity.</li>
-			<li>V <strong>Nastavení</strong> &rarr; karta <strong>ABRA</strong> vyplňte adresu a port instance ABRA Flexi, uživatelské jméno a heslo. Podle vašeho serveru zapněte/vypněte ověřování TLS.</li>
-			<li>V kartě <strong>Import do ABRA</strong> předvyplňte firmy a typy dokladů podle návodu níže, aby se při importu nabízely správné hodnoty.</li>
-			<li>V <strong>Nahrát PDF</strong> nahrajte jedno nebo více PDF a spusťte zpracování (1 kredit = 1 faktura; prázdné/neúspěšné extrakce se neúčtují).</li>
-			<li>Po zpracování otevřete <strong>Výsledky</strong>, zkontrolujte a případně upravte data a dokončete import do ABRA Flexi.</li>
-		</ol>
-	</section>
-
-	<section class="help-section">
-		<h3>Podrobný průvodce</h3>
-		<div class="help-grid">
-			<div class="help-tile">
-				<h4>Registrace a přístup</h4>
-				<ul>
-					<li>Registrace, aktivace i reset hesla řeší administrátor na <a href="mailto:{{ contact_email }}">{{ contact_email }}</a> nebo <a href="tel:{{ contact_phone }}">{{ contact_phone }}</a>.</li>
-					<li>Přihlašovací údaje obdržíte od administrátora. Pokud se nemůžete přihlásit, napište nebo zavolejte &ndash; samoobslužné obnovení hesla není dostupné.</li>
-				</ul>
-			</div>
-			<div class="help-tile">
-				<h4>Nastavení</h4>
-				<ul>
-					<li><strong>ABRA</strong>: zadejte adresu/hostitele a port vaší instance ABRA Flexi, uživatele a heslo pro REST API. Volba ověřování TLS odpovídá tomu, zda server používá platný certifikát.</li>
-					<li><strong>Extractor</strong>: vidí pouze administrátor a spravuje zde OpenAI klíč a model. Běžný uživatel nic nevyplňuje.</li>
-					<li><strong>Extrakce</strong>: přepínače pro použití čísla dokladu jako VS, dopočítávání chybějících dat, mapování CSV sloupců a auto-import po extrakci.</li>
-					<li><strong>Import do ABRA</strong>: přidejte firmy a typy dokladů, aby se při importu nabízely správné kombinace pro vaši instanci.</li>
-				</ul>
-			</div>
-			<div class="help-tile">
-				<h4>Kredity</h4>
-				<ul>
-					<li>1 kredit = zpracování 1 faktury (prázdné výsledky se neúčtují). Noví uživatelé začínají se 100 kredity.</li>
-					<li>Platby: bankovní převod (CZK). QR kód a variabilní symbol najdete v sekci <strong>Kredity</strong>; kredity připisuje ručně administrátor.</li>
-					<li>Minimální dobití: <strong>100 kreditů za 50 Kč</strong>. Potřebujete-li více, zadejte vyšší částku při platbě.</li>
-				</ul>
-			</div>
-			<div class="help-tile">
-				<h4>Nahrávání PDF a extrakce</h4>
-				<ul>
-					<li>Můžete nahrát jednotlivé soubory nebo složku s více PDF.</li>
-					<li>Nepodporované formáty se automaticky přeskočí a zobrazí se upozornění.</li>
-					<li>Po nahrání dostanete přehled faktur; můžete ručně opravit čísla dokladů, datumy, částky nebo identifikaci dodavatele/odběratele.</li>
-				</ul>
-			</div>
-			<div class="help-tile">
-				<h4>Import do ABRA Flexi</h4>
-				<ul>
-					<li>Před importem vyberte firmu, směr a typ dokladu z hodnot, které jste si nastavili v části Import do ABRA.</li>
-					<li>Řádky lze označit/odznačit pro import; chyby (např. neplatné IČ/DIČ nebo kód dokladu) se zobrazí přímo u řádku.</li>
-					<li>Po opravě dat můžete import zopakovat; úspěšně importované řádky se označí jako hotové.</li>
-				</ul>
-			</div>
+<div class="help-page">
+	<section class="card help-hero">
+		<div class="help-hero-copy">
+			<p class="help-eyebrow">EasyFlex Web</p>
+			<h1>Nápověda pro práci s fakturami a importem do ABRA Flexi</h1>
+			<p class="help-lead">Vše podstatné na jednom místě: co nastavit, kolik stojí zpracování, jak fungují dávky a kde doplnit firmy a typy dokladů.</p>
+		</div>
+		<div class="help-link-cloud" aria-label="Rychlá navigace">
+			<a href="#zacatek">Začátek</a>
+			<a href="#nastaveni">Nastavení</a>
+			<a href="#workflow">Workflow</a>
+			<a href="#abra-kody">ABRA kódy</a>
+			<a href="#faq">FAQ</a>
+			<a href="#kontakt">Kontakt</a>
 		</div>
 	</section>
 
-	<section class="help-section">
-		<h3>Přidávání firem a typů dokladů pro ABRA Flexi</h3>
-		<p>Vše se nastavuje v části <strong>Nastavení</strong> &rarr; <strong>Import do ABRA</strong>. Správné kódy přebíráme přímo z ABRA Flexi, proto je potřeba je zadat přesně.</p>
-		<div class="help-grid">
-			<div class="help-tile">
-				<h4>Firmy</h4>
-				<ol>
-					<li>Otevřete <strong>Firmy pro ABRA</strong> a klikněte na <em>Přidat firmu</em>.</li>
-					<li><strong>Kód firmy</strong> zkopírujte z adresy webové verze ABRA Flexi: po přihlášení uvidíte v URL část <code>/c/<em>kod_firmy</em>/</code> (např. <code>.../c/mojefirma/...</code>). Stejný kód používá i REST API.</li>
-					<li><strong>Název</strong> je popisek pro váš přehled; doporučujeme použít oficiální název společnosti, aby šel snadno odlišit.</li>
-				</ol>
-			</div>
-			<div class="help-tile">
-				<h4>Typy dokladů</h4>
-				<ol>
-					<li>Nejprve mějte přidanou firmu, pro kterou typ vytváříte.</li>
-					<li>V ABRA Flexi otevřete číselník <strong>Typy dokladů</strong> v dané firmě (lze jej vyhledat přes vyhledávání nebo menu Nastavení).</li>
-					<li>Otevřete konkrétní typ (např. Faktura přijatá) a zkopírujte pole <strong>Kód</strong> / <strong>Zkratka</strong>. Stejná hodnota je vidět i v URL detailu typu dokladu.</li>
-					<li>V EasyFlex vyberte firmu, nastavte <strong>Směr</strong> (<code>faktura-prijata</code> pro dodavatelské faktury, <code>faktura-vydana</code> pro odběratelské) a vložte název i kód přesně tak, jak je v ABRA Flexi.</li>
-					<li>Uložte typ. Při importu se pak tento kód automaticky nabídne pro vybranou firmu a směr.</li>
-				</ol>
-			</div>
+	<section class="help-stat-grid" aria-label="Shrnutí klíčových informací">
+		<div class="help-stat-card">
+			<span class="help-stat-label">Startovní kredit</span>
+			<strong>100 kreditů</strong>
+			<p>Nový uživatel začíná se zůstatkem <code>100</code> kreditů.</p>
+		</div>
+		<div class="help-stat-card">
+			<span class="help-stat-label">PDF extrakce</span>
+			<strong>1 kredit / faktura</strong>
+			<p>Kredit se odečte jen u použitelného výsledku.</p>
+		</div>
+		<div class="help-stat-card">
+			<span class="help-stat-label">Tabulky</span>
+			<strong>2 kredity / soubor</strong>
+			<p>Platí pro CSV, XLSX/XLS i XML soubory.</p>
+		</div>
+		<div class="help-stat-card">
+			<span class="help-stat-label">Dobití</span>
+			<strong>od 100 kreditů</strong>
+			<p>Minimální dobití je <code>100</code> kreditů za <code>50 Kč</code>.</p>
 		</div>
 	</section>
 
-	<section class="help-section">
-		<h3>Časté otázky</h3>
-		<dl class="faq">
-			<dt>Nemám účet nebo jsem zapomněl heslo, co dělat?</dt>
-			<dd>Registrace i obnova hesla se řeší výhradně přes administrátora na <a href="mailto:{{ contact_email }}">{{ contact_email }}</a> nebo <a href="tel:{{ contact_phone }}">{{ contact_phone }}</a>. Samoobsluha zatím není dostupná.</dd>
-
-			<dt>Nenačítá se mi QR kód pro platbu, co dělat?</dt>
-			<dd>Zkontrolujte, zda jste přihlášeni. QR kód je dostupný jen po přihlášení v sekci <strong>Kredity</strong>. Pokud problém přetrvá, napište nebo zavolejte na kontakty níže.</dd>
-
-			<dt>Nemám dostatek kreditů, ale potřebuji rychle zpracovat faktury.</dt>
-			<dd>Dočasně odeberte některé PDF a spusťte zpracování menšího počtu souborů. Současně můžete dobít minimálně 100 kreditů (50 Kč) převodem; variabilní symbol a QR kód jsou v sekci <strong>Kredity</strong>.</dd>
-
-			<dt>Import do ABRA Flexi hlásí chybu ověření.</dt>
-			<dd>Ověřte přihlašovací údaje k ABRA Flexi (server, port, uživatel, heslo) a že je správně zvolená firma i kód typu dokladu. Pokud používáte vlastní certifikát, ověřte, že je server dostupný a volba ověřování TLS odpovídá jeho nastavení.</dd>
-
-			<dt>Co se stane, když je faktura prázdná nebo nečitelná?</dt>
-			<dd>Prázdné výsledky neodečítají kredity. Pokud je text nečitelný, zkuste lepší sken nebo kontaktujte podporu.</dd>
-
-			<dt>Jak funguje označování řádků pro import?</dt>
-			<dd>Každý řádek má přepínač. Jen označené řádky se odešlou do ABRA Flexi. Před importem můžete hodnoty upravit a změny uložit.</dd>
-		</dl>
+	<section id="zacatek" class="card help-section-card">
+		<div class="help-section-head">
+			<p class="help-kicker">1. Rychlý start</p>
+			<h2>Co udělat po prvním přihlášení</h2>
+		</div>
+		<div class="help-step-grid">
+			<article class="help-step-card">
+				<span class="help-step-index">01</span>
+				<h3>Získání přístupu</h3>
+				<p>Registraci, aktivaci účtu i reset hesla řeší podpora na <a href="mailto:{{ contact_email }}">{{ contact_email }}</a> nebo <a href="tel:{{ contact_phone }}">{{ contact_phone }}</a>.</p>
+			</article>
+			<article class="help-step-card">
+				<span class="help-step-index">02</span>
+				<h3>Zkontrolujte kredity</h3>
+				<p>V sekci <strong>Kredity</strong> uvidíte aktuální zůstatek. Nový účet začíná se <code>100</code> kredity a bez kreditů nelze spustit nové zpracování.</p>
+			</article>
+			<article class="help-step-card">
+				<span class="help-step-index">03</span>
+				<h3>Vyplňte ABRA přístup</h3>
+				<p>V <strong>Nastavení</strong> na kartě <strong>ABRA</strong> zadejte server, port, uživatele, heslo a případně vypněte nebo zapněte ověřování TLS podle vašeho serveru.</p>
+			</article>
+			<article class="help-step-card">
+				<span class="help-step-index">04</span>
+				<h3>Přidejte firmy a typy</h3>
+				<p>Na kartě <strong>Import do ABRA</strong> si připravte firmy a typy dokladů, aby se při importu nabízely správné kombinace.</p>
+			</article>
+			<article class="help-step-card">
+				<span class="help-step-index">05</span>
+				<h3>Začněte zpracování</h3>
+				<p>Nahrajte PDF nebo tabulku, zkontrolujte výsledky a až potom spusťte import do ABRA Flexi.</p>
+			</article>
+		</div>
 	</section>
 
-	<section class="help-section">
-		<h3>Kontakt</h3>
-		<p>Registrace, ztracené heslo i další otázky řešíme přímo. Kontaktujte nás:</p>
+	<section id="nastaveni" class="card help-section-card">
+		<div class="help-section-head">
+			<p class="help-kicker">2. Nastavení</p>
+			<h2>Co je potřeba mít správně vyplněné</h2>
+		</div>
+		<div class="help-grid">
+			<article class="help-tile help-tile-strong">
+				<h3>ABRA</h3>
+				<ul>
+					<li>Zadejte adresu serveru, port, uživatelské jméno a heslo pro REST API.</li>
+					<li>Volba ověřování TLS musí odpovídat tomu, zda má server platný certifikát.</li>
+					<li>Bez správně vyplněného ABRA přístupu nepůjde import dokončit.</li>
+				</ul>
+			</article>
+			<article class="help-tile">
+				<h3>Extractor</h3>
+				<ul>
+					<li>Kartu <strong>Extractor</strong> vidí jen administrátor.</li>
+					<li>Administrátor zde spravuje OpenAI klíč a parametry modelu.</li>
+					<li>Běžný uživatel tuto část nevyplňuje.</li>
+				</ul>
+			</article>
+			<article class="help-tile">
+				<h3>Extrakce</h3>
+				<ul>
+					<li>Můžete zapnout dopočítávání chybějících dat nebo použití čísla dokladu jako variabilního symbolu.</li>
+					<li>Volitelně lze zapnout LLM mapování CSV sloupců a auto-import po extrakci nebo načtení tabulky.</li>
+					<li>U PDF lze při nahrání zapnout segmentaci více faktur v jednom souboru.</li>
+				</ul>
+			</article>
+		</div>
+	</section>
+
+	<section id="workflow" class="card help-section-card">
+		<div class="help-section-head">
+			<p class="help-kicker">3. Workflow</p>
+			<h2>Jak funguje zpracování od nahrání po import</h2>
+		</div>
+		<div class="help-flow-grid">
+			<article class="help-flow-card">
+				<h3>PDF faktury</h3>
+				<ul>
+					<li>Můžete vybrat více PDF najednou nebo v moderních prohlížečích nahrát celou složku.</li>
+					<li>Nepodporované soubory se při nahrání přeskočí a aplikace na to upozorní.</li>
+					<li>Extrakce běží na pozadí a výsledky se do dávky doplňují průběžně.</li>
+					<li><code>1</code> kredit se odečítá za každou použitelně zpracovanou fakturu.</li>
+				</ul>
+			</article>
+			<article class="help-flow-card">
+				<h3>Tabulky</h3>
+				<ul>
+					<li>Podporované formáty jsou CSV, XLSX/XLS a XML.</li>
+					<li>Po načtení se vytvoří dávka a za tabulku se odečtou <code>2</code> kredity.</li>
+					<li>Pokud v souboru nejsou nalezené žádné faktury, kredity se neodečtou.</li>
+				</ul>
+			</article>
+			<article class="help-flow-card">
+				<h3>Výsledky a import</h3>
+				<ul>
+					<li>Na stránce <strong>Výsledky</strong> můžete upravovat řádky, vybírat, co se má importovat, a sledovat průběh dávky.</li>
+					<li>Před importem zvolíte firmu, směr a typ dokladu.</li>
+					<li>Úspěšné a chybové řádky se v přehledu rozlišují stavem přímo v tabulce.</li>
+				</ul>
+			</article>
+		</div>
+		<p class="help-note">Prázdné nebo neúspěšné PDF extrakce se neúčtují. Pokud během dávky dojdou kredity, zpracování se zastaví u dalších faktur.</p>
+	</section>
+
+	<section id="abra-kody" class="card help-section-card">
+		<div class="help-section-head">
+			<p class="help-kicker">4. ABRA kódy</p>
+			<h2>Jak správně přidat firmy a typy dokladů</h2>
+		</div>
+		<div class="help-grid">
+			<article class="help-tile">
+				<h3>Firmy</h3>
+				<ol>
+					<li>Otevřete <strong>Nastavení</strong> → <strong>Import do ABRA</strong>.</li>
+					<li>V části <strong>Firmy pro ABRA</strong> přidejte název a kód firmy.</li>
+					<li>Kód firmy zkopírujte z URL ABRA Flexi, kde bývá část <code>/c/kod_firmy/</code>.</li>
+				</ol>
+			</article>
+			<article class="help-tile">
+				<h3>Typy dokladů</h3>
+				<ol>
+					<li>Nejprve vyberte firmu, ke které typ patří.</li>
+					<li>V ABRA otevřete číselník typů dokladů a zkopírujte kód konkrétního typu.</li>
+					<li>V EasyFlex nastavte správný směr: <code>faktura-prijata</code> nebo <code>faktura-vydana</code>.</li>
+					<li>Uložte název i kód přesně ve stejné podobě, jakou používá ABRA.</li>
+				</ol>
+			</article>
+		</div>
+	</section>
+
+	<section id="faq" class="card help-section-card">
+		<div class="help-section-head">
+			<p class="help-kicker">5. FAQ</p>
+			<h2>Nejčastější otázky</h2>
+		</div>
+		<div class="faq-stack">
+			<details class="faq-item" open>
+				<summary>Nemám účet nebo jsem zapomněl heslo</summary>
+				<p>Registrace i obnova hesla se řeší výhradně přes podporu na <a href="mailto:{{ contact_email }}">{{ contact_email }}</a> nebo <a href="tel:{{ contact_phone }}">{{ contact_phone }}</a>. Samoobslužné obnovení hesla není dostupné.</p>
+			</details>
+			<details class="faq-item">
+				<summary>Nenačítá se mi QR kód pro platbu</summary>
+				<p>QR je dostupné jen po přihlášení v sekci <strong>Kredity</strong>. Pokud se nezobrazuje, zkontrolujte přihlášení a případně kontaktujte podporu.</p>
+			</details>
+			<details class="faq-item">
+				<summary>Jak vyplnit platbu za kredity</summary>
+				<p>V sekci <strong>Kredity</strong> najdete číslo účtu, QR kód a instrukci pro zprávu příjemci. Do zprávy pro příjemce uveďte svoje uživatelské jméno, aby šlo platbu správně přiřadit.</p>
+			</details>
+			<details class="faq-item">
+				<summary>Import do ABRA hlásí chybu ověření</summary>
+				<p>Zkontrolujte server, port, uživatele, heslo, správně vybranou firmu a typ dokladu. Pokud používáte vlastní certifikát, ověřte i nastavení TLS.</p>
+			</details>
+			<details class="faq-item">
+				<summary>Co se stane s nečitelnou nebo prázdnou fakturou</summary>
+				<p>Pokud extrakce nevrátí použitelná data, řádek se označí chybou a kredit se za něj neodečte. Pomůže kvalitnější sken nebo ruční kontrola vstupního souboru.</p>
+			</details>
+			<details class="faq-item">
+				<summary>Jak funguje označování řádků pro import</summary>
+				<p>Do ABRA se odešlou jen označené řádky. Před importem můžete hodnoty upravit, výběr změnit a import zkusit znovu.</p>
+			</details>
+		</div>
+	</section>
+
+	<section id="kontakt" class="card help-contact-card">
+		<div>
+			<p class="help-kicker">6. Kontakt</p>
+			<h2>Potřebujete pomoct?</h2>
+			<p class="help-lead small">Registrace, reset hesla i provozní dotazy řešíme přímo.</p>
+		</div>
 		<ul class="contact-list">
 			<li>E-mail: <a href="mailto:{{ contact_email }}">{{ contact_email }}</a></li>
 			<li>Telefon: <a href="tel:{{ contact_phone }}">{{ contact_phone }}</a></li>

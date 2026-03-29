@@ -199,42 +199,6 @@ input[type="file"] {
 	margin-bottom: 8px;
 }
 
-.help-section {
-	margin-top: 24px;
-}
-
-.help-grid {
-	display: grid;
-	grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-	gap: 16px;
-	margin-top: 12px;
-}
-
-.help-tile {
-	background: #f7f8fb;
-	border: 1px solid #e1e3e8;
-	border-radius: 8px;
-	padding: 12px;
-}
-
-.help-tile h4 {
-	margin-top: 0;
-}
-
-.faq {
-	margin: 0;
-}
-
-.faq dt {
-	font-weight: 700;
-	margin-top: 12px;
-}
-
-.faq dd {
-	margin: 4px 0 0 0;
-	color: #404553;
-}
-
 .contact-list {
 	list-style: none;
 	padding: 0;
@@ -343,9 +307,239 @@ input[type="file"] {
 	text-align: center;
 }
 
+.help-page {
+	display: grid;
+	gap: 18px;
+}
+
+.help-hero {
+	display: grid;
+	gap: 18px;
+	background:
+		linear-gradient(135deg, rgba(15, 95, 166, 0.08), rgba(77, 163, 255, 0.14)),
+		#ffffff;
+	border: 1px solid #dbe6f5;
+}
+
+.help-hero h1,
+.help-section-card h2,
+.help-contact-card h2 {
+	margin: 0;
+	line-height: 1.15;
+	text-wrap: balance;
+}
+
+.help-eyebrow,
+.help-kicker,
+.help-stat-label {
+	margin: 0 0 8px;
+	font-size: 12px;
+	font-weight: 800;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: #0f5fa6;
+}
+
+.help-lead {
+	margin: 10px 0 0;
+	max-width: 720px;
+	color: #465062;
+	font-size: 16px;
+	line-height: 1.6;
+}
+
+.help-lead.small {
+	font-size: 15px;
+}
+
+.help-link-cloud {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 10px;
+}
+
+.help-link-cloud a {
+	padding: 8px 12px;
+	border-radius: 999px;
+	background: #f0f5fb;
+	border: 1px solid #d7e2f0;
+	color: #0f5fa6;
+	text-decoration: none;
+	font-weight: 700;
+}
+
+.help-link-cloud a:hover,
+.help-link-cloud a:focus-visible {
+	background: #e2eefc;
+	outline: 2px solid #9ec5ef;
+	outline-offset: 2px;
+}
+
+.help-stat-grid,
+.help-grid,
+.help-step-grid,
+.help-flow-grid {
+	display: grid;
+	gap: 16px;
+}
+
+.help-stat-grid {
+	grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.help-grid,
+.help-flow-grid {
+	grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.help-step-grid {
+	grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.help-stat-card,
+.help-tile,
+.help-step-card,
+.help-flow-card {
+	background: #f8fbff;
+	border: 1px solid #dbe6f5;
+	border-radius: 12px;
+	padding: 16px;
+}
+
+.help-stat-card strong {
+	display: block;
+	font-size: 22px;
+	color: #123d68;
+	margin-bottom: 8px;
+}
+
+.help-stat-card p,
+.help-tile p,
+.help-step-card p,
+.help-flow-card p,
+.help-note,
+.faq-item p {
+	margin: 0;
+	color: #4d5668;
+	line-height: 1.6;
+}
+
+.help-section-card,
+.help-contact-card {
+	border: 1px solid #e0e8f2;
+}
+
+.help-section-card {
+	scroll-margin-top: 24px;
+}
+
+.help-section-head {
+	margin-bottom: 16px;
+}
+
+.help-tile h3,
+.help-step-card h3,
+.help-flow-card h3 {
+	margin: 0 0 10px;
+	color: #16395b;
+}
+
+.help-tile-strong {
+	background: linear-gradient(180deg, #f4f9ff, #f8fbff);
+}
+
+.help-tile ul,
+.help-flow-card ul,
+.help-step-card ul,
+.help-tile ol {
+	margin: 0;
+	padding-left: 18px;
+	color: #4d5668;
+	line-height: 1.65;
+}
+
+.help-step-card {
+	position: relative;
+	padding-top: 52px;
+}
+
+.help-step-index {
+	position: absolute;
+	top: 16px;
+	left: 16px;
+	font-size: 12px;
+	font-weight: 800;
+	letter-spacing: 0.08em;
+	color: #4d82b8;
+}
+
+.help-note {
+	margin-top: 16px;
+	padding: 14px 16px;
+	border-radius: 10px;
+	background: #f1f7ff;
+	border: 1px solid #d7e6f8;
+}
+
+.faq-stack {
+	display: grid;
+	gap: 12px;
+}
+
+.faq-item {
+	border: 1px solid #dbe6f5;
+	border-radius: 12px;
+	background: #fbfdff;
+	padding: 0 16px;
+}
+
+.faq-item summary {
+	cursor: pointer;
+	font-weight: 700;
+	padding: 14px 0;
+	color: #17395d;
+}
+
+.faq-item p {
+	padding: 0 0 14px;
+}
+
+.help-contact-card {
+	display: flex;
+	justify-content: space-between;
+	gap: 20px;
+	align-items: flex-start;
+	background: linear-gradient(135deg, #0f5fa6, #1d78c8);
+	color: #fff;
+}
+
+.help-contact-card .help-kicker,
+.help-contact-card h2,
+.help-contact-card .help-lead,
+.help-contact-card a {
+	color: #fff;
+}
+
+.help-contact-card .contact-list {
+	min-width: 240px;
+	margin: 0;
+}
+
+.help-contact-card .contact-list li + li {
+	margin-top: 10px;
+}
+
 @media (max-width: 720px) {
 	.inline-payment {
 		grid-template-columns: 1fr;
+	}
+
+	.help-contact-card {
+		flex-direction: column;
+	}
+
+	.help-contact-card .contact-list {
+		min-width: 0;
 	}
 }
 

@@ -2,11 +2,9 @@ import logging
 import os
 import json
 import configparser
-from collections import deque
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime
-import threading
 
 try:
 	from dotenv import load_dotenv
@@ -58,12 +56,6 @@ _CONFIG_ENV_KEYS: Tuple[str, ...] = (
 
 _CONFIG_CACHE: Optional["AppConfig"] = None
 _CONFIG_CACHE_STATE: Optional[Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Tuple[Tuple[str, str], ...]]] = None
-
-_LOG_HISTORY_LIMIT = 2000
-_LOG_HANDLER: Optional["_InMemoryLogHandler"] = None
-_LOG_HOOKS_INSTALLED = False
-_ORIGINAL_EXCEPTHOOK = sys.excepthook
-_ORIGINAL_THREAD_EXCEPTHOOK = getattr(threading, "excepthook", None)
 
 
 def _parse_date_order(value: Optional[str]) -> bool:
@@ -147,100 +139,6 @@ class AppConfig:
 	csv_enable_llm_mapping: bool
 
 
-class _InMemoryLogHandler(logging.Handler):
-	"""Simple in-memory handler storing formatted log records for later inspection."""
-
-	def __init__(self, capacity: int = _LOG_HISTORY_LIMIT) -> None:
-		super().__init__(level=logging.NOTSET)
-		self._capacity = capacity
-		self._messages: deque[str] = deque(maxlen=capacity)
-		self._lock = threading.Lock()
-
-	def emit(self, record: logging.LogRecord) -> None:
-		try:
-			message = self.format(record)
-		except Exception:  # noqa: BLE001
-			message = record.getMessage()
-		with self._lock:
-			self._messages.append(message)
-
-	def get_messages(self, limit: Optional[int] = None) -> List[str]:
-		with self._lock:
-			if limit is None or limit <= 0 or limit >= len(self._messages):
-				return list(self._messages)
-			return list(self._messages)[-limit:]
-
-	def clear(self) -> None:
-		with self._lock:
-			self._messages.clear()
-
-
-def _install_exception_hooks() -> None:
-	"""Ensure uncaught exceptions are mirrored to the log buffer for diagnostics."""
-	global _LOG_HOOKS_INSTALLED
-	if _LOG_HOOKS_INSTALLED:
-		return
-
-	def _handle_uncaught(exc_type, exc_value, exc_tb):
-		logging.getLogger("EasyFlex").critical(
-			"Nezachycená výjimka",
-			exc_info=(exc_type, exc_value, exc_tb),
-		)
-		if _ORIGINAL_EXCEPTHOOK and _ORIGINAL_EXCEPTHOOK is not _handle_uncaught:
-			try:
-				_ORIGINAL_EXCEPTHOOK(exc_type, exc_value, exc_tb)
-			except Exception:  # noqa: BLE001
-				pass
-
-	sys.excepthook = _handle_uncaught
-
-	if hasattr(threading, "excepthook") and callable(getattr(threading, "excepthook")):
-		def _handle_thread_uncaught(args):
-			thread_name = getattr(args.thread, "name", None) or f"Thread-{getattr(args.thread, 'ident', '?')}"
-			logging.getLogger(thread_name).critical(
-				f"Nezachycená výjimka ve vlákně {thread_name}",
-				exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
-			)
-			if _ORIGINAL_THREAD_EXCEPTHOOK and _ORIGINAL_THREAD_EXCEPTHOOK is not _handle_thread_uncaught:
-				try:
-					_ORIGINAL_THREAD_EXCEPTHOOK(args)
-				except Exception:  # noqa: BLE001
-					pass
-
-		threading.excepthook = _handle_thread_uncaught  # type: ignore[attr-defined]
-
-	_LOG_HOOKS_INSTALLED = True
-
-
-def setup_logging() -> None:
-	global _LOG_HANDLER
-	logging.basicConfig(
-		level=logging.INFO,
-		format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-	)
-	root_logger = logging.getLogger()
-	if not any(isinstance(handler, _InMemoryLogHandler) for handler in root_logger.handlers):
-		handler = _InMemoryLogHandler(_LOG_HISTORY_LIMIT)
-		handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
-		root_logger.addHandler(handler)
-		_LOG_HANDLER = handler
-	elif _LOG_HANDLER is None:
-		for handler in root_logger.handlers:
-			if isinstance(handler, _InMemoryLogHandler):
-				_LOG_HANDLER = handler
-				break
-
-	_install_exception_hooks()
-
-
-def get_log_messages(limit: Optional[int] = None) -> List[str]:
-	"""Return recorded log lines (oldest first)."""
-	handler = _LOG_HANDLER
-	if handler is None:
-		return []
-	return handler.get_messages(limit)
-
-
 def _default_settings_path() -> Path:
 	"""Path to bundled default settings shipped with the application."""
 	return Path(__file__).resolve().parent / "settings.ini"
@@ -289,57 +187,10 @@ def invalidate_config_cache() -> None:
 	_CONFIG_CACHE_STATE = None
 
 
-def _detect_bundled_poppler() -> Optional[str]:
-	"""Try to locate a bundled Poppler 'bin' folder for pdf2image.
-
-	Checks typical locations in both dev mode (package dir and project root)
-	and when frozen (PyInstaller _MEIPASS or alongside the executable).
-	Returns the path to the directory that contains pdftoppm(.exe) or None.
-	"""
-	candidates: List[Path] = []
-	if getattr(sys, "frozen", False):
-		meipass = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-		candidates += [meipass, Path(sys.executable).parent]
-	# Dev mode: package dir and its parent (project root)
-	package_dir = Path(__file__).resolve().parent
-	project_root = package_dir.parent
-	candidates += [package_dir, project_root]
-
-	bin_name = "pdftoppm.exe" if os.name == "nt" else "pdftoppm"
-	for base in candidates:
-		# Common fixed locations
-		for rel in ("poppler/Library/bin", "poppler/bin", "poppler"):
-			p = base / rel
-			if (p / bin_name).exists():
-				return str(p)
-		# Dynamic: any directory starting with 'poppler' (e.g., poppler-25.07.0)
-		try:
-			for child in base.iterdir():
-				if not child.is_dir():
-					continue
-				name_lower = child.name.lower()
-				if name_lower.startswith("poppler"):
-					for rel in ("Library/bin", "bin", ""):
-						p = child / rel if rel else child
-						if (p / bin_name).exists():
-							return str(p)
-		except Exception:
-			pass
-	return None
-
-
 def get_errors_dir() -> Path:
 	"""Return a user-writable directory for error JSON dumps."""
-	if getattr(sys, "frozen", False):
-		if os.name == "nt":
-			base = Path(os.getenv("APPDATA", Path.home() / "AppData" / "Roaming"))
-		else:
-			base = Path.home() / "Library" / "Application Support"
-		err_dir = base / "EasyFlex" / "errors"
-	else:
-		# Dev mode: prefer project-level errors dir if present
-		project_errors = Path(__file__).resolve().parent.parent / "errors"
-		err_dir = project_errors if project_errors.exists() else _settings_path().parent / "errors"
+	project_errors = Path(__file__).resolve().parent.parent / "errors"
+	err_dir = project_errors if project_errors.exists() else _settings_path().parent / "errors"
 	err_dir.mkdir(parents=True, exist_ok=True)
 	return err_dir
 
@@ -492,8 +343,6 @@ def _load_config_uncached() -> AppConfig:
 		(cp.get("extractor", "poppler_path", fallback=None) if cp.has_section("extractor") else None)
 		or os.getenv("POPPLER_PATH")
 	)
-	if not poppler:
-		poppler = _detect_bundled_poppler()
 	concurrency = int(
 		(cp.get("extractor", "concurrency", fallback="2") if cp.has_section("extractor") else "2")
 		or os.getenv("CONCURRENCY", "2")
