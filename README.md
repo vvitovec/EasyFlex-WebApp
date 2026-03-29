@@ -51,6 +51,15 @@ python -m webapp.app
 
 Aplikace poběží na `http://127.0.0.1:5000/`. Přihlaste se jako `admin` a přejděte na **/settings**, kde nastavíte OpenAI a ABRA přístupové údaje.
 
+### 6) Spuštění workeru
+PDF extrakce i import do ABRA nyní běží přes perzistentní DB frontu. Vedle webu proto spusťte i worker:
+
+```bash
+python -m webapp.worker
+```
+
+Bez workeru se dávky správně zařadí do fronty, ale nebudou se zpracovávat.
+
 ---
 
 ## Uživatelské role a přihlášení
@@ -88,6 +97,7 @@ Aplikace poběží na `http://127.0.0.1:5000/`. Přihlaste se jako `admin` a př
 ### Databáze
 - **Výchozí**: SQLite soubor `webapp/easyflex_web.db`.
 - **PostgreSQL**: nastavte `DATABASE_URL` (např. z Renderu). Aplikace automaticky upraví prefix `postgres://` → `postgresql://`.
+- **Doporučení pro produkci**: PostgreSQL + samostatný worker proces. SQLite je vhodná hlavně pro lokální vývoj a malý provoz.
 
 ### Konfigurační klíče a přístupy
 Většina citlivých údajů se nastavuje **po přihlášení** na stránce `/settings`:
@@ -95,6 +105,12 @@ Většina citlivých údajů se nastavuje **po přihlášení** na stránce `/se
 - `OPENAI_API_KEY` – API klíč (per uživatel)
 - `OPENAI_TIMEOUT_S` – timeout požadavku na OpenAI (výchozí 90 s, lze přepsat v admin nastavení)
 - `PDF_BATCH_MAX_RUNTIME_S` – max. čas běhu jedné PDF dávky na pozadí (výchozí 3600 s)
+- `MAX_CONTENT_LENGTH` – max. velikost celého upload requestu
+- `MAX_PDF_FILES_PER_BATCH` – max. počet PDF v jedné dávce
+- `MAX_PDF_FILE_BYTES` – max. velikost jednoho PDF
+- `MAX_BATCH_TOTAL_BYTES` – max. celková velikost PDF dávky
+- `MAX_BATCH_TOTAL_PAGES` – max. celkový počet stran v PDF dávce
+- `MAX_TABLE_FILE_BYTES` – max. velikost CSV/XLSX/XML souboru
 - `ABRA_SERVER`, `ABRA_PORT`, `ABRA_USERNAME`, `ABRA_PASSWORD`, `ABRA_COMPANY`
 - Volby jako `ABRA_VERIFY_TLS`, kontext firmy, typ dokladu a další
 
@@ -107,6 +123,8 @@ Admin může nastavit výchozí extrakční parametry pro ostatní uživatele (m
 - Každé nahrání nebo import z tabulky vytvoří **dávku**.
 - Dávka obsahuje všechny řádky a metadata (název, typ zdroje, datum vytvoření).
 - Dávky lze znovu otevřít, upravit a importovat opakovaně.
+- PDF extrakce i ABRA import se ukládají jako **persistentní joby** do DB a po restartu workeru se obnoví.
+- Výsledky velkých batchů se na stránce `/results/<id>` načítají stránkovaně.
 
 ---
 
@@ -115,6 +133,12 @@ Admin může nastavit výchozí extrakční parametry pro ostatní uživatele (m
 - **Web DB**: `webapp/easyflex_web.db` (pokud nepoužíváte PostgreSQL).
 - **Chybové JSONy z ABRA importu**: ukládají se do `errors/` nebo do uživatelského profilu (dle prostředí).
 - **Cache extrakce**: v uživatelském profilu `.../EasyFlex/cache`.
+- **Batch storage**: nahraná PDF se ukládají do `instance/batches/<batch_id>/`.
+- Úklid starých batch artifactů:
+
+```bash
+python -m webapp.cleanup_batches
+```
 
 ---
 
@@ -144,12 +168,19 @@ Admin může nastavit výchozí extrakční parametry pro ostatní uživatele (m
 
 ## Produkční nasazení (stručně)
 
+- Repo nově obsahuje `Procfile` se dvěma procesy: `web` a `worker`.
+- V produkci nastavte `EASYFLEX_ENV=production`; aplikace v tomto režimu odmítne start bez `EASYFLEX_SECRET_KEY`.
 - Produkční server lze spustit přes `gunicorn`:
 ```bash
 gunicorn "webapp.app:app" --timeout 180 --graceful-timeout 30 --workers 2
 ```
+- Worker spusťte jako samostatný proces ve stejném deploymentu:
+```bash
+python -m webapp.worker
+```
 - Pro PostgreSQL nastavte `DATABASE_URL`.
 - Doporučeno nastavit silný `EASYFLEX_SECRET_KEY` a zabezpečit přístup k `/settings`.
+- Doporučený runtime: **Python 3.11 nebo 3.12**.
 
 ---
 

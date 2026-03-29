@@ -5,6 +5,7 @@ import os
 from getpass import getpass
 
 from .app import app
+from .constants import STARTING_CREDITS
 from .models import User, db
 
 
@@ -21,12 +22,12 @@ def main() -> None:
 			user.is_admin = True
 			user.set_password(password)
 			if user.credits is None:
-				user.credits = 100
+				user.credits = STARTING_CREDITS
 			action = "aktualizován"
 		else:
 			user = User(username="admin", is_admin=True)
 			user.set_password(password)
-			user.credits = 100
+			user.credits = STARTING_CREDITS
 			db.session.add(user)
 			action = "vytvořen"
 		db.session.commit()

@@ -8,14 +8,14 @@
 		<div class="credit-value">{{ current_user.credits or 0 }}</div>
 		<div class="credit-label">aktuální zůstatek</div>
 	</div>
-	<p class="muted">Nový uživatel dostává 100 kreditů zdarma na vyzkoušení.</p>
+	<p class="muted">Nový uživatel dostává {{ starting_credits }} kreditů zdarma na vyzkoušení.</p>
 </div>
 
 <div class="card">
 	<h3>Ceník funkcí</h3>
 	<ul>
-		<li>Extrakce faktury z PDF: <strong>1 kredit</strong> za každou fakturu.</li>
-		<li>Extrakce faktury z tabulky (CSV/XLSX/XML): <strong>2 kredity</strong> za celou tabulku.</li>
+		<li>Extrakce faktury z PDF: <strong>{{ pdf_invoice_credit_cost }} kredit</strong> za každou fakturu.</li>
+		<li>Extrakce faktury z tabulky (CSV/XLSX/XML): <strong>{{ table_upload_credit_cost }} kreditů</strong> za celou tabulku.</li>
 	</ul>
 </div>
 

@@ -10,7 +10,7 @@ from flask_login import (
 	LoginManager,
 )
 
-from .models import User
+from .models import User, db
 
 auth_bp = Blueprint("auth", __name__)
 login_manager = LoginManager()
@@ -20,7 +20,7 @@ login_manager.login_view = "auth.login"
 @login_manager.user_loader
 def load_user(user_id: str) -> User | None:  # pragma: no cover - simple loader
 	try:
-		return User.query.get(int(user_id))
+		return db.session.get(User, int(user_id))
 	except Exception:
 		return None
 

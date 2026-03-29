@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 import logging
 import re
 import time
@@ -12,6 +12,12 @@ from sqlalchemy.exc import OperationalError
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
+
+from .constants import STARTING_CREDITS
+from .constants import (
+	JOB_STATUS_QUEUED,
+	ROW_IMPORT_STATUS_PENDING,
+)
 
 db = SQLAlchemy()
 logger = logging.getLogger(__name__)
@@ -208,6 +214,10 @@ def _ensure_counter_column(engine, *, table_name: str, column_name: str) -> None
 	_execute_migration_sql(engine, f"ALTER TABLE {table_name} ADD COLUMN {column_name} INTEGER DEFAULT 0 NOT NULL")
 
 
+def _utcnow_naive() -> datetime:
+	return datetime.now(UTC).replace(tzinfo=None)
+
+
 class User(db.Model, UserMixin):
 	"""Simple user model for web authentication."""
 
@@ -215,7 +225,12 @@ class User(db.Model, UserMixin):
 	username = db.Column(db.String(80), unique=True, nullable=False)
 	password_hash = db.Column(db.String(255), nullable=False)
 	is_admin = db.Column(db.Boolean, default=False, nullable=False)
-	credits = db.Column(db.Integer, default=100, nullable=False, server_default=text("100"))
+	credits = db.Column(
+		db.Integer,
+		default=STARTING_CREDITS,
+		nullable=False,
+		server_default=text(str(STARTING_CREDITS)),
+	)
 	settings = db.relationship(
 		"UserSettings",
 		uselist=False,
@@ -303,7 +318,7 @@ class InvoiceBatch(db.Model):
 	user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
 	source_label = db.Column(db.String(255), nullable=True)
 	source_type = db.Column(db.String(32), nullable=True)  # e.g., pdf/table
-	created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+	created_at = db.Column(db.DateTime, default=_utcnow_naive, nullable=False)
 	processing_status = db.Column(db.String(32), nullable=False, default="completed", server_default=text("'completed'"))
 	total_files = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
 	processed_files = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
@@ -313,13 +328,16 @@ class InvoiceBatch(db.Model):
 	success_count = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
 	error_count = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
 	credits_charged = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
+	selected_count = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
 	started_at = db.Column(db.DateTime, nullable=True)
 	finished_at = db.Column(db.DateTime, nullable=True)
 	last_heartbeat_at = db.Column(db.DateTime, nullable=True)
+	active_job_type = db.Column(db.String(64), nullable=True)
 	summary_message = db.Column(db.Text, nullable=True)
 
 	user = db.relationship("User", back_populates="batches")
 	rows = db.relationship("InvoiceRow", back_populates="batch", cascade="all, delete-orphan")
+	jobs = db.relationship("BatchJob", back_populates="batch", cascade="all, delete-orphan")
 
 
 class InvoiceRow(db.Model):
@@ -328,14 +346,70 @@ class InvoiceRow(db.Model):
 	id = db.Column(db.Integer, primary_key=True)
 	batch_id = db.Column(db.Integer, db.ForeignKey("invoice_batch.id"), nullable=False)
 	row_index = db.Column(db.Integer, nullable=False)
+	source_file_index = db.Column(db.Integer, nullable=True)
+	source_invoice_index = db.Column(db.Integer, nullable=True)
 	source = db.Column(db.String(255), nullable=True)
 	invoice_data = db.Column(db.JSON, nullable=True)
 	warning = db.Column(db.Text, nullable=True)
 	error = db.Column(db.Text, nullable=True)
 	status = db.Column(db.String(120), nullable=True)
 	marked_for_import = db.Column(db.Boolean, default=True, nullable=False)
+	import_status = db.Column(
+		db.String(32),
+		nullable=False,
+		default=ROW_IMPORT_STATUS_PENDING,
+		server_default=text(f"'{ROW_IMPORT_STATUS_PENDING}'"),
+	)
+	import_attempts = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
+	imported_at = db.Column(db.DateTime, nullable=True)
+	last_import_error = db.Column(db.Text, nullable=True)
 
 	batch = db.relationship("InvoiceBatch", back_populates="rows")
+
+	__table_args__ = (
+		db.UniqueConstraint(
+			"batch_id",
+			"source_file_index",
+			"source_invoice_index",
+			name="uq_invoice_row_batch_source_invoice",
+		),
+	)
+
+
+class BatchJob(db.Model):
+	"""Persistent background job for batch extraction/import."""
+
+	id = db.Column(db.Integer, primary_key=True)
+	batch_id = db.Column(db.Integer, db.ForeignKey("invoice_batch.id"), nullable=False, index=True)
+	user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+	job_type = db.Column(db.String(64), nullable=False)
+	status = db.Column(
+		db.String(32),
+		nullable=False,
+		default=JOB_STATUS_QUEUED,
+		server_default=text(f"'{JOB_STATUS_QUEUED}'"),
+		index=True,
+	)
+	priority = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
+	attempt_count = db.Column(db.Integer, nullable=False, default=0, server_default=text("0"))
+	max_attempts = db.Column(db.Integer, nullable=False, default=3, server_default=text("3"))
+	claimed_by = db.Column(db.String(255), nullable=True)
+	claimed_at = db.Column(db.DateTime, nullable=True)
+	last_heartbeat_at = db.Column(db.DateTime, nullable=True, index=True)
+	started_at = db.Column(db.DateTime, nullable=True)
+	finished_at = db.Column(db.DateTime, nullable=True)
+	created_at = db.Column(db.DateTime, default=_utcnow_naive, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+	resume_cursor = db.Column(db.JSON, nullable=True)
+	payload = db.Column(db.JSON, nullable=True)
+	summary_message = db.Column(db.Text, nullable=True)
+	last_error = db.Column(db.Text, nullable=True)
+
+	batch = db.relationship("InvoiceBatch", back_populates="jobs")
+	user = db.relationship("User")
+
+	__table_args__ = (
+		db.Index("ix_batch_job_status_type_claimed", "status", "job_type", "claimed_at"),
+	)
 
 
 def init_db(app) -> None:
@@ -353,7 +427,10 @@ def init_db(app) -> None:
 			user_columns = {col["name"] for col in insp.get_columns("user")}
 			if "credits" not in user_columns:
 				table_name = '"user"' if engine.dialect.name == "postgresql" else "user"
-				_execute_migration_sql(engine, f"ALTER TABLE {table_name} ADD COLUMN credits INTEGER DEFAULT 100 NOT NULL")
+				_execute_migration_sql(
+					engine,
+					f"ALTER TABLE {table_name} ADD COLUMN credits INTEGER DEFAULT {STARTING_CREDITS} NOT NULL",
+				)
 			batch_columns = {col["name"] for col in insp.get_columns("invoice_batch")}
 			if "processing_status" not in batch_columns:
 				_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN processing_status VARCHAR(32) DEFAULT 'completed' NOT NULL")
@@ -381,6 +458,35 @@ def init_db(app) -> None:
 				_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN last_heartbeat_at TIMESTAMP")
 			if "summary_message" not in batch_columns:
 				_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN summary_message TEXT")
+			if "selected_count" not in batch_columns:
+				_ensure_counter_column(engine, table_name="invoice_batch", column_name="selected_count")
+			if "active_job_type" not in batch_columns:
+				_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN active_job_type VARCHAR(64)")
+			row_columns = {col["name"] for col in insp.get_columns("invoice_row")}
+			if "source_file_index" not in row_columns:
+				_execute_migration_sql(engine, "ALTER TABLE invoice_row ADD COLUMN source_file_index INTEGER")
+			if "source_invoice_index" not in row_columns:
+				_execute_migration_sql(engine, "ALTER TABLE invoice_row ADD COLUMN source_invoice_index INTEGER")
+			if "import_status" not in row_columns:
+				_execute_migration_sql(engine, f"ALTER TABLE invoice_row ADD COLUMN import_status VARCHAR(32) DEFAULT '{ROW_IMPORT_STATUS_PENDING}' NOT NULL")
+			if "import_attempts" not in row_columns:
+				_ensure_counter_column(engine, table_name="invoice_row", column_name="import_attempts")
+			if "imported_at" not in row_columns:
+				_execute_migration_sql(engine, "ALTER TABLE invoice_row ADD COLUMN imported_at TIMESTAMP")
+			if "last_import_error" not in row_columns:
+				_execute_migration_sql(engine, "ALTER TABLE invoice_row ADD COLUMN last_import_error TEXT")
+			# `batch_job` is created by SQLAlchemy for new DBs. Existing DBs may need explicit create_all rerun.
+			# Build metadata indexes/constraints that are safe to recreate.
+			db.create_all()
+			job_tables = insp.get_table_names()
+			if "batch_job" in job_tables:
+				job_columns = {col["name"] for col in insp.get_columns("batch_job")}
+				if "created_at" not in job_columns:
+					_execute_migration_sql(engine, "ALTER TABLE batch_job ADD COLUMN created_at TIMESTAMP")
+				if "resume_cursor" not in job_columns:
+					_execute_migration_sql(engine, "ALTER TABLE batch_job ADD COLUMN resume_cursor TEXT")
+				if "payload" not in job_columns:
+					_execute_migration_sql(engine, "ALTER TABLE batch_job ADD COLUMN payload TEXT")
 			# If the process restarted while batch processing was in-flight, expose partial results as interrupted.
 			# Keep this update narrowly scoped to avoid heavy startup scans.
 			with engine.begin() as conn:

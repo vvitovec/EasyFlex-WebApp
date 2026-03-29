@@ -4,13 +4,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from sqlalchemy.orm import joinedload
+from sqlalchemy import Float, String, cast, func
 
 from EasyFlex.date_helpers import domysleni_chybejicich_datumu
 from EasyFlex.invoice_warnings import get_warning, set_warning
 from EasyFlex.models import InvoiceData
 
 from .models import InvoiceBatch, InvoiceRow, User, db
+from .constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 
 
 DISPLAY_COLUMNS: List[str] = [
@@ -155,6 +156,8 @@ def create_batch_from_results(user: User, results: List[Any], source_label: str,
 		row = InvoiceRow(
 			batch=batch,
 			row_index=idx,
+			source_file_index=0,
+			source_invoice_index=idx + 1,
 			source=source_name or source_label,
 			invoice_data=invoice_dict,
 			warning=warning_text,
@@ -170,6 +173,7 @@ def create_batch_from_results(user: User, results: List[Any], source_label: str,
 	batch.success_count = success_count
 	batch.error_count = error_count
 	batch.credits_charged = success_count if source_type == "pdf" else 0
+	batch.selected_count = success_count
 	batch.processing_status = "completed_with_errors" if error_count else "completed"
 	batch.summary_message = (
 		f"Dokončeno: {batch.success_count} úspěšně, {batch.error_count} s chybou, "
@@ -194,6 +198,7 @@ def create_batch_from_invoices(user: User, invoices: List[Any], source_label: st
 		success_count=len(invoices),
 		error_count=0,
 		credits_charged=0,
+		selected_count=len(invoices),
 		summary_message=f"Načteno {len(invoices)} faktur z tabulky.",
 	)
 	db.session.add(batch)
@@ -206,6 +211,8 @@ def create_batch_from_invoices(user: User, invoices: List[Any], source_label: st
 		row = InvoiceRow(
 			batch=batch,
 			row_index=idx,
+			source_file_index=0,
+			source_invoice_index=idx + 1,
 			source=f"{source_label} #{idx + 1}",
 			invoice_data=invoice_dict,
 			warning=warning_text,
@@ -220,14 +227,89 @@ def create_batch_from_invoices(user: User, invoices: List[Any], source_label: st
 def load_batch_for_user(batch_id: int, user: User) -> Optional[InvoiceBatch]:
 	return (
 		InvoiceBatch.query.filter_by(id=batch_id, user_id=user.id)
-		.options(joinedload(InvoiceBatch.rows))
 		.first()
 	)
 
 
-def rows_for_display(batch: InvoiceBatch) -> list[dict]:
+def _numeric_json_expr(key: str):
+	return cast(InvoiceRow.invoice_data[key], Float)
+
+
+def _text_json_expr(key: str):
+	return cast(InvoiceRow.invoice_data[key], String)
+
+
+def _apply_row_filter(query, filter_name: Optional[str]):
+	name = (filter_name or "all").strip().lower()
+	if name == "errors":
+		return query.filter((InvoiceRow.error.isnot(None)) | (InvoiceRow.import_status == "failed"))
+	if name == "success":
+		return query.filter(InvoiceRow.error.is_(None), InvoiceRow.invoice_data.isnot(None))
+	if name == "pending_import":
+		return query.filter(InvoiceRow.marked_for_import.is_(True), InvoiceRow.import_status.in_(["pending", "running", "failed"]))
+	if name == "imported":
+		return query.filter(InvoiceRow.import_status == "imported")
+	return query
+
+
+def _resolve_sort_expression(sort_key: Optional[str]):
+	key = (sort_key or "row_index").strip()
+	if key in {"row_index", "source_file_index", "source_invoice_index"}:
+		return getattr(InvoiceRow, key)
+	if key in {"source", "status", "error", "import_status", "soubor"}:
+		return InvoiceRow.source if key in {"source", "soubor"} else getattr(InvoiceRow, key)
+	if key in {"upozorneni"}:
+		return InvoiceRow.warning
+	if key in {
+		"zaklad_dane",
+		"zaklad_dane_0",
+		"zaklad_dane_12",
+		"zaklad_dane_21",
+		"vyse_dph",
+		"vyse_dph_12",
+		"vyse_dph_21",
+		"celkova_cena",
+	}:
+		return _numeric_json_expr(key)
+	return _text_json_expr(key)
+
+
+def query_rows_for_batch(
+	batch: InvoiceBatch,
+	*,
+	page: int = 1,
+	page_size: int = DEFAULT_PAGE_SIZE,
+	sort_key: str = "row_index",
+	sort_direction: str = "asc",
+	filter_name: str = "all",
+):
+	page = max(1, int(page or 1))
+	page_size = max(1, min(MAX_PAGE_SIZE, int(page_size or DEFAULT_PAGE_SIZE)))
+	query = InvoiceRow.query.filter(InvoiceRow.batch_id == batch.id)
+	query = _apply_row_filter(query, filter_name)
+	total_count = query.with_entities(func.count(InvoiceRow.id)).scalar() or 0
+	sort_expr = _resolve_sort_expression(sort_key)
+	if (sort_direction or "asc").strip().lower() == "desc":
+		query = query.order_by(sort_expr.desc().nullslast(), InvoiceRow.row_index.desc())
+	else:
+		query = query.order_by(sort_expr.asc().nullslast(), InvoiceRow.row_index.asc())
+	rows = query.offset((page - 1) * page_size).limit(page_size).all()
+	return rows, int(total_count)
+
+
+def count_selected_rows(batch_id: int) -> int:
+	return (
+		db.session.query(func.count(InvoiceRow.id))
+		.filter(InvoiceRow.batch_id == batch_id, InvoiceRow.marked_for_import.is_(True))
+		.scalar()
+		or 0
+	)
+
+
+def rows_for_display(batch: InvoiceBatch, row_items: Optional[Iterable[InvoiceRow]] = None) -> list[dict]:
 	rows: list[dict] = []
-	for row in sorted(batch.rows, key=lambda r: r.row_index):
+	items = list(row_items) if row_items is not None else sorted(batch.rows, key=lambda r: r.row_index)
+	for row in items:
 		invoice_dict = dict(row.invoice_data or {})
 		warning_text = _normalize_warning_text(row.warning) or _normalize_warning_text(invoice_dict.get("upozorneni"))
 		if warning_text:
@@ -240,6 +322,7 @@ def rows_for_display(batch: InvoiceBatch) -> list[dict]:
 			"warning": warning_text or "bez problému",
 			"error": row.error,
 			"status": row.status,
+			"import_status": row.import_status,
 			"marked_for_import": bool(row.marked_for_import),
 		})
 	return rows

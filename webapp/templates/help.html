@@ -21,23 +21,23 @@
 	<section class="help-stat-grid" aria-label="Shrnutí klíčových informací">
 		<div class="help-stat-card">
 			<span class="help-stat-label">Startovní kredit</span>
-			<strong>100 kreditů</strong>
-			<p>Nový uživatel začíná se zůstatkem <code>100</code> kreditů.</p>
+			<strong>{{ starting_credits }} kreditů</strong>
+			<p>Nový uživatel začíná se zůstatkem <code>{{ starting_credits }}</code> kreditů.</p>
 		</div>
 		<div class="help-stat-card">
 			<span class="help-stat-label">PDF extrakce</span>
-			<strong>1 kredit / faktura</strong>
+			<strong>{{ pdf_invoice_credit_cost }} kredit / faktura</strong>
 			<p>Kredit se odečte jen u použitelného výsledku.</p>
 		</div>
 		<div class="help-stat-card">
 			<span class="help-stat-label">Tabulky</span>
-			<strong>2 kredity / soubor</strong>
+			<strong>{{ table_upload_credit_cost }} kreditů / soubor</strong>
 			<p>Platí pro CSV, XLSX/XLS i XML soubory.</p>
 		</div>
 		<div class="help-stat-card">
 			<span class="help-stat-label">Dobití</span>
-			<strong>od 100 kreditů</strong>
-			<p>Minimální dobití je <code>100</code> kreditů za <code>50 Kč</code>.</p>
+			<strong>od {{ min_credit_purchase }} kreditů</strong>
+			<p>Minimální dobití je <code>{{ min_credit_purchase }}</code> kreditů za <code>{{ "%.0f"|format(price_per_credit * min_credit_purchase) }} Kč</code>.</p>
 		</div>
 	</section>
 
@@ -55,7 +55,7 @@
 			<article class="help-step-card">
 				<span class="help-step-index">02</span>
 				<h3>Zkontrolujte kredity</h3>
-				<p>V sekci <strong>Kredity</strong> uvidíte aktuální zůstatek. Nový účet začíná se <code>100</code> kredity a bez kreditů nelze spustit nové zpracování.</p>
+				<p>V sekci <strong>Kredity</strong> uvidíte aktuální zůstatek. Nový účet začíná se <code>{{ starting_credits }}</code> kredity a bez kreditů nelze spustit nové zpracování.</p>
 			</article>
 			<article class="help-step-card">
 				<span class="help-step-index">03</span>
@@ -90,14 +90,6 @@
 				</ul>
 			</article>
 			<article class="help-tile">
-				<h3>Extractor</h3>
-				<ul>
-					<li>Kartu <strong>Extractor</strong> vidí jen administrátor.</li>
-					<li>Administrátor zde spravuje OpenAI klíč a parametry modelu.</li>
-					<li>Běžný uživatel tuto část nevyplňuje.</li>
-				</ul>
-			</article>
-			<article class="help-tile">
 				<h3>Extrakce</h3>
 				<ul>
 					<li>Můžete zapnout dopočítávání chybějících dat nebo použití čísla dokladu jako variabilního symbolu.</li>
@@ -120,14 +112,14 @@
 					<li>Můžete vybrat více PDF najednou nebo v moderních prohlížečích nahrát celou složku.</li>
 					<li>Nepodporované soubory se při nahrání přeskočí a aplikace na to upozorní.</li>
 					<li>Extrakce běží na pozadí a výsledky se do dávky doplňují průběžně.</li>
-					<li><code>1</code> kredit se odečítá za každou použitelně zpracovanou fakturu.</li>
+					<li><code>{{ pdf_invoice_credit_cost }}</code> kredit se odečítá za každou použitelně zpracovanou fakturu.</li>
 				</ul>
 			</article>
 			<article class="help-flow-card">
 				<h3>Tabulky</h3>
 				<ul>
 					<li>Podporované formáty jsou CSV, XLSX/XLS a XML.</li>
-					<li>Po načtení se vytvoří dávka a za tabulku se odečtou <code>2</code> kredity.</li>
+					<li>Po načtení se vytvoří dávka a za tabulku se odečte <code>{{ table_upload_credit_cost }}</code> kreditů.</li>
 					<li>Pokud v souboru nejsou nalezené žádné faktury, kredity se neodečtou.</li>
 				</ul>
 			</article>

@@ -1,5 +1,6 @@
 import importlib
 import io
+import json
 
 from sqlalchemy.exc import OperationalError
 
@@ -55,15 +56,6 @@ def test_admin_init_operational_error_is_handled(monkeypatch) -> None:
 	app = app_module.create_app()
 	monkeypatch.setenv("EASYFLEX_ADMIN_PASSWORD", "secret")
 
-	class _DummyQuery:
-		def filter_by(self, **kwargs):
-			return self
-
-		def first(self):
-			raise OperationalError("SELECT 1", {}, Exception("boom"))
-
-	monkeypatch.setattr(app_module.User, "query", _DummyQuery())
-
 	rollback_called = {"value": False}
 	remove_called = {"value": False}
 
@@ -80,11 +72,19 @@ def test_admin_init_operational_error_is_handled(monkeypatch) -> None:
 	run_once = next(func for func in before_funcs if func.__name__ == "_run_admin_init_once")
 
 	with app.test_request_context("/"):
+		class _DummyQuery:
+			def filter_by(self, **kwargs):
+				return self
+
+			def first(self):
+				raise OperationalError("SELECT 1", {}, Exception("boom"))
+
+		monkeypatch.setattr(app_module.User, "query", _DummyQuery(), raising=False)
 		run_once()
 
 	assert rollback_called["value"] is True
 	assert remove_called["value"] is True
-	assert app.config.get("_ADMIN_INITIALIZED") is False
+	assert app.config.get("_ADMIN_INITIALIZED") is not True
 
 
 def test_upload_pdf_creates_queued_batch_and_redirects(monkeypatch, tmp_path) -> None:
@@ -93,18 +93,6 @@ def test_upload_pdf_creates_queued_batch_and_redirects(monkeypatch, tmp_path) ->
 	app.config["TESTING"] = True
 	_create_user(app_module, app)
 	monkeypatch.setattr(app_module, "ensure_seed_data", lambda *_args, **_kwargs: None)
-
-	captured = {}
-
-	def _fake_start(app_obj, *, batch_id, user_id, saved_files, job_dir, runtime_limit_s):
-		captured["app_obj"] = app_obj
-		captured["batch_id"] = batch_id
-		captured["user_id"] = user_id
-		captured["saved_files"] = saved_files
-		captured["job_dir"] = job_dir
-		captured["runtime_limit_s"] = runtime_limit_s
-
-	monkeypatch.setattr(app_module, "_start_pdf_batch_job", _fake_start)
 
 	client = app.test_client()
 	_login(client)
@@ -121,17 +109,21 @@ def test_upload_pdf_creates_queued_batch_and_redirects(monkeypatch, tmp_path) ->
 	)
 	assert resp.status_code == 302
 	assert "/results/" in resp.headers["Location"]
-	assert "batch_id" in captured
-	assert len(captured["saved_files"]) == 2
 
 	with app.app_context():
-		batch = app_module.db.session.get(app_module.InvoiceBatch, captured["batch_id"])
+		job = app_module.BatchJob.query.order_by(app_module.BatchJob.id.desc()).first()
+		assert job is not None
+		assert job.job_type == "extract_pdf"
+		assert job.status == "queued"
+		batch = app_module.db.session.get(app_module.InvoiceBatch, job.batch_id)
 		assert batch is not None
 		assert batch.processing_status == "queued"
 		assert batch.total_files == 2
 		assert batch.processed_files == 0
 		assert batch.success_count == 0
 		assert batch.error_count == 0
+		payload = json.loads(app_module.batch_payload_path(batch.id).read_text(encoding="utf-8"))
+		assert len(payload["files"]) == 2
 
 
 def test_batch_progress_endpoint_returns_json(monkeypatch, tmp_path) -> None:
@@ -185,7 +177,48 @@ def test_batch_progress_endpoint_returns_json(monkeypatch, tmp_path) -> None:
 	assert payload["total_invoices_estimate"] == 5
 	assert payload["current_phase"] == "persisting"
 	assert payload["row_count"] == 1
+	assert payload["selected_count"] == 0
 	assert payload["is_terminal"] is False
+
+
+def test_selection_endpoint_persists_checkbox_state(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+	user_id = _create_user(app_module, app)
+	monkeypatch.setattr(app_module, "ensure_seed_data", lambda *_args, **_kwargs: None)
+
+	with app.app_context():
+		user = app_module.db.session.get(app_module.User, user_id)
+		batch = app_module.InvoiceBatch(user=user, source_label="Test", source_type="table", processing_status="completed")
+		app_module.db.session.add(batch)
+		app_module.db.session.flush()
+		row = app_module.InvoiceRow(
+			batch=batch,
+			row_index=0,
+			source="row-1",
+			invoice_data={"cislo_dokladu": "A1"},
+			marked_for_import=True,
+		)
+		app_module.db.session.add(row)
+		app_module.db.session.commit()
+		batch_id = batch.id
+		row_id = row.id
+
+	client = app.test_client()
+	_login(client)
+	resp = client.post(
+		f"/results/{batch_id}/selection",
+		json={"row_id": row_id, "marked": False},
+	)
+	assert resp.status_code == 200
+	payload = resp.get_json()
+	assert payload["marked"] is False
+
+	with app.app_context():
+		row = app_module.db.session.get(app_module.InvoiceRow, row_id)
+		assert row is not None
+		assert row.marked_for_import is False
 
 
 def test_db_write_retry_retries_operational_error(monkeypatch, tmp_path) -> None:

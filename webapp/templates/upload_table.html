@@ -5,7 +5,7 @@
 	<h2>Nahrát tabulku s fakturami</h2>
 	<p>Podporované formáty: CSV, XLSX/XLS, XML.</p>
 	<p class="muted">Během zpracování prosím nezavírejte okno.</p>
-	<p><strong>Cena:</strong> 2 kredity za celou tabulku. Aktuální zůstatek: {{ current_user.credits or 0 }} kreditů.</p>
+	<p><strong>Cena:</strong> {{ table_upload_credit_cost }} kreditů za celou tabulku. Aktuální zůstatek: {{ current_user.credits or 0 }} kreditů.</p>
 	{% if error %}
 		<div class="flash danger">{{ error }}</div>
 	{% endif %}

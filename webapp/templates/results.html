@@ -11,16 +11,17 @@
 			class="batch-progress-card"
 			data-batch-progress
 			data-progress-url="{{ url_for('batch_progress', batch_id=batch.id) }}"
-			data-view-url="{{ url_for('view_results', batch_id=batch.id) }}"
+			data-view-url="{{ url_for('view_results', batch_id=batch.id, page=page, page_size=page_size, filter=filter_name, sort=sort_key, sort_dir=sort_direction, company_code=selected_company, direction=selected_direction, doc_type_code=selected_doc_type) }}"
 			data-status="{{ batch_progress.status }}"
-			data-processed="{{ batch_progress.processed_files }}"
-			data-processed-invoices="{{ batch_progress.processed_invoices }}"
 			data-row-count="{{ batch_progress.row_count }}"
 			data-terminal="{% if batch_progress.is_terminal %}1{% else %}0{% endif %}"
 		>
 			<div class="batch-progress-head">
 				<strong id="batch-status-label">{{ batch_progress.status_label }}</strong>
-				<span id="batch-progress-text">{{ batch_progress.processed_files }}/{{ batch_progress.total_files }} PDF</span>
+				<span id="batch-job-label">
+					{% if batch_progress.active_job_type == 'extract_pdf' %}Extrakce PDF{% elif batch_progress.active_job_type == 'import_abra' %}Import do ABRA{% else %}Bez aktivního jobu{% endif %}
+					{% if batch_progress.active_job_status_label %}• {{ batch_progress.active_job_status_label }}{% endif %}
+				</span>
 			</div>
 			<div class="batch-progress-head">
 				<strong id="batch-phase-label">{{ batch_progress.current_phase_label }}</strong>
@@ -30,16 +31,45 @@
 				<div class="batch-progress-fill" id="batch-progress-fill" style="width: {{ batch_progress.invoice_progress_percent }}%;"></div>
 			</div>
 			<div class="batch-progress-meta">
-				<span>Úspěšně: <strong id="batch-success-count">{{ batch_progress.success_count }}</strong></span>
-				<span>Chyby: <strong id="batch-error-count">{{ batch_progress.error_count }}</strong></span>
+				<span>PDF: <strong id="batch-progress-text">{{ batch_progress.processed_files }}/{{ batch_progress.total_files }}</strong></span>
+				<span>Úspěšně extrahováno: <strong id="batch-success-count">{{ batch_progress.success_count }}</strong></span>
+				<span>Extrakční chyby: <strong id="batch-error-count">{{ batch_progress.error_count }}</strong></span>
+				<span>Označeno k importu: <strong id="batch-selected-count">{{ batch_progress.selected_count }}</strong></span>
+				<span>Importováno: <strong id="batch-imported-count">{{ batch_progress.imported_count }}</strong></span>
+				<span>Import chyb: <strong id="batch-import-failed-count">{{ batch_progress.import_failed_count }}</strong></span>
+				<span>Přeskočeno: <strong id="batch-import-skipped-count">{{ batch_progress.import_skipped_count }}</strong></span>
 				<span>Kredity: <strong id="batch-credits-count">{{ batch_progress.credits_charged }}</strong></span>
-				<span>Zbývá souborů: <strong id="batch-remaining-count">{{ batch_progress.remaining_files }}</strong></span>
-				<span>Zbývá faktur (odhad): <strong id="batch-remaining-invoices-count">{{ batch_progress.remaining_invoices }}</strong></span>
 			</div>
 			<p class="muted" id="batch-summary-text">{{ batch_progress.summary_message or "Čeká na zpracování…" }}</p>
 			<p class="muted" id="batch-heartbeat-text">Poslední heartbeat: {{ batch_progress.last_heartbeat_at or "—" }}</p>
 		</div>
 	{% endif %}
+
+	<form method="get" action="{{ url_for('view_results', batch_id=batch.id) }}" class="form inline" id="results-filter-form">
+		<input type="hidden" name="company_code" value="{{ selected_company or '' }}">
+		<input type="hidden" name="direction" value="{{ selected_direction or '' }}">
+		<input type="hidden" name="doc_type_code" value="{{ selected_doc_type or '' }}">
+		<input type="hidden" name="sort" value="{{ sort_key }}">
+		<input type="hidden" name="sort_dir" value="{{ sort_direction }}">
+		<label for="filter-select">Filtr</label>
+		<select id="filter-select" name="filter">
+			<option value="all" {% if filter_name == 'all' %}selected{% endif %}>Vše</option>
+			<option value="errors" {% if filter_name == 'errors' %}selected{% endif %}>Jen chyby</option>
+			<option value="success" {% if filter_name == 'success' %}selected{% endif %}>Jen validní</option>
+			<option value="pending_import" {% if filter_name == 'pending_import' %}selected{% endif %}>Čeká na import</option>
+			<option value="imported" {% if filter_name == 'imported' %}selected{% endif %}>Importováno</option>
+		</select>
+		<label for="page-size-select">Řádků</label>
+		<select id="page-size-select" name="page_size">
+			{% for size in (25, 50, 100, 200) %}
+				<option value="{{ size }}" {% if page_size == size %}selected{% endif %}>{{ size }}</option>
+			{% endfor %}
+		</select>
+		<input type="hidden" name="page" value="1">
+		<button type="submit" class="secondary">Použít</button>
+		<span class="muted">Celkem řádků: {{ total_rows }}</span>
+	</form>
+
 	{% if not rows %}
 		{% if batch_progress and not batch_progress.is_terminal %}
 			<p>Zatím nejsou k dispozici žádné řádky. Výsledky se objeví průběžně během zpracování.</p>
@@ -79,10 +109,8 @@
 				</select>
 			</div>
 			<div class="context-actions">
-				{% if allow_import %}
-					<button type="button" class="secondary" id="toggle-all-import">Označit vše</button>
-				{% endif %}
-				<button type="submit" class="secondary" formmethod="get" formaction="{{ url_for('view_results', batch_id=batch.id) }}">Aktualizovat výběr</button>
+				<button type="button" class="secondary" id="toggle-page-import">Přepnout stránku</button>
+				<button type="button" class="secondary" id="toggle-filter-import">Přepnout filtr</button>
 				<button type="submit">Importovat označené do ABRA</button>
 			</div>
 		</div>
@@ -90,28 +118,38 @@
 			<table class="results">
 				<thead>
 					<tr>
-						{% if allow_import %}<th>Import</th>{% endif %}
+						<th>Import</th>
 						<th>Akce</th>
 						{% for col in columns %}
-							<th class="sortable" data-col="{{ col }}" aria-sort="none">
+							<th class="sortable" data-col="{{ col }}" data-sort-key="{{ col }}">
 								{{ column_labels.get(col, col) }}
-								<span class="sort-indicator" aria-hidden="true">↕</span>
+								<span class="sort-indicator" aria-hidden="true">
+									{% if sort_key == col %}{% if sort_direction == 'asc' %}▲{% else %}▼{% endif %}{% else %}↕{% endif %}
+								</span>
 							</th>
 						{% endfor %}
-						<th class="sortable" data-col="status" aria-sort="none">
+						<th class="sortable" data-col="status" data-sort-key="status">
 							Stav / Chyba
-							<span class="sort-indicator" aria-hidden="true">↕</span>
+							<span class="sort-indicator" aria-hidden="true">
+								{% if sort_key == 'status' %}{% if sort_direction == 'asc' %}▲{% else %}▼{% endif %}{% else %}↕{% endif %}
+							</span>
 						</th>
 					</tr>
 				</thead>
 				<tbody>
 					{% for row in rows %}
-						<tr class="{% if row.error %}row-error{% elif row.status %}row-success{% endif %}">
-							{% if allow_import %}
+						<tr class="{% if row.error or row.import_status == 'failed' %}row-error{% elif row.status or row.import_status == 'imported' %}row-success{% endif %}">
 							<td>
-								<input type="checkbox" name="import_row_ids" value="{{ row.id }}" {% if row.marked_for_import and not row.error %}checked{% endif %}>
+								<input
+									type="checkbox"
+									name="import_row_ids"
+									value="{{ row.id }}"
+									data-import-checkbox
+									data-row-id="{{ row.id }}"
+									{% if row.marked_for_import and not row.error %}checked{% endif %}
+									{% if row.error %}disabled{% endif %}
+								>
 							</td>
-							{% endif %}
 							<td><a class="button small" href="{{ url_for('edit_invoice', row_id=row.id) }}">Upravit</a></td>
 							{% for col in columns %}
 								{% set value = row.invoice.get(col) %}
@@ -123,18 +161,36 @@
 									<td>{{ value if value is not none else '' }}</td>
 								{% endif %}
 							{% endfor %}
-							<td>{{ row.error or row.status or "—" }}</td>
+							<td>
+								{{ row.error or row.status or "—" }}
+								{% if row.import_status and row.import_status != 'pending' %}
+									<div class="muted">Import: {{ row.import_status }}</div>
+								{% endif %}
+							</td>
 						</tr>
 					{% endfor %}
 				</tbody>
 			</table>
 		</div>
 	</form>
+
+	<div class="pagination muted">
+		{% set prev_page = page - 1 %}
+		{% set next_page = page + 1 %}
+		{% if page > 1 %}
+			<a href="{{ url_for('view_results', batch_id=batch.id, page=prev_page, page_size=page_size, filter=filter_name, sort=sort_key, sort_dir=sort_direction, company_code=selected_company, direction=selected_direction, doc_type_code=selected_doc_type) }}">Předchozí</a>
+		{% endif %}
+		<span>Strana {{ page }} / {{ page_count }}</span>
+		{% if page < page_count %}
+			<a href="{{ url_for('view_results', batch_id=batch.id, page=next_page, page_size=page_size, filter=filter_name, sort=sort_key, sort_dir=sort_direction, company_code=selected_company, direction=selected_direction, doc_type_code=selected_doc_type) }}">Další</a>
+		{% endif %}
+	</div>
+
 	<div class="inline-forms">
 		<div class="inline-form-section">
 			<h3>Vytvoření nové firmy</h3>
 			<form id="add-company-form" method="post" action="{{ url_for('add_company_route') }}" class="form inline">
-				<input type="hidden" name="next" value="{{ url_for('view_results', batch_id=batch.id) }}">
+				<input type="hidden" name="next" value="{{ url_for('view_results', batch_id=batch.id, page=page, page_size=page_size, filter=filter_name, sort=sort_key, sort_dir=sort_direction, company_code=selected_company, direction=selected_direction, doc_type_code=selected_doc_type) }}">
 				<label for="new_company_name">Nová firma</label>
 				<input id="new_company_name" name="company_name" type="text" placeholder="Název">
 				<label for="new_company_code">Kód</label>
@@ -147,7 +203,7 @@
 		<div class="inline-form-section">
 			<h3>Vytvoření nového typu</h3>
 			<form id="add-doc-type-form" method="post" action="{{ url_for('add_doc_type_route') }}" class="form inline">
-				<input type="hidden" name="next" value="{{ url_for('view_results', batch_id=batch.id) }}">
+				<input type="hidden" name="next" value="{{ url_for('view_results', batch_id=batch.id, page=page, page_size=page_size, filter=filter_name, sort=sort_key, sort_dir=sort_direction, company_code=selected_company, direction=selected_direction, doc_type_code=selected_doc_type) }}">
 				<label for="new_doc_type_company">Firma</label>
 				<select id="new_doc_type_company" name="company_code" required>
 					<option value="">Vyberte</option>
@@ -182,12 +238,21 @@
 		const docTypeCompanySelect = document.getElementById('new_doc_type_company');
 		const docTypeDirectionSelect = document.getElementById('new_doc_type_direction');
 		const contextRefreshUrl = "{{ url_for('view_results', batch_id=batch.id) }}";
-		const toggleAllBtn = document.getElementById('toggle-all-import');
-		const importCheckboxSelector = 'input[name="import_row_ids"]';
+		const selectionUrl = "{{ url_for('update_batch_selection', batch_id=batch.id) }}";
+		const bulkSelectionUrl = "{{ url_for('bulk_update_batch_selection', batch_id=batch.id) }}";
+		const filterName = "{{ filter_name }}";
 		const progressRoot = document.querySelector('[data-batch-progress]');
 		const progressUrl = progressRoot ? progressRoot.dataset.progressUrl : null;
 		const progressViewUrl = progressRoot ? progressRoot.dataset.viewUrl : null;
+		const checkboxes = Array.from(document.querySelectorAll('[data-import-checkbox]'));
+		const togglePageBtn = document.getElementById('toggle-page-import');
+		const toggleFilterBtn = document.getElementById('toggle-filter-import');
+		const selectedCountEl = document.getElementById('batch-selected-count');
+		const importedCountEl = document.getElementById('batch-imported-count');
+		const importFailedCountEl = document.getElementById('batch-import-failed-count');
+		const importSkippedCountEl = document.getElementById('batch-import-skipped-count');
 		const progressLabelEl = document.getElementById('batch-status-label');
+		const progressJobEl = document.getElementById('batch-job-label');
 		const progressTextEl = document.getElementById('batch-progress-text');
 		const progressPhaseEl = document.getElementById('batch-phase-label');
 		const progressInvoiceTextEl = document.getElementById('batch-invoice-progress-text');
@@ -197,18 +262,92 @@
 		const progressSuccessEl = document.getElementById('batch-success-count');
 		const progressErrorEl = document.getElementById('batch-error-count');
 		const progressCreditsEl = document.getElementById('batch-credits-count');
-		const progressRemainingEl = document.getElementById('batch-remaining-count');
-		const progressRemainingInvoicesEl = document.getElementById('batch-remaining-invoices-count');
 		let lastKnownStatus = progressRoot ? (progressRoot.dataset.status || "") : "";
-		let lastKnownProcessed = progressRoot ? Number(progressRoot.dataset.processed || "0") : 0;
-		let lastKnownProcessedInvoices = progressRoot ? Number(progressRoot.dataset.processedInvoices || "0") : 0;
 		let lastKnownRowCount = progressRoot ? Number(progressRoot.dataset.rowCount || "0") : 0;
 		let lastReloadAt = Date.now();
+
+		function buildCurrentParams() {
+			const params = new URLSearchParams(window.location.search);
+			if (companySelect && companySelect.value) params.set('company_code', companySelect.value);
+			if (directionSelect && directionSelect.value) params.set('direction', directionSelect.value);
+			if (docTypeSelect && docTypeSelect.value) params.set('doc_type_code', docTypeSelect.value);
+			return params;
+		}
+
+		function syncCompanyFormContext() {
+			if (!companyForm) return;
+			const directionField = companyForm.querySelector('input[name="direction"]');
+			const docTypeField = companyForm.querySelector('input[name="doc_type_code"]');
+			if (directionField && directionSelect) directionField.value = directionSelect.value || "";
+			if (docTypeField && docTypeSelect) docTypeField.value = docTypeSelect.value || "";
+		}
+
+		function syncDocTypeFormContext() {
+			if (docTypeCompanySelect && companySelect) docTypeCompanySelect.value = companySelect.value || "";
+			if (docTypeDirectionSelect && directionSelect) docTypeDirectionSelect.value = directionSelect.value || "";
+		}
+
+		function refreshContext(resetDocType) {
+			const params = buildCurrentParams();
+			if (resetDocType) params.delete('doc_type_code');
+			window.location.href = `${contextRefreshUrl}?${params.toString()}`;
+		}
+
+		function getPageCheckboxes() {
+			return checkboxes.filter((cb) => !cb.disabled);
+		}
+
+		async function persistRowSelection(rowId, marked) {
+			const response = await fetch(selectionUrl, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ row_id: rowId, marked })
+			});
+			if (!response.ok) return null;
+			return response.json();
+		}
+
+		async function persistBulkSelection(scope, marked) {
+			const body = { scope, marked, filter: filterName };
+			if (scope === 'page') {
+				body.row_ids = getPageCheckboxes().map((cb) => Number(cb.dataset.rowId));
+			}
+			const response = await fetch(bulkSelectionUrl, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(body)
+			});
+			if (!response.ok) return null;
+			return response.json();
+		}
+
+		async function togglePageSelection() {
+			const boxes = getPageCheckboxes();
+			const shouldCheck = boxes.some((cb) => !cb.checked);
+			boxes.forEach((cb) => { cb.checked = shouldCheck; });
+			const payload = await persistBulkSelection('page', shouldCheck);
+			if (payload && selectedCountEl) selectedCountEl.textContent = String(payload.selected_count || 0);
+		}
+
+		async function toggleFilterSelection() {
+			const shouldCheck = getPageCheckboxes().some((cb) => !cb.checked);
+			const payload = await persistBulkSelection('filtered', shouldCheck);
+			if (payload && selectedCountEl) selectedCountEl.textContent = String(payload.selected_count || 0);
+			window.location.reload();
+		}
 
 		function updateProgress(payload) {
 			if (!payload || !progressRoot) return;
 			if (progressLabelEl) progressLabelEl.textContent = payload.status_label || payload.status || "";
-			if (progressTextEl) progressTextEl.textContent = `${payload.processed_files}/${payload.total_files} PDF`;
+			if (progressJobEl) {
+				const jobLabel = payload.active_job_type === 'extract_pdf'
+					? 'Extrakce PDF'
+					: payload.active_job_type === 'import_abra'
+						? 'Import do ABRA'
+						: 'Bez aktivního jobu';
+				progressJobEl.textContent = payload.active_job_status_label ? `${jobLabel} • ${payload.active_job_status_label}` : jobLabel;
+			}
+			if (progressTextEl) progressTextEl.textContent = `${payload.processed_files}/${payload.total_files}`;
 			if (progressPhaseEl) progressPhaseEl.textContent = payload.current_phase_label || "Zpracování";
 			if (progressInvoiceTextEl) progressInvoiceTextEl.textContent = `${payload.processed_invoices || 0}/${payload.total_invoices_estimate || 0} faktur`;
 			if (progressFillEl) progressFillEl.style.width = `${payload.invoice_progress_percent || 0}%`;
@@ -216,9 +355,11 @@
 			if (progressHeartbeatEl) progressHeartbeatEl.textContent = `Poslední heartbeat: ${payload.last_heartbeat_at || "—"}`;
 			if (progressSuccessEl) progressSuccessEl.textContent = String(payload.success_count || 0);
 			if (progressErrorEl) progressErrorEl.textContent = String(payload.error_count || 0);
+			if (selectedCountEl) selectedCountEl.textContent = String(payload.selected_count || 0);
+			if (importedCountEl) importedCountEl.textContent = String(payload.imported_count || 0);
+			if (importFailedCountEl) importFailedCountEl.textContent = String(payload.import_failed_count || 0);
+			if (importSkippedCountEl) importSkippedCountEl.textContent = String(payload.import_skipped_count || 0);
 			if (progressCreditsEl) progressCreditsEl.textContent = String(payload.credits_charged || 0);
-			if (progressRemainingEl) progressRemainingEl.textContent = String(payload.remaining_files || 0);
-			if (progressRemainingInvoicesEl) progressRemainingInvoicesEl.textContent = String(payload.remaining_invoices || 0);
 		}
 
 		async function pollProgress() {
@@ -229,57 +370,17 @@
 				const payload = await response.json();
 				updateProgress(payload);
 				const now = Date.now();
-				const changed =
-					(payload.status !== lastKnownStatus) ||
-					(Number(payload.processed_files || 0) !== lastKnownProcessed) ||
-					(Number(payload.processed_invoices || 0) !== lastKnownProcessedInvoices) ||
-					(Number(payload.row_count || 0) !== lastKnownRowCount);
+				const changed = (payload.status !== lastKnownStatus) || (Number(payload.row_count || 0) !== lastKnownRowCount);
 				if (changed && progressViewUrl && (now - lastReloadAt) > 4000) {
 					lastReloadAt = now;
 					window.location.href = progressViewUrl;
 					return;
 				}
 				lastKnownStatus = payload.status || "";
-				lastKnownProcessed = Number(payload.processed_files || 0);
-				lastKnownProcessedInvoices = Number(payload.processed_invoices || 0);
 				lastKnownRowCount = Number(payload.row_count || 0);
 			} catch (_err) {
-				// Polling errors should not break interactions on this page.
+				// Do not break the page when polling fails.
 			}
-		}
-
-		function syncCompanyFormContext() {
-			if (!companyForm) return;
-			const directionField = companyForm.querySelector('input[name="direction"]');
-			const docTypeField = companyForm.querySelector('input[name="doc_type_code"]');
-			if (directionField && directionSelect) {
-				directionField.value = directionSelect.value || "";
-			}
-			if (docTypeField && docTypeSelect) {
-				docTypeField.value = docTypeSelect.value || "";
-			}
-		}
-
-		function syncDocTypeFormContext() {
-			if (docTypeCompanySelect && companySelect) {
-				docTypeCompanySelect.value = companySelect.value || "";
-			}
-			if (docTypeDirectionSelect && directionSelect) {
-				docTypeDirectionSelect.value = directionSelect.value || "";
-			}
-		}
-
-		function refreshContext(options = {}) {
-			const resetDocType = options.resetDocType;
-			if (resetDocType && docTypeSelect) {
-				docTypeSelect.value = "";
-			}
-			const params = new URLSearchParams();
-			if (companySelect && companySelect.value) params.set('company_code', companySelect.value);
-			if (directionSelect && directionSelect.value) params.set('direction', directionSelect.value);
-			if (!resetDocType && docTypeSelect && docTypeSelect.value) params.set('doc_type_code', docTypeSelect.value);
-			const query = params.toString();
-			window.location.href = query ? `${contextRefreshUrl}?${query}` : contextRefreshUrl;
 		}
 
 		syncCompanyFormContext();
@@ -288,126 +389,43 @@
 		if (companySelect) companySelect.addEventListener('change', () => {
 			syncCompanyFormContext();
 			syncDocTypeFormContext();
-			refreshContext({ resetDocType: true });
+			refreshContext(true);
 		});
 		if (directionSelect) directionSelect.addEventListener('change', () => {
 			syncCompanyFormContext();
 			syncDocTypeFormContext();
-			refreshContext({ resetDocType: true });
+			refreshContext(true);
 		});
 		if (docTypeSelect) docTypeSelect.addEventListener('change', syncCompanyFormContext);
+		if (togglePageBtn) togglePageBtn.addEventListener('click', togglePageSelection);
+		if (toggleFilterBtn) toggleFilterBtn.addEventListener('click', toggleFilterSelection);
 
-		function getImportCheckboxes() {
-			return Array.from(document.querySelectorAll(importCheckboxSelector)).filter(cb => !cb.disabled);
-		}
-
-		function updateToggleLabel() {
-			if (!toggleAllBtn) return;
-			const boxes = getImportCheckboxes();
-			const allChecked = boxes.length > 0 && boxes.every(cb => cb.checked);
-			toggleAllBtn.textContent = allChecked ? "Odoznačit vše" : "Označit vše";
-		}
-
-		if (toggleAllBtn) {
-			toggleAllBtn.addEventListener('click', () => {
-				const boxes = getImportCheckboxes();
-				const shouldCheck = boxes.some(cb => !cb.checked);
-				boxes.forEach(cb => { cb.checked = shouldCheck; });
-				updateToggleLabel();
+		checkboxes.forEach((checkbox) => {
+			checkbox.addEventListener('change', async () => {
+				const payload = await persistRowSelection(Number(checkbox.dataset.rowId), checkbox.checked);
+				if (payload && selectedCountEl) selectedCountEl.textContent = String(payload.selected_count || 0);
 			});
-			getImportCheckboxes().forEach(cb => cb.addEventListener('change', updateToggleLabel));
-			updateToggleLabel();
-		}
+		});
+
+		document.querySelectorAll('th.sortable[data-sort-key]').forEach((header) => {
+			header.addEventListener('click', () => {
+				const params = buildCurrentParams();
+				const nextKey = header.dataset.sortKey;
+				const currentKey = "{{ sort_key }}";
+				const currentDir = "{{ sort_direction }}";
+				const nextDir = currentKey === nextKey && currentDir === 'asc' ? 'desc' : 'asc';
+				params.set('sort', nextKey);
+				params.set('sort_dir', nextDir);
+				params.set('filter', "{{ filter_name }}");
+				params.set('page_size', "{{ page_size }}");
+				params.set('page', '1');
+				window.location.href = `${contextRefreshUrl}?${params.toString()}`;
+			});
+		});
 
 		if (progressRoot && progressRoot.dataset.terminal !== "1") {
 			pollProgress();
 			setInterval(pollProgress, 3000);
-		}
-
-		const dateColumns = new Set(["datum_vystaveni", "datum_duzp", "datum_splatnosti"]);
-		const numberColumns = new Set([
-			"zaklad_dane",
-			"zaklad_dane_0",
-			"zaklad_dane_12",
-			"zaklad_dane_21",
-			"vyse_dph",
-			"vyse_dph_12",
-			"vyse_dph_21",
-			"celkova_cena",
-		]);
-
-		function detectType(colKey) {
-			if (dateColumns.has(colKey)) return "date";
-			if (numberColumns.has(colKey)) return "number";
-			return "text";
-		}
-
-		function parseValue(rawText, type) {
-			const text = (rawText || "").trim();
-			if (!text) return null;
-			if (type === "date") {
-				const ts = Date.parse(text);
-				return Number.isNaN(ts) ? null : ts;
-			}
-			if (type === "number") {
-				const normalized = text
-					.replace(/[\s\u00A0\u202F]/g, "")
-					.replace(/(?<=\d)\.(?=\d{3}(?:\D|$))/g, "")
-					.replace(",", ".");
-				const num = parseFloat(normalized);
-				return Number.isNaN(num) ? null : num;
-			}
-			return text.toLowerCase();
-		}
-
-		function compareRows(a, b, cellIndex, type, direction) {
-			const aval = parseValue(a.cells[cellIndex]?.textContent || "", type);
-			const bval = parseValue(b.cells[cellIndex]?.textContent || "", type);
-			const dirMultiplier = direction === "asc" ? 1 : -1;
-			if (aval === null && bval === null) return 0;
-			if (aval === null) return 1;
-			if (bval === null) return -1;
-			if (type === "text") {
-				return aval.localeCompare(bval, "cs", { sensitivity: "base" }) * dirMultiplier;
-			}
-			const diff = aval - bval;
-			return diff === 0 ? 0 : diff > 0 ? dirMultiplier : -dirMultiplier;
-		}
-
-		const resultsTable = document.querySelector(".results");
-		if (resultsTable) {
-			const tbody = resultsTable.querySelector("tbody");
-			const headerCells = Array.from(resultsTable.querySelectorAll("thead th"));
-			let sortState = null;
-
-			function updateIndicators(activeIndex, direction) {
-				headerCells.forEach((th, idx) => {
-					const indicator = th.querySelector(".sort-indicator");
-					const isActive = idx === activeIndex;
-					th.setAttribute("aria-sort", isActive ? (direction === "asc" ? "ascending" : "descending") : "none");
-					if (indicator) {
-						indicator.textContent = isActive ? (direction === "asc" ? "▲" : "▼") : "↕";
-						indicator.style.opacity = isActive ? "0.85" : "0.55";
-					}
-				});
-			}
-
-			headerCells.forEach((th) => {
-				if (!th.classList.contains("sortable")) return;
-				const colKey = th.dataset.col;
-				const cellIndex = headerCells.indexOf(th);
-				th.addEventListener("click", () => {
-					const type = detectType(colKey);
-					const nextDir = sortState && sortState.index === cellIndex && sortState.direction === "desc" ? "asc" : "desc";
-					const rows = Array.from(tbody.querySelectorAll("tr"));
-					rows.sort((a, b) => compareRows(a, b, cellIndex, type, nextDir));
-					rows.forEach((row) => tbody.appendChild(row));
-					sortState = { index: cellIndex, direction: nextDir };
-					updateIndicators(cellIndex, nextDir);
-				});
-			});
-
-			updateIndicators(-1, "asc");
 		}
 	})();
 </script>

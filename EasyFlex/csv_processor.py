@@ -33,6 +33,9 @@ from charset_normalizer import from_path as cn_from_path
 
 logger = logging.getLogger(__name__)
 
+CSV_CHUNK_THRESHOLD_BYTES = 4 * 1024 * 1024
+CSV_CHUNK_SIZE = 1000
+
 
 XL_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
@@ -238,14 +241,15 @@ class CSVProcessor:
 		"""Načte libovolnou tabulku (CSV/XLSX/XML) a vrátí InvoiceData objekty."""
 		try:
 			path = Path(table_path)
+			if path.suffix.lower() in {".csv", ".txt"} and path.exists() and path.stat().st_size >= CSV_CHUNK_THRESHOLD_BYTES:
+				return self._process_csv_in_chunks(path)
 			df = self._load_table(path)
 			return self._process_dataframe(df, str(path))
 		except Exception:
 			self.logger.exception("Chyba při zpracování souboru %s", table_path)
 			raise
 
-	def _process_dataframe(self, df: pd.DataFrame, source_label: str) -> List[InvoiceData]:
-		self.logger.info("Načtena tabulka: %s, řádků: %s", source_label, len(df))
+	def _normalize_dataframe_columns(self, df: pd.DataFrame) -> pd.DataFrame:
 		df = df.copy()
 		if isinstance(df.columns, pd.MultiIndex):
 			raw_columns = [
@@ -255,6 +259,11 @@ class CSVProcessor:
 		else:
 			raw_columns = [str(col) for col in df.columns]
 		df.columns = [self._clean_header_name(col) for col in raw_columns]
+		return df
+
+	def _process_dataframe(self, df: pd.DataFrame, source_label: str) -> List[InvoiceData]:
+		self.logger.info("Načtena tabulka: %s, řádků: %s", source_label, len(df))
+		df = self._normalize_dataframe_columns(df)
 
 		# Infer column mapping before iterating rows (LLM-assisted with fallback)
 		self._column_map = self._infer_column_map(df)
@@ -265,16 +274,42 @@ class CSVProcessor:
 			)
 
 		invoices: List[InvoiceData] = []
-		for index, row in df.iterrows():
+		for index, row_values in enumerate(df.itertuples(index=False, name=None), start=1):
+			row = dict(zip(df.columns, row_values))
 			try:
-				invoice_data = self._map_row_to_invoice_data(row, index + 1)
+				invoice_data = self._map_row_to_invoice_data(row, index)
 				if invoice_data:
 					invoices.append(invoice_data)
 			except Exception as exc:  # noqa: BLE001
-				self.logger.error("Chyba při zpracování řádku %s: %s", index + 1, exc)
+				self.logger.error("Chyba při zpracování řádku %s: %s", index, exc)
 				continue
 
 		self.logger.info("Úspěšně zpracováno %s faktur z tabulky", len(invoices))
+		return invoices
+
+	def _process_csv_in_chunks(self, path: Path) -> List[InvoiceData]:
+		self.logger.info("Načítám CSV po částech: %s", path)
+		encoding = "utf-8"
+		try:
+			best = cn_from_path(str(path)).best()
+			if best is not None and best.encoding:
+				encoding = best.encoding
+		except Exception:
+			pass
+		chunks = pd.read_csv(path, sep=None, engine="python", encoding=encoding, chunksize=CSV_CHUNK_SIZE)
+		invoices: List[InvoiceData] = []
+		processed_rows = 0
+		for chunk_index, chunk in enumerate(chunks):
+			chunk = self._normalize_dataframe_columns(chunk)
+			if chunk_index == 0:
+				self._column_map = self._infer_column_map(chunk)
+			for row_number, row_values in enumerate(chunk.itertuples(index=False, name=None), start=1):
+				row = dict(zip(chunk.columns, row_values))
+				invoice = self._map_row_to_invoice_data(row, processed_rows + row_number)
+				if invoice:
+					invoices.append(invoice)
+			processed_rows += len(chunk)
+		self.logger.info("Úspěšně zpracováno %s faktur z chunkovaného CSV", len(invoices))
 		return invoices
 
 	def _load_table(self, path: Path) -> pd.DataFrame:
@@ -699,8 +734,23 @@ class CSVProcessor:
 		except (ValueError, TypeError):
 			return None
 
-	def _safe_get(self, row: pd.Series, column_name: str) -> Optional[str]:
+	def _safe_get(self, row: Any, column_name: str) -> Optional[str]:
 		try:
+			if isinstance(row, dict):
+				if column_name in row:
+					value = row[column_name]
+					if pd.isna(value) or value == "":
+						return None
+					return str(value).strip()
+				target = self._target_by_label.get(column_name)
+				if target:
+					mapped_header = self._column_map.get(target)
+					if mapped_header and mapped_header in row:
+						value = row[mapped_header]
+						if pd.isna(value) or value == "":
+							return None
+						return str(value).strip()
+				return None
 			# 1) Přímý název sloupce
 			if column_name in row.index:
 				value = row[column_name]

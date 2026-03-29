@@ -29,23 +29,33 @@ from sqlalchemy.exc import OperationalError
 from werkzeug.utils import secure_filename
 
 from EasyFlex.config import load_config
-from EasyFlex.extractor import InvoiceExtractor, ExtractResult
-from EasyFlex.csv_processor import CSVProcessor
-from EasyFlex.abra import import_to_abra
 from EasyFlex.date_helpers import DATE_FIELDS, parse_invoice_date
 from EasyFlex.invoice_warnings import get_warning, set_warning
 from EasyFlex.models import InvoiceData
 
-from .models import init_db, db, User, InvoiceBatch, InvoiceRow
+from .models import init_db, db, User, UserSettings, InvoiceBatch, InvoiceRow, BatchJob
 from .auth import init_auth
 from .config_utils import EXTRACTOR_OVERRIDE_KEYS, get_user_config, get_user_config_for_user
 from .invoice_batches import (
 	DISPLAY_COLUMNS,
 	COLUMN_LABELS,
+	_apply_row_filter,
 	apply_invoice_updates,
+	count_selected_rows,
 	create_batch_from_invoices,
 	load_batch_for_user,
+	query_rows_for_batch,
 	rows_for_display,
+)
+from .batch_jobs import (
+	active_job_for_batch,
+	batch_payload_path,
+	is_terminal_batch_status,
+	job_status_label,
+	persist_batch_payload,
+	queue_batch_job,
+	utcnow,
+	batch_storage_root,
 )
 from .abra_context import (
 	add_company as store_company,
@@ -60,50 +70,38 @@ from .abra_context import (
 	delete_company,
 	delete_doc_type,
 )
-
-logger = logging.getLogger(__name__)
-
-BATCH_STATUS_QUEUED = "queued"
-BATCH_STATUS_RUNNING = "running"
-BATCH_STATUS_COMPLETED = "completed"
-BATCH_STATUS_COMPLETED_WITH_ERRORS = "completed_with_errors"
-BATCH_STATUS_PARTIAL_TIMEOUT = "partial_timeout"
-BATCH_STATUS_INTERRUPTED = "interrupted"
-BATCH_STATUS_FAILED = "failed"
-
-BATCH_TERMINAL_STATUSES = {
+from .constants import (
+	BATCH_PHASE_LABELS,
 	BATCH_STATUS_COMPLETED,
 	BATCH_STATUS_COMPLETED_WITH_ERRORS,
-	BATCH_STATUS_PARTIAL_TIMEOUT,
-	BATCH_STATUS_INTERRUPTED,
 	BATCH_STATUS_FAILED,
-}
+	BATCH_STATUS_IMPORTING,
+	BATCH_STATUS_INTERRUPTED,
+	BATCH_STATUS_LABELS,
+	BATCH_STATUS_PARTIAL_TIMEOUT,
+	BATCH_STATUS_QUEUED,
+	BATCH_STATUS_RUNNING,
+	BATCH_STATUS_WAITING_IMPORT,
+	DEFAULT_MAX_BATCH_TOTAL_BYTES,
+	DEFAULT_MAX_BATCH_TOTAL_PAGES,
+	DEFAULT_MAX_PDF_FILE_BYTES,
+	DEFAULT_MAX_PDF_FILES_PER_BATCH,
+	DEFAULT_MAX_TABLE_FILE_BYTES,
+	DEFAULT_MAX_UPLOAD_BYTES,
+	DEFAULT_PAGE_SIZE,
+	JOB_TYPE_EXTRACT_PDF,
+	JOB_TYPE_IMPORT_ABRA,
+	MAX_PAGE_SIZE,
+	MIN_CREDIT_PURCHASE,
+	PDF_INVOICE_CREDIT_COST,
+	PRICE_PER_CREDIT,
+	STARTING_CREDITS,
+	TABLE_UPLOAD_CREDIT_COST,
+)
 
-BATCH_STATUS_LABELS = {
-	BATCH_STATUS_QUEUED: "Ve frontě",
-	BATCH_STATUS_RUNNING: "Zpracovává se",
-	BATCH_STATUS_COMPLETED: "Dokončeno",
-	BATCH_STATUS_COMPLETED_WITH_ERRORS: "Dokončeno s chybami",
-	BATCH_STATUS_PARTIAL_TIMEOUT: "Částečný výsledek (časový limit)",
-	BATCH_STATUS_INTERRUPTED: "Přerušeno",
-	BATCH_STATUS_FAILED: "Selhalo",
-}
-
-_BATCH_PHASE_LABELS = {
-	"queued": "Ve frontě",
-	"initializing": "Inicializace",
-	"extracting": "Extrakce PDF",
-	"persisting": "Ukládání výsledků",
-	"importing": "Auto-import do ABRA",
-	"finalizing": "Dokončení dávky",
-	"done": "Hotovo",
-}
-
-_BATCH_THREADS: dict[int, threading.Thread] = {}
-_BATCH_THREADS_LOCK = threading.Lock()
+logger = logging.getLogger(__name__)
 _DEFAULT_PDF_BATCH_MAX_RUNTIME_S = 60 * 60
 _DEFAULT_DB_COMMIT_RETRY_ATTEMPTS = 3
-_DEFAULT_HEARTBEAT_INTERVAL_S = 8
 
 _DbResultT = TypeVar("_DbResultT")
 
@@ -178,6 +176,55 @@ def _dedupe_filename(base_name: str, used: set[str], *, fallback: str) -> str:
 	return candidate
 
 
+def _env_int(name: str, default: int, *, minimum: Optional[int] = None) -> int:
+	raw = (os.getenv(name) or "").strip()
+	if not raw:
+		value = default
+	else:
+		try:
+			value = int(raw)
+		except ValueError:
+			value = default
+	if minimum is not None:
+		return max(minimum, value)
+	return value
+
+
+def _pdf_upload_limits() -> dict[str, int]:
+	return {
+		"max_request_bytes": _env_int("MAX_CONTENT_LENGTH", DEFAULT_MAX_UPLOAD_BYTES, minimum=1024 * 1024),
+		"max_files": _env_int("MAX_PDF_FILES_PER_BATCH", DEFAULT_MAX_PDF_FILES_PER_BATCH, minimum=1),
+		"max_file_bytes": _env_int("MAX_PDF_FILE_BYTES", DEFAULT_MAX_PDF_FILE_BYTES, minimum=1024),
+		"max_total_bytes": _env_int("MAX_BATCH_TOTAL_BYTES", DEFAULT_MAX_BATCH_TOTAL_BYTES, minimum=1024),
+		"max_total_pages": _env_int("MAX_BATCH_TOTAL_PAGES", DEFAULT_MAX_BATCH_TOTAL_PAGES, minimum=1),
+	}
+
+
+def _max_table_file_bytes() -> int:
+	return _env_int("MAX_TABLE_FILE_BYTES", DEFAULT_MAX_TABLE_FILE_BYTES, minimum=1024)
+
+
+def _read_pdf_page_count(pdf_path: Path, *, poppler_path: Optional[str]) -> int:
+	try:
+		from pdf2image import pdfinfo_from_path
+	except Exception:
+		return 0
+	try:
+		info = pdfinfo_from_path(str(pdf_path), poppler_path=poppler_path)
+	except Exception:
+		return 0
+	try:
+		return max(0, int(info.get("Pages") or 0))
+	except Exception:
+		return 0
+
+
+def _build_csv_processor(cfg):
+	from EasyFlex.csv_processor import CSVProcessor
+
+	return CSVProcessor(config=cfg)
+
+
 def _derive_batch_label(display_names: List[str]) -> str:
 	"""Derive human-friendly source label for a batch."""
 	if not display_names:
@@ -220,7 +267,7 @@ def _deduct_credits(user: User, amount: int) -> int:
 
 
 def _utcnow() -> datetime:
-	return datetime.utcnow()
+	return utcnow()
 
 
 def _batch_status_label(status: Optional[str]) -> str:
@@ -228,11 +275,11 @@ def _batch_status_label(status: Optional[str]) -> str:
 
 
 def _batch_phase_label(phase: Optional[str]) -> str:
-	return _BATCH_PHASE_LABELS.get((phase or "").strip().lower(), "Zpracování")
+	return BATCH_PHASE_LABELS.get((phase or "").strip().lower(), "Zpracování")
 
 
 def _is_terminal_batch_status(status: Optional[str]) -> bool:
-	return (status or "").strip().lower() in BATCH_TERMINAL_STATUSES
+	return is_terminal_batch_status(status)
 
 
 def _load_batch_runtime_limit_s() -> int:
@@ -388,6 +435,8 @@ def _extract_file_with_retry(
 			file_results = _run_extraction(extractor, pdf_path, on_result=_collect_result)
 		except Exception as exc:  # noqa: BLE001
 			logger.exception("Chyba při extrakci PDF %s (pokus %s/%s)", display_name, attempt, max_attempts)
+			from EasyFlex.extractor import ExtractResult
+
 			file_results = [ExtractResult(file_path=display_name, data=None, error=str(exc))]
 			attempt_results = file_results
 		if attempt_results and not file_results:
@@ -470,6 +519,48 @@ def _batch_progress_payload(batch: InvoiceBatch, *, row_count: Optional[int] = N
 		invoice_progress_pct = 100
 	else:
 		invoice_progress_pct = 0
+	row_count_value = int(
+		row_count
+		if row_count is not None
+		else (
+			db.session.query(db.func.count(InvoiceRow.id))
+			.filter(InvoiceRow.batch_id == batch.id)
+			.scalar()
+			or 0
+		)
+	)
+	selected_count = max(0, int(batch.selected_count or 0))
+	imported_count = (
+		db.session.query(db.func.count(InvoiceRow.id))
+		.filter(InvoiceRow.batch_id == batch.id, InvoiceRow.import_status == "imported")
+		.scalar()
+		or 0
+	)
+	import_failed_count = (
+		db.session.query(db.func.count(InvoiceRow.id))
+		.filter(InvoiceRow.batch_id == batch.id, InvoiceRow.import_status == "failed")
+		.scalar()
+		or 0
+	)
+	import_skipped_count = (
+		db.session.query(db.func.count(InvoiceRow.id))
+		.filter(InvoiceRow.batch_id == batch.id, InvoiceRow.import_status == "skipped")
+		.scalar()
+		or 0
+	)
+	active_job = active_job_for_batch(batch.id)
+	active_job_type = active_job.job_type if active_job is not None else (batch.active_job_type or None)
+	active_job_status = active_job.status if active_job is not None else None
+	summary_message = (
+		(active_job.summary_message or "").strip()
+		if active_job is not None and active_job.summary_message
+		else (batch.summary_message or "")
+	)
+	last_heartbeat = None
+	if active_job is not None and active_job.last_heartbeat_at:
+		last_heartbeat = active_job.last_heartbeat_at.isoformat()
+	elif batch.last_heartbeat_at:
+		last_heartbeat = batch.last_heartbeat_at.isoformat()
 	return {
 		"batch_id": batch.id,
 		"status": status,
@@ -488,11 +579,18 @@ def _batch_progress_payload(batch: InvoiceBatch, *, row_count: Optional[int] = N
 		"invoice_progress_percent": invoice_progress_pct,
 		"current_phase": phase,
 		"current_phase_label": _batch_phase_label(phase),
-		"summary_message": batch.summary_message or "",
-		"row_count": int(row_count if row_count is not None else len(batch.rows or [])),
+		"summary_message": summary_message,
+		"row_count": row_count_value,
+		"selected_count": selected_count,
+		"imported_count": int(imported_count),
+		"import_failed_count": int(import_failed_count),
+		"import_skipped_count": int(import_skipped_count),
+		"active_job_type": active_job_type,
+		"active_job_status": active_job_status,
+		"active_job_status_label": job_status_label(active_job_status) if active_job_status else None,
 		"started_at": batch.started_at.isoformat() if batch.started_at else None,
 		"finished_at": batch.finished_at.isoformat() if batch.finished_at else None,
-		"last_heartbeat_at": batch.last_heartbeat_at.isoformat() if batch.last_heartbeat_at else None,
+		"last_heartbeat_at": last_heartbeat,
 	}
 
 
@@ -1027,6 +1125,8 @@ def _start_pdf_batch_job(
 
 def _import_batch(batch: InvoiceBatch, cfg: Any, selected_ids: Optional[List[int]]) -> tuple[int, int, int]:
 	"""Import selected rows to ABRA using current config."""
+	from EasyFlex.abra import import_to_abra
+
 	if selected_ids is None:
 		selected_ids = [row.id for row in batch.rows if row.marked_for_import]
 	selected_set = {int(val) for val in selected_ids}
@@ -1135,8 +1235,14 @@ def create_app() -> Flask:
 	app = Flask(__name__)
 	base_dir = Path(__file__).resolve().parent
 	db_path = base_dir / "easyflex_web.db"
-
-	app.config["SECRET_KEY"] = os.getenv("EASYFLEX_SECRET_KEY", "dev-secret-key")
+	app_env = (os.getenv("EASYFLEX_ENV") or os.getenv("FLASK_ENV") or "").strip().lower()
+	secret_key = os.getenv("EASYFLEX_SECRET_KEY")
+	if secret_key:
+		app.config["SECRET_KEY"] = secret_key
+	elif app_env == "production":
+		raise RuntimeError("EASYFLEX_SECRET_KEY must be set when EASYFLEX_ENV=production.")
+	else:
+		app.config["SECRET_KEY"] = "dev-secret-key"
 
 	# Pokud je nastaveno DATABASE_URL (např. z Render Postgres), použij ho,
 	# jinak fallback na lokální SQLite soubor easyflex_web.db
@@ -1154,12 +1260,23 @@ def create_app() -> Flask:
 	else:
 		app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
 	app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+	app.config["MAX_CONTENT_LENGTH"] = _pdf_upload_limits()["max_request_bytes"]
 
 	# Load shared EasyFlex configuration (per-user overrides are applied later)
 	app.config["EASYFLEX_BASE_CONFIG"] = load_config()
 
 	init_db(app)
 	init_auth(app)
+
+	@app.context_processor
+	def inject_credit_settings():
+		return {
+			"starting_credits": STARTING_CREDITS,
+			"pdf_invoice_credit_cost": PDF_INVOICE_CREDIT_COST,
+			"table_upload_credit_cost": TABLE_UPLOAD_CREDIT_COST,
+			"price_per_credit": PRICE_PER_CREDIT,
+			"min_credit_purchase": MIN_CREDIT_PURCHASE,
+		}
 
 	@app.route("/")
 	@login_required
@@ -1180,8 +1297,8 @@ def create_app() -> Flask:
 		return render_template(
 			"credits.html",
 			account_number="254980360/0600",
-			price_per_credit=0.5,
-			min_purchase=100,
+			price_per_credit=PRICE_PER_CREDIT,
+			min_purchase=MIN_CREDIT_PURCHASE,
 		)
 
 	@app.route("/assets/qr-payment")
@@ -1239,69 +1356,115 @@ def create_app() -> Flask:
 			if not pdf_files:
 				flash("V nahraných souborech není žádné PDF.", "warning")
 				return render_template("upload_pdf.html", cfg=cfg)
-			job_dir = tempfile.mkdtemp(prefix=f"easyflex-pdf-batch-{current_user.id}-")
-			job_dir_path = Path(job_dir)
+			limits = _pdf_upload_limits()
+			if len(pdf_files) > limits["max_files"]:
+				flash(
+					f"V jedné dávce lze nahrát maximálně {limits['max_files']} PDF. "
+					f"Vybráno: {len(pdf_files)}.",
+					"danger",
+				)
+				return render_template("upload_pdf.html", cfg=cfg)
 			display_names: list[str] = []
 			used_names: set[str] = set()
-			saved_files: list[tuple[str, str]] = []
-			try:
-				for idx, storage in enumerate(pdf_files):
-					display_name = _normalize_upload_label(storage.filename, idx)
-					display_names.append(display_name)
-					save_name = _dedupe_filename(display_name, used_names, fallback=f"upload-{idx + 1}.pdf")
-					pdf_path = job_dir_path / save_name
-					storage.save(pdf_path)
-					saved_files.append((str(pdf_path), display_name))
-			except Exception:  # noqa: BLE001
-				logger.exception("Nepodařilo se uložit nahraná PDF do dočasného úložiště.")
-				shutil.rmtree(job_dir, ignore_errors=True)
-				flash("Nepodařilo se uložit nahrané PDF soubory. Zkuste to prosím znovu.", "danger")
-				return render_template("upload_pdf.html", cfg=cfg)
-
-			source_label = _derive_batch_label(display_names)
+			saved_files: list[dict[str, Any]] = []
+			total_bytes = 0
+			total_pages = 0
+			source_label = _derive_batch_label([_normalize_upload_label(item.filename, idx) for idx, item in enumerate(pdf_files)])
 			batch = InvoiceBatch(
 				user=current_user,
 				source_label=source_label,
 				source_type="pdf",
 				processing_status=BATCH_STATUS_QUEUED,
-				total_files=len(saved_files),
+				total_files=len(pdf_files),
 				processed_files=0,
 				processed_invoices=0,
-				total_invoices_estimate=max(1, len(saved_files)),
+				total_invoices_estimate=max(1, len(pdf_files)),
 				current_phase="queued",
 				success_count=0,
 				error_count=0,
 				credits_charged=0,
-				summary_message=f"Dávka čeká na spuštění ({len(saved_files)} PDF).",
+				selected_count=0,
+				active_job_type=JOB_TYPE_EXTRACT_PDF,
+				summary_message=f"Dávka čeká na worker ({len(pdf_files)} PDF).",
 				last_heartbeat_at=_utcnow(),
 			)
 			db.session.add(batch)
 			db.session.commit()
-
-			runtime_limit_s = _load_batch_runtime_limit_s()
+			storage_root = batch_storage_root(batch.id)
 			try:
-				_start_pdf_batch_job(
-					app,
+				for idx, storage in enumerate(pdf_files):
+					display_name = _normalize_upload_label(storage.filename, idx)
+					display_names.append(display_name)
+					save_name = _dedupe_filename(display_name, used_names, fallback=f"upload-{idx + 1}.pdf")
+					pdf_path = storage_root / save_name
+					storage.save(pdf_path)
+					size_bytes = int(pdf_path.stat().st_size)
+					total_bytes += size_bytes
+					if size_bytes > limits["max_file_bytes"]:
+						raise ValueError(
+							f"Soubor {display_name} je příliš velký ({size_bytes} B). "
+							f"Limit je {limits['max_file_bytes']} B."
+						)
+					if total_bytes > limits["max_total_bytes"]:
+						raise ValueError(
+							f"Celková velikost dávky překročila limit {limits['max_total_bytes']} B."
+						)
+					page_count = _read_pdf_page_count(pdf_path, poppler_path=getattr(cfg, "poppler_path", None))
+					if page_count > 0:
+						total_pages += page_count
+						if total_pages > limits["max_total_pages"]:
+							raise ValueError(
+								f"Dávka překračuje limit {limits['max_total_pages']} stran PDF."
+							)
+					saved_files.append(
+						{
+							"relative_path": save_name,
+							"display_name": display_name,
+							"size_bytes": size_bytes,
+							"page_count": page_count,
+						}
+					)
+			except Exception as exc:  # noqa: BLE001
+				logger.exception("Nepodařilo se uložit/validovat nahraná PDF.")
+				shutil.rmtree(storage_root, ignore_errors=True)
+				db.session.delete(batch)
+				db.session.commit()
+				flash(f"Nepodařilo se připravit PDF dávku: {exc}", "danger")
+				return render_template("upload_pdf.html", cfg=cfg)
+			persist_batch_payload(
+				batch.id,
+				{
+					"batch_id": batch.id,
+					"source_label": source_label,
+					"files": saved_files,
+					"runtime_limit_s": _load_batch_runtime_limit_s(),
+				},
+			)
+			try:
+				queue_batch_job(
 					batch_id=batch.id,
 					user_id=current_user.id,
-					saved_files=saved_files,
-					job_dir=job_dir,
-					runtime_limit_s=runtime_limit_s,
+					job_type=JOB_TYPE_EXTRACT_PDF,
+					payload={"files": saved_files, "runtime_limit_s": _load_batch_runtime_limit_s()},
+					priority=10,
+					max_attempts=3,
 				)
+				db.session.commit()
 			except Exception as exc:  # noqa: BLE001
-				logger.exception("Nepodařilo se spustit PDF batch worker.")
+				logger.exception("Nepodařilo se zařadit PDF batch do fronty.")
 				batch.processing_status = BATCH_STATUS_FAILED
 				batch.finished_at = _utcnow()
 				batch.last_heartbeat_at = _utcnow()
-				batch.summary_message = f"Spuštění dávky selhalo: {exc}"
+				batch.active_job_type = None
+				batch.summary_message = f"Zařazení dávky do fronty selhalo: {exc}"
 				db.session.commit()
-				shutil.rmtree(job_dir, ignore_errors=True)
+				shutil.rmtree(storage_root, ignore_errors=True)
 				flash("Nepodařilo se spustit zpracování na pozadí. Zkuste to prosím znovu.", "danger")
 				return redirect(url_for("view_results", batch_id=batch.id))
 
 			flash(
-				f"Extrakce byla spuštěna na pozadí pro {len(saved_files)} PDF. "
-				"Výsledky se budou průběžně doplňovat.",
+				f"Extrakce byla zařazena do fronty pro {len(saved_files)} PDF. "
+				"Worker bude výsledky průběžně doplňovat.",
 				"info",
 			)
 			return redirect(url_for("view_results", batch_id=batch.id))
@@ -1321,18 +1484,24 @@ def create_app() -> Flask:
 			if file is None or file.filename == "":
 				flash("Vyberte prosím CSV/XLSX/XML soubor.", "warning")
 				return render_template("upload_table.html")
+			if request.content_length and request.content_length > _max_table_file_bytes():
+				flash("Nahraný tabulkový soubor je příliš velký.", "danger")
+				return render_template("upload_table.html")
 			filename = secure_filename(file.filename) or "tabulka"
 			with tempfile.TemporaryDirectory() as tmpdir:
 				table_path = Path(tmpdir) / filename
 				file.save(table_path)
-				processor = CSVProcessor(config=cfg)
+				if table_path.stat().st_size > _max_table_file_bytes():
+					flash("Tabulkový soubor překračuje povolený limit velikosti.", "danger")
+					return render_template("upload_table.html")
+				processor = _build_csv_processor(cfg)
 				try:
 					invoices = processor.process_table_file(str(table_path))
 				except Exception as exc:  # noqa: BLE001
 					logger.exception("Chyba při zpracování tabulky")
 					return render_template("upload_table.html", error=str(exc))
 			invoice_count = len(invoices)
-			credit_cost = 2 if invoice_count > 0 else 0
+			credit_cost = TABLE_UPLOAD_CREDIT_COST if invoice_count > 0 else 0
 			if invoice_count == 0:
 				flash("V tabulce nebyly nalezeny žádné faktury.", "warning")
 				return render_template("upload_table.html")
@@ -1358,9 +1527,24 @@ def create_app() -> Flask:
 			)
 			if getattr(cfg, "auto_import", False):
 				company_code, direction, doc_type_code = current_context(current_user.settings, base_cfg=cfg)
-				apply_context_to_config(cfg, company_code, direction, doc_type_code)
-				_import_batch(batch, cfg, None)
-				flash("Auto-import dokončen (viz statusy níže).", "info")
+				queue_batch_job(
+					batch_id=batch.id,
+					user_id=current_user.id,
+					job_type=JOB_TYPE_IMPORT_ABRA,
+					payload={
+						"company_code": company_code,
+						"direction": direction,
+						"doc_type_code": doc_type_code,
+						"auto_import": True,
+					},
+					priority=5,
+					max_attempts=3,
+				)
+				batch.processing_status = BATCH_STATUS_WAITING_IMPORT
+				batch.current_phase = "waiting_import"
+				batch.active_job_type = JOB_TYPE_IMPORT_ABRA
+				db.session.commit()
+				flash("Auto-import byl zařazen do fronty.", "info")
 			return redirect(url_for("view_results", batch_id=batch.id))
 		return render_template("upload_table.html")
 
@@ -1372,7 +1556,20 @@ def create_app() -> Flask:
 		batch = load_batch_for_user(batch_id, current_user)
 		if batch is None:
 			abort(404)
-		rows = rows_for_display(batch)
+		page = max(1, request.args.get("page", default=1, type=int) or 1)
+		page_size = min(MAX_PAGE_SIZE, max(1, request.args.get("page_size", default=DEFAULT_PAGE_SIZE, type=int) or DEFAULT_PAGE_SIZE))
+		sort_key = (request.args.get("sort") or "row_index").strip() or "row_index"
+		sort_direction = (request.args.get("sort_dir") or "asc").strip().lower()
+		filter_name = (request.args.get("filter") or "all").strip().lower() or "all"
+		row_items, total_rows = query_rows_for_batch(
+			batch,
+			page=page,
+			page_size=page_size,
+			sort_key=sort_key,
+			sort_direction=sort_direction,
+			filter_name=filter_name,
+		)
+		rows = rows_for_display(batch, row_items)
 		settings = current_user.settings
 		company_code, direction, doc_type_code = current_context(settings, base_cfg=cfg)
 		company_override = request.args.get("company") or request.args.get("company_code") or None
@@ -1385,7 +1582,8 @@ def create_app() -> Flask:
 		doc_types = list_doc_types(current_user, company_code, direction)
 		if doc_type_code and not any(dt.code == doc_type_code for dt in doc_types):
 			doc_type_code = None
-		progress = _batch_progress_payload(batch, row_count=len(rows))
+		progress = _batch_progress_payload(batch, row_count=total_rows)
+		page_count = max(1, (int(total_rows) + page_size - 1) // page_size) if total_rows else 1
 		return render_template(
 			"results.html",
 			batch=batch,
@@ -1399,6 +1597,13 @@ def create_app() -> Flask:
 			selected_company=company_code,
 			selected_direction=direction,
 			selected_doc_type=doc_type_code,
+			page=page,
+			page_size=page_size,
+			page_count=page_count,
+			total_rows=total_rows,
+			sort_key=sort_key,
+			sort_direction=sort_direction,
+			filter_name=filter_name,
 		)
 
 	@app.route("/results/<int:batch_id>/progress")
@@ -1409,6 +1614,62 @@ def create_app() -> Flask:
 			abort(404)
 		row_count = db.session.query(db.func.count(InvoiceRow.id)).filter(InvoiceRow.batch_id == batch.id).scalar() or 0
 		return jsonify(_batch_progress_payload(batch, row_count=int(row_count)))
+
+	@app.route("/results/<int:batch_id>/selection", methods=["POST"])
+	@login_required
+	def update_batch_selection(batch_id: int):
+		batch = load_batch_for_user(batch_id, current_user)
+		if batch is None:
+			abort(404)
+		payload = request.get_json(silent=True) or request.form
+		try:
+			row_id = int(payload.get("row_id", 0))
+		except (TypeError, ValueError):
+			abort(400)
+		marked_raw = payload.get("marked", False)
+		marked = marked_raw if isinstance(marked_raw, bool) else str(marked_raw).strip().lower() in {"1", "true", "yes", "on"}
+		row = InvoiceRow.query.filter_by(id=row_id, batch_id=batch.id).first_or_404()
+		if row.error:
+			marked = False
+		row.marked_for_import = bool(marked)
+		batch.selected_count = count_selected_rows(batch.id)
+		db.session.commit()
+		return jsonify({"ok": True, "row_id": row.id, "marked": bool(row.marked_for_import), "selected_count": int(batch.selected_count or 0)})
+
+	@app.route("/results/<int:batch_id>/selection/bulk", methods=["POST"])
+	@login_required
+	def bulk_update_batch_selection(batch_id: int):
+		batch = load_batch_for_user(batch_id, current_user)
+		if batch is None:
+			abort(404)
+		payload = request.get_json(silent=True) or request.form
+		marked_raw = payload.get("marked", False)
+		marked = marked_raw if isinstance(marked_raw, bool) else str(marked_raw).strip().lower() in {"1", "true", "yes", "on"}
+		scope = (payload.get("scope") or "page").strip().lower()
+		updated = 0
+		query = InvoiceRow.query.filter(InvoiceRow.batch_id == batch.id, InvoiceRow.error.is_(None))
+		if scope == "filtered":
+			filter_name = (payload.get("filter") or "all").strip().lower()
+			query = _apply_row_filter(query, filter_name)
+			rows = query.all()
+		else:
+			if isinstance(payload, dict):
+				row_ids = payload.get("row_ids") or []
+			else:
+				row_ids = payload.get("row_ids") or payload.getlist("row_ids")
+			normalized_ids: list[int] = []
+			for row_id in row_ids:
+				try:
+					normalized_ids.append(int(row_id))
+				except (TypeError, ValueError):
+					continue
+			rows = query.filter(InvoiceRow.id.in_(normalized_ids or [-1])).all()
+		for row in rows:
+			row.marked_for_import = bool(marked)
+			updated += 1
+		batch.selected_count = count_selected_rows(batch.id)
+		db.session.commit()
+		return jsonify({"ok": True, "updated": updated, "selected_count": int(batch.selected_count or 0)})
 
 	@app.route("/invoice/<int:row_id>/edit", methods=["GET", "POST"])
 	@login_required
@@ -1621,37 +1882,39 @@ def create_app() -> Flask:
 		direction = (request.form.get("direction") or "").strip() or "faktura-prijata"
 		doc_type_code = (request.form.get("doc_type_code") or "").strip() or None
 		persist_context(current_user.settings, company_code, direction, doc_type_code)
-		apply_context_to_config(cfg, company_code, direction, doc_type_code)
-		selected_ids = [int(val) for val in request.form.getlist("import_row_ids")]
-		if not selected_ids:
+		if batch.processing_status in {BATCH_STATUS_RUNNING, BATCH_STATUS_QUEUED, BATCH_STATUS_IMPORTING}:
+			flash("Dávka se ještě zpracovává nebo se právě importuje. Zkuste to znovu za chvíli.", "warning")
+			return redirect(url_for("view_results", batch_id=batch.id))
+		selected_count = count_selected_rows(batch.id)
+		if selected_count <= 0:
 			flash("Vyberte alespoň jednu fakturu k importu.", "warning")
 			return redirect(url_for("view_results", batch_id=batch.id))
-		success_count, error_count, skipped_count = _import_batch(batch, cfg, selected_ids)
-		message_parts = []
-		if success_count:
-			message_parts.append(f"Úspěšně importováno: {success_count}")
-		if error_count:
-			message_parts.append(f"Chyby: {error_count}")
-		if skipped_count:
-			message_parts.append(f"Přeskočeno: {skipped_count}")
-		if message_parts:
-			flash("; ".join(message_parts), "info")
-		rows = rows_for_display(batch)
-		companies = list_companies(current_user)
-		doc_types = list_doc_types(current_user, company_code, direction)
-		return render_template(
-			"results.html",
-			batch=batch,
-			rows=rows,
-			allow_import=True,
-			columns=DISPLAY_COLUMNS,
-			column_labels=COLUMN_LABELS,
-			companies=companies,
-			doc_types=doc_types,
-			selected_company=company_code,
-			selected_direction=direction,
-			selected_doc_type=doc_type_code,
+		active_job = active_job_for_batch(batch.id)
+		if active_job is not None and active_job.job_type == JOB_TYPE_IMPORT_ABRA:
+			flash("Import do ABRA už je zařazen nebo právě běží.", "warning")
+			return redirect(url_for("view_results", batch_id=batch.id))
+		queue_batch_job(
+			batch_id=batch.id,
+			user_id=current_user.id,
+			job_type=JOB_TYPE_IMPORT_ABRA,
+			payload={
+				"company_code": company_code,
+				"direction": direction,
+				"doc_type_code": doc_type_code,
+				"selected_count": selected_count,
+			},
+			priority=5,
+			max_attempts=3,
 		)
+		batch.processing_status = BATCH_STATUS_WAITING_IMPORT
+		batch.current_phase = "waiting_import"
+		batch.active_job_type = JOB_TYPE_IMPORT_ABRA
+		batch.selected_count = selected_count
+		batch.summary_message = f"Import do ABRA byl zařazen do fronty pro {selected_count} označených faktur."
+		batch.last_heartbeat_at = _utcnow()
+		db.session.commit()
+		flash(f"Import do ABRA byl zařazen do fronty pro {selected_count} faktur.", "info")
+		return redirect(url_for("view_results", batch_id=batch.id))
 
 	@app.route("/abra/company", methods=["POST"])
 	@login_required
@@ -1747,10 +2010,10 @@ def create_app() -> Flask:
 				else:
 					user = User(username=username)
 					user.set_password(password)
-					user.credits = 100
+					user.credits = STARTING_CREDITS
 					db.session.add(user)
 					db.session.commit()
-					message = f"Uživatel {username} vytvořen se 100 startovními kredity."
+					message = f"Uživatel {username} vytvořen se {STARTING_CREDITS} startovními kredity."
 		users = User.query.order_by(User.username.asc()).all()
 		return render_template("users.html", users=users, message=message, error=error)
 
@@ -1775,7 +2038,7 @@ def create_app() -> Flask:
 					app.logger.info("ensure_admin_user: creating new admin user 'admin'")
 					admin = User(username="admin", is_admin=True)
 					admin.set_password(password)
-					admin.credits = 100
+					admin.credits = STARTING_CREDITS
 					db.session.add(admin)
 				else:
 					app.logger.info(
@@ -1784,7 +2047,7 @@ def create_app() -> Flask:
 					admin.is_admin = True
 					admin.set_password(password)
 					if admin.credits is None:
-						admin.credits = 100
+						admin.credits = STARTING_CREDITS
 
 				db.session.commit()
 				app.logger.info("ensure_admin_user: admin user saved")
