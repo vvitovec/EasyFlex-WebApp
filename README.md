@@ -170,6 +170,8 @@ python -m webapp.cleanup_batches
 
 - Repo nově obsahuje `Procfile` se dvěma procesy: `web` a `worker`.
 - V produkci nastavte `EASYFLEX_ENV=production`; aplikace v tomto režimu odmítne start bez `EASYFLEX_SECRET_KEY`.
+- Repo nyní obsahuje i `Dockerfile` pro Render/Docker deployment s nainstalovaným Popplerem (`pdftoppm`) pro PDF extrakci.
+- Pro kompletní domácí self-hosting na čistém Ubuntu je připravený návod v `SELFHOSTING.md`.
 - Produkční server lze spustit přes `gunicorn`:
 ```bash
 gunicorn "webapp.app:app" --timeout 180 --graceful-timeout 30 --workers 2
@@ -181,6 +183,7 @@ python -m webapp.worker
 - Pro PostgreSQL nastavte `DATABASE_URL`.
 - Doporučeno nastavit silný `EASYFLEX_SECRET_KEY` a zabezpečit přístup k `/settings`.
 - Doporučený runtime: **Python 3.11 nebo 3.12**.
+- Pro Render native Python runtime je potřeba worker vytvořit jako samostatnou službu; pro plnou PDF funkčnost je bezpečnější Docker service nad přiloženým `Dockerfile`.
 
 ---
 

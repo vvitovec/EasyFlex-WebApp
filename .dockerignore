@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.coverage
+.coverage.*
+htmlcov
+instance
+errors
+backups
+webapp/easyflex_web.db

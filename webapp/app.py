@@ -26,6 +26,7 @@ from flask import (
 )
 from flask_login import login_required, current_user
 from sqlalchemy.exc import OperationalError
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
 from EasyFlex.config import load_config
@@ -1233,6 +1234,7 @@ def _import_batch(batch: InvoiceBatch, cfg: Any, selected_ids: Optional[List[int
 def create_app() -> Flask:
 	load_dotenv()
 	app = Flask(__name__)
+	app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 	base_dir = Path(__file__).resolve().parent
 	db_path = base_dir / "easyflex_web.db"
 	app_env = (os.getenv("EASYFLEX_ENV") or os.getenv("FLASK_ENV") or "").strip().lower()
@@ -1261,6 +1263,10 @@ def create_app() -> Flask:
 		app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
 	app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 	app.config["MAX_CONTENT_LENGTH"] = _pdf_upload_limits()["max_request_bytes"]
+	app.config["SESSION_COOKIE_HTTPONLY"] = True
+	app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+	if app_env == "production":
+		app.config["SESSION_COOKIE_SECURE"] = True
 
 	# Load shared EasyFlex configuration (per-user overrides are applied later)
 	app.config["EASYFLEX_BASE_CONFIG"] = load_config()
@@ -1282,6 +1288,10 @@ def create_app() -> Flask:
 	@login_required
 	def dashboard():
 		return render_template("dashboard.html")
+
+	@app.get("/healthz")
+	def healthz():
+		return jsonify({"status": "ok"}), 200
 
 	@app.route("/napoveda")
 	def help_page():

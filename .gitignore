@@ -12,3 +12,4 @@ errors/*.json
 instance/
 htmlcov/
 *.log
+backups/

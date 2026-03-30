@@ -1,0 +1,80 @@
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: easyflex-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-easyflex}
+      POSTGRES_USER: ${POSTGRES_USER:-easyflex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-easyflex} -d ${POSTGRES_DB:-easyflex}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: easyflex-web
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      EASYFLEX_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-easyflex}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-easyflex}
+      PORT: 10000
+    volumes:
+      - easyflex_instance:/app/instance
+    command: >
+      sh -c "gunicorn webapp.app:app
+      --bind 0.0.0.0:10000
+      --timeout 300
+      --graceful-timeout 30
+      --workers ${WEB_CONCURRENCY:-2}"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: easyflex-worker
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      EASYFLEX_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-easyflex}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-easyflex}
+    volumes:
+      - easyflex_instance:/app/instance
+    command: python -m webapp.worker
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: easyflex-caddy
+    restart: unless-stopped
+    depends_on:
+      - web
+    env_file:
+      - .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  postgres_data:
+  easyflex_instance:
+  caddy_data:
+  caddy_config:
