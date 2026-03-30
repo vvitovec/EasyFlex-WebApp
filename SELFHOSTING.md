@@ -97,6 +97,7 @@ POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 EASYFLEX_ENV=production
 EASYFLEX_SECRET_KEY=$EASYFLEX_SECRET_KEY
 EASYFLEX_ADMIN_PASSWORD=SEM_NAPIS_SVE_ADMIN_HESLO
+EASYFLEX_SECURE_COOKIES=false
 
 CADDY_SITE_ADDRESS=:80
 WEB_CONCURRENCY=2
@@ -176,6 +177,11 @@ Měla by se otevřít přihlašovací stránka EasyFlexu.
 Přihlášení:
 - uživatel: `admin`
 - heslo: to, které jste dali do `EASYFLEX_ADMIN_PASSWORD`
+
+Poznámka:
+- v tomto prvním lokálním režimu běží EasyFlex jen přes `http://`
+- proto je v `.env` nastaveno `EASYFLEX_SECURE_COOKIES=false`
+- jinak by login nefungoval, protože prohlížeč neposílá secure cookie přes obyčejné HTTP
 
 ## 8. Nastavení EasyFlexu po prvním přihlášení
 
@@ -288,6 +294,11 @@ docker compose up -d
 ```
 
 Caddy si automaticky vyřídí HTTPS certifikát.
+Po zapnutí HTTPS změňte v `.env` také:
+
+```text
+EASYFLEX_SECURE_COOKIES=true
+```
 
 ### Varianta B: nemáte doménu
 

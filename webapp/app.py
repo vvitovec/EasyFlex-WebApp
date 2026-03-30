@@ -191,6 +191,13 @@ def _env_int(name: str, default: int, *, minimum: Optional[int] = None) -> int:
 	return value
 
 
+def _env_bool(name: str, default: bool) -> bool:
+	raw = (os.getenv(name) or "").strip().lower()
+	if not raw:
+		return default
+	return raw in {"1", "true", "yes", "on"}
+
+
 def _pdf_upload_limits() -> dict[str, int]:
 	return {
 		"max_request_bytes": _env_int("MAX_CONTENT_LENGTH", DEFAULT_MAX_UPLOAD_BYTES, minimum=1024 * 1024),
@@ -1266,7 +1273,7 @@ def create_app() -> Flask:
 	app.config["SESSION_COOKIE_HTTPONLY"] = True
 	app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 	if app_env == "production":
-		app.config["SESSION_COOKIE_SECURE"] = True
+		app.config["SESSION_COOKIE_SECURE"] = _env_bool("EASYFLEX_SECURE_COOKIES", True)
 
 	# Load shared EasyFlex configuration (per-user overrides are applied later)
 	app.config["EASYFLEX_BASE_CONFIG"] = load_config()
