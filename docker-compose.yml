@@ -73,6 +73,18 @@ services:
       - caddy_data:/data
       - caddy_config:/config
 
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: easyflex-cloudflared
+    restart: unless-stopped
+    depends_on:
+      - web
+    profiles:
+      - cloudflare
+    env_file:
+      - .env
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+
 volumes:
   postgres_data:
   easyflex_instance:

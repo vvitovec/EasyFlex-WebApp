@@ -340,6 +340,113 @@ docker compose logs --tail=100 db
 - `worker`: zpracování fronty
 - `caddy`: web server před aplikací
 
+## 18. Varianta bez veřejné IP: Cloudflare Tunnel
+
+Pokud jste za CGNAT a nechcete řešit veřejnou IPv4, použijte Cloudflare Tunnel.
+
+Tohle je pro vás vhodné, když:
+- doma vám web normálně běží,
+- ale z internetu na něj nejde port forwarding,
+- a máte doménu, kterou chcete použít například jako `easyflex.vvitovec.com`.
+
+### Co je potřeba
+
+- účet u Cloudflare,
+- doména `vvitovec.com` přidaná do Cloudflare,
+- a změněné nameservery u Forpsi na nameservery, které vám dá Cloudflare.
+
+### 18.1 Přidejte doménu do Cloudflare
+
+1. Přihlaste se do Cloudflare.
+2. Klikněte na `Add a site`.
+3. Zadejte `vvitovec.com`.
+4. Dokončete přidání zóny.
+5. Cloudflare vám ukáže 2 nameservery.
+
+### 18.2 Přepište nameservery u Forpsi
+
+Ve Forpsi:
+1. otevřete správu domény `vvitovec.com`,
+2. najděte nastavení nameserverů,
+3. přepište původní nameservery na ty 2, které ukázal Cloudflare,
+4. uložte změny.
+
+Počkejte, až se změna propíše. Někdy je to za pár minut, někdy několik hodin.
+
+### 18.3 Vytvořte tunnel v Cloudflare Zero Trust
+
+1. V Cloudflare otevřete `Zero Trust`.
+2. Jděte do `Networks` -> `Tunnels`.
+3. Klikněte `Create a tunnel`.
+4. Zadejte název, například `easyflex-home`.
+5. Vyberte typ `Cloudflared`.
+6. Vyberte prostředí `Docker`.
+
+Cloudflare vám ukáže token nebo Docker command.
+
+Zajímat vás bude jen samotný token.
+
+### 18.4 Přidejte veřejný hostname
+
+Ve stejném průvodci přidejte Public Hostname:
+
+- `Subdomain`: `easyflex`
+- `Domain`: `vvitovec.com`
+- `Type`: `HTTP`
+- `URL`: `web:10000`
+
+To je správně, protože `cloudflared` běží ve stejné Docker síti jako EasyFlex web a umí se na službu `web` přímo připojit.
+
+### 18.5 Uložte token do `.env`
+
+Na Ubuntu otevřete:
+
+```bash
+cd ~/EasyFlex-WebApp
+nano .env
+```
+
+Doplňte nebo upravte:
+
+```text
+EASYFLEX_SECURE_COOKIES=true
+CLOUDFLARE_TUNNEL_TOKEN=SEM_VLOZ_TOKEN_Z_CLOUDFLARE
+```
+
+Poznámka:
+- pro veřejnou Cloudflare doménu má být `EASYFLEX_SECURE_COOKIES=true`
+- protože už půjde o HTTPS přístup z internetu
+
+### 18.6 Spusťte tunnel container
+
+Na Ubuntu spusťte:
+
+```bash
+cd ~/EasyFlex-WebApp
+docker compose --profile cloudflare up -d
+```
+
+Tím se spustí i kontejner:
+- `easyflex-cloudflared`
+
+### 18.7 Ověřte, že tunnel běží
+
+```bash
+cd ~/EasyFlex-WebApp
+docker compose ps
+docker compose logs --tail=100 cloudflared
+```
+
+### 18.8 Otevřete EasyFlex z internetu
+
+Pak otevřete:
+
+```text
+https://easyflex.vvitovec.com
+```
+
+Tohle už bude fungovat i bez veřejné IPv4 a bez port forwarding pravidel v routeru.
+
 ## 17. Důležité poznámky
 
 - Pokud server vypnete, EasyFlex nebude dostupný.
