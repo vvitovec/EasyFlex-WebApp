@@ -178,7 +178,9 @@ def main() -> None:
                 return
 
         table_names = [item.table_name for item in plan]
-        target_conn.autocommit = False
+        # Finish the read-only planning transaction before starting the destructive write phase.
+        source_conn.rollback()
+        target_conn.rollback()
         try:
             _truncate_target_tables(target_conn, reversed(table_names))
             for item in plan:
