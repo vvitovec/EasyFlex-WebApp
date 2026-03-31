@@ -453,3 +453,67 @@ Tohle už bude fungovat i bez veřejné IPv4 a bez port forwarding pravidel v ro
 - Pokud vypadne internet doma, EasyFlex nebude zvenku dostupný.
 - Pokud chcete maximální spolehlivost, dělejte pravidelné zálohy.
 - `.env` nikam neposílejte. Je v něm heslo do databáze i secret key.
+
+## 17a. Jak převést stará data ze Supabase nebo Render PostgreSQL
+
+Pokud už máte stará data v původní PostgreSQL databázi, můžete je přenést přímo.
+
+Migrují se tabulky:
+- `user`
+- `user_settings`
+- `company`
+- `doc_type`
+- `invoice_batch`
+- `invoice_row`
+
+Nemigrují se staré `batch_job` záznamy, protože ty jsou jen pracovní fronta a po přesunu nedávají smysl obnovovat.
+
+### 17a.1 Odkud vzít starou PostgreSQL URL
+
+Můžete použít jednu z těchto variant:
+
+- stará `DATABASE_URL` z Renderu
+- nebo PostgreSQL connection string ze Supabase `Project Settings -> Database -> Connection string -> URI`
+
+Potřebujete plnou URL ve tvaru:
+
+```text
+postgresql://UZIVATEL:HESLO@HOST:5432/DATABAZE
+```
+
+### 17a.2 Udělejte si zálohu domácí databáze
+
+```bash
+cd ~/EasyFlex-WebApp
+bash scripts/selfhost/backup_postgres.sh
+```
+
+### 17a.3 Nejdřív si ukažte plán migrace nanečisto
+
+Níže místo `SEM_VLOZ_STAROU_DATABASE_URL` vložte svou starou PostgreSQL URL do apostrofů:
+
+```bash
+cd ~/EasyFlex-WebApp
+docker compose exec -T -e SOURCE_DATABASE_URL='SEM_VLOZ_STAROU_DATABASE_URL' web python scripts/selfhost/migrate_from_postgres.py --dry-run
+```
+
+### 17a.4 Proveďte skutečnou migraci
+
+```bash
+cd ~/EasyFlex-WebApp
+docker compose exec -T -e SOURCE_DATABASE_URL='SEM_VLOZ_STAROU_DATABASE_URL' web python scripts/selfhost/migrate_from_postgres.py --yes
+```
+
+### 17a.5 Po migraci restartujte stack
+
+```bash
+cd ~/EasyFlex-WebApp
+docker compose restart web worker
+```
+
+### 17a.6 Co zkontrolovat po migraci
+
+- přihlášení uživatelů
+- firmy a typy dokladů v UI
+- nastavení v `/settings`
+- historie batchů a výsledků
