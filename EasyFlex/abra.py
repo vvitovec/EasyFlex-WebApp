@@ -225,35 +225,49 @@ def _normalize_psc(value: Optional[str]) -> Optional[str]:
 	return None
 
 
-def _extract_buyer_details(faktura: Dict[str, Any]) -> Dict[str, Optional[str]]:
-	"""Extract and normalize buyer (odběratel) details from invoice data."""
-	customer_name = faktura.get("odberatel_jmeno")
-	match_name = customer_name or faktura.get("dodavatel_jmeno")
+def _extract_partner_details(faktura: Dict[str, Any], doc_endpoint: str) -> Dict[str, Optional[str]]:
+	"""Extract and normalize partner details (dodavatel or odběratel) from invoice data based on doc endpoint."""
+	if doc_endpoint == "faktura-prijata":
+		primary = "dodavatel"
+		secondary = "odberatel"
+	else:
+		primary = "odberatel"
+		secondary = "dodavatel"
 
-	customer_address = faktura.get("odberatel_adresa")
-	match_address = customer_address or faktura.get("dodavatel_adresa")
+	def get_val(key: str, fallback: bool = True) -> Optional[str]:
+		val = faktura.get(f"{primary}_{key}")
+		if not val and fallback:
+			val = faktura.get(f"{secondary}_{key}")
+		return val
 
-	customer_psc_field = faktura.get("odberatel_psc")
-	customer_city_field = faktura.get("odberatel_mesto")
-	match_psc_field = customer_psc_field or faktura.get("dodavatel_psc")
-	match_city_field = customer_city_field or faktura.get("dodavatel_mesto")
+	partner_name = get_val("jmeno", fallback=False)
+	match_name = get_val("jmeno", fallback=True)
 
-	customer_state_raw = faktura.get("odberatel_stat")
-	match_state_raw = customer_state_raw or faktura.get("dodavatel_stat")
+	partner_address = get_val("adresa", fallback=False)
+	match_address = get_val("adresa", fallback=True)
 
-	customer_ico_raw = faktura.get("odberatel_ic")
-	match_ico_raw = customer_ico_raw or faktura.get("dodavatel_ic")
+	partner_psc_field = get_val("psc", fallback=False)
+	partner_city_field = get_val("mesto", fallback=False)
+	match_psc_field = get_val("psc", fallback=True)
+	match_city_field = get_val("mesto", fallback=True)
 
-	customer_dic_raw = faktura.get("odberatel_dic")
-	match_dic_raw = customer_dic_raw or faktura.get("dodavatel_dic")
+	partner_state_raw = get_val("stat", fallback=False)
+	match_state_raw = get_val("stat", fallback=True)
+
+	partner_ico_raw = get_val("ic", fallback=False)
+	match_ico_raw = get_val("ic", fallback=True)
+
+	partner_dic_raw = get_val("dic", fallback=False)
+	match_dic_raw = get_val("dic", fallback=True)
 
 	match_street, match_psc, match_city = _split_address_components(match_address)
-	customer_street, customer_psc, customer_city = _split_address_components(customer_address)
-	customer_street = customer_street or faktura.get("odberatel_ulice")
-	if customer_psc_field:
-		customer_psc = customer_psc_field
-	if customer_city_field:
-		customer_city = customer_city_field
+	partner_street, partner_psc, partner_city = _split_address_components(partner_address)
+	
+	partner_street = partner_street or get_val("ulice", fallback=False)
+	if partner_psc_field:
+		partner_psc = partner_psc_field
+	if partner_city_field:
+		partner_city = partner_city_field
 	if match_psc_field:
 		match_psc = match_psc or match_psc_field
 	if match_city_field:
@@ -262,7 +276,7 @@ def _extract_buyer_details(faktura: Dict[str, Any]) -> Dict[str, Optional[str]]:
 	return {
 		"name_raw": str(match_name).strip() if match_name else None,
 		"name_norm": _normalize_company_name(match_name),
-		"street": match_street or (faktura.get("odberatel_ulice") or None),
+		"street": match_street or (get_val("ulice", fallback=True) or None),
 		"psc_raw": match_psc or None,
 		"psc_norm": _normalize_psc(match_psc),
 		"city_raw": match_city or None,
@@ -270,14 +284,14 @@ def _extract_buyer_details(faktura: Dict[str, Any]) -> Dict[str, Optional[str]]:
 		"state": _normalize_country_reference(match_state_raw),
 		"ico": _normalize_ico(match_ico_raw),
 		"dic": _normalize_dic(match_dic_raw),
-		"customer_name": str(customer_name).strip() if customer_name else None,
-		"customer_street": customer_street or None,
-		"customer_psc": _normalize_psc(customer_psc),
-		"customer_city": customer_city or None,
-		"customer_city_norm": _normalize_city(customer_city),
-		"customer_state": _normalize_country_reference(customer_state_raw),
-		"customer_ico": _normalize_ico(customer_ico_raw),
-		"customer_dic": _normalize_dic(customer_dic_raw),
+		"partner_name": str(partner_name).strip() if partner_name else None,
+		"partner_street": partner_street or None,
+		"partner_psc": _normalize_psc(partner_psc),
+		"partner_city": partner_city or None,
+		"partner_city_norm": _normalize_city(partner_city),
+		"partner_state": _normalize_country_reference(partner_state_raw),
+		"partner_ico": _normalize_ico(partner_ico_raw),
+		"partner_dic": _normalize_dic(partner_dic_raw),
 	}
 
 
@@ -617,7 +631,7 @@ def _ensure_company_id(base_url: str, auth: tuple[str, str], timeout_s: int, ver
 
 
 
-def _ensure_partner_ext_id(base_url: str, auth: tuple[str, str], timeout_s: int, company_code: str, faktura: Dict[str, Any], verify: bool, partner_rel_code: Optional[str]) -> Optional[str]:
+def _ensure_partner_ext_id(base_url: str, auth: tuple[str, str], timeout_s: int, company_code: str, faktura: Dict[str, Any], verify: bool, partner_rel_code: Optional[str], doc_endpoint: str) -> Optional[str]:
 	"""Najdi existující záznam v Adresáři dle IČO/DIČ/názvu a vrať jeho referenci.
 
 	Nikdy nevytváří nové adresy – pokud se nenajde shoda nebo adresář nelze načíst,
@@ -642,13 +656,13 @@ def _ensure_partner_ext_id(base_url: str, auth: tuple[str, str], timeout_s: int,
 				return ref if ref.startswith(("code:", "id:", "ext:")) else f"id:{ref}"
 		return None
 
-	buyer = _extract_buyer_details(faktura)
-	nazev_raw = buyer["name_raw"]
-	ico = buyer["ico"]
-	dic = buyer["dic"]
-	nazev_norm = buyer["name_norm"]
-	psc_norm = buyer["psc_norm"]
-	city_norm = buyer["city_norm"]
+	partner = _extract_partner_details(faktura, doc_endpoint)
+	nazev_raw = partner["name_raw"]
+	ico = partner["ico"]
+	dic = partner["dic"]
+	nazev_norm = partner["name_norm"]
+	psc_norm = partner["psc_norm"]
+	city_norm = partner["city_norm"]
 
 	if not any((ico, dic, nazev_norm)):
 		logger.info("ABRA: faktura postrádá IČO/DIČ/název pro přiřazení firmy, import pokračuje bez vazby.")
@@ -778,18 +792,18 @@ def _ensure_partner_ext_id(base_url: str, auth: tuple[str, str], timeout_s: int,
 	return None
 
 
-def _prepare_buyer_section(faktura: Dict[str, Any], partner_ref: Optional[str]) -> Dict[str, Any]:
-	"""Return ABRA payload fields for buyer snapshot and optional firma reference."""
-	buyer = _extract_buyer_details(faktura)
+def _prepare_partner_section(faktura: Dict[str, Any], partner_ref: Optional[str], doc_endpoint: str) -> Dict[str, Any]:
+	"""Return ABRA payload fields for partner snapshot and optional firma reference."""
+	partner = _extract_partner_details(faktura, doc_endpoint)
 	body: Dict[str, Any] = {}
 
-	name_for_payload = buyer.get("customer_name") or buyer.get("name_raw")
-	street = buyer.get("customer_street") or buyer.get("street")
-	psc_value = buyer.get("customer_psc") or buyer.get("psc_norm")
-	city_value = buyer.get("customer_city") or buyer.get("city_raw")
-	state_value = buyer.get("customer_state") or buyer.get("state")
-	ico_value = buyer.get("customer_ico") or buyer.get("ico")
-	dic_value = buyer.get("customer_dic") or buyer.get("dic")
+	name_for_payload = partner.get("partner_name") or partner.get("name_raw")
+	street = partner.get("partner_street") or partner.get("street")
+	psc_value = partner.get("partner_psc") or partner.get("psc_norm")
+	city_value = partner.get("partner_city") or partner.get("city_raw")
+	state_value = partner.get("partner_state") or partner.get("state")
+	ico_value = partner.get("partner_ico") or partner.get("ico")
+	dic_value = partner.get("partner_dic") or partner.get("dic")
 
 	def _set_if_present(key: str, value: Optional[str]) -> None:
 		if value:
@@ -1033,7 +1047,7 @@ def _build_invoice_payload(
 	body.pop("kurz", None)
 	body.pop("kurzMnozstvi", None)
 
-	body.update(_prepare_buyer_section(faktura_dict, partner_ref))
+	body.update(_prepare_partner_section(faktura_dict, partner_ref, doc_endpoint))
 	payload = _wrap_winstrom(doc_endpoint, body)
 	_validate_winstrom_payload(payload, partner_ref=partner_ref)
 	return payload
@@ -1151,8 +1165,8 @@ def import_to_abra(faktura_data: Union[Dict[str, Any], InvoiceData], cfg: Option
 
 	# Resolve company code used in path
 	company_code = _ensure_company_id(base_url, auth, cfg.abra_timeout_s, cfg.abra_verify_tls, cfg.abra_company, faktura_data if isinstance(faktura_data, dict) else faktura_data.model_dump())
-	# Best-effort lookup of buyer (odběratel) in ABRA adresář (bez vytváření nových)
-	partner_ref = _ensure_partner_ext_id(base_url, auth, cfg.abra_timeout_s, company_code, faktura_data if isinstance(faktura_data, dict) else faktura_data.model_dump(), cfg.abra_verify_tls, cfg.abra_partner_rel_code)
+	# Best-effort lookup of partner in ABRA adresář (bez vytváření nových)
+	partner_ref = _ensure_partner_ext_id(base_url, auth, cfg.abra_timeout_s, company_code, faktura_data if isinstance(faktura_data, dict) else faktura_data.model_dump(), cfg.abra_verify_tls, cfg.abra_partner_rel_code, doc_endpoint)
 
 	payload = _build_invoice_payload(faktura_data, cfg, partner_ref, doc_endpoint)
 	try:
