@@ -17,14 +17,7 @@
 			data-terminal="{% if batch_progress.is_terminal %}1{% else %}0{% endif %}"
 		>
 			<div class="batch-progress-head">
-				<strong id="batch-status-label">{{ batch_progress.status_label }}</strong>
-				<span id="batch-job-label">
-					{% if batch_progress.active_job_type == 'extract_pdf' %}Extrakce PDF{% elif batch_progress.active_job_type == 'import_abra' %}Import do ABRA{% else %}Bez aktivního jobu{% endif %}
-					{% if batch_progress.active_job_status_label %}• {{ batch_progress.active_job_status_label }}{% endif %}
-				</span>
-			</div>
-			<div class="batch-progress-head">
-				<strong id="batch-phase-label">{{ batch_progress.current_phase_label }}</strong>
+				<strong>Zpracování PDF</strong>
 				<span id="batch-invoice-progress-text">{{ batch_progress.processed_invoices }}/{{ batch_progress.total_invoices_estimate }} faktur</span>
 			</div>
 			<div class="batch-progress-track">
@@ -40,8 +33,7 @@
 				<span>Přeskočeno: <strong id="batch-import-skipped-count">{{ batch_progress.import_skipped_count }}</strong></span>
 				<span>Kredity: <strong id="batch-credits-count">{{ batch_progress.credits_charged }}</strong></span>
 			</div>
-			<p class="muted" id="batch-summary-text">{{ batch_progress.summary_message or "Čeká na zpracování…" }}</p>
-			<p class="muted" id="batch-heartbeat-text">Poslední heartbeat: {{ batch_progress.last_heartbeat_at or "—" }}</p>
+			<p class="batch-progress-note">Zpracování můžete nechat běžet na pozadí. Nevadí ani když zavřete prohlížeč. Počkejte, až bude vše zpracované a připravené k importu.</p>
 		</div>
 	{% endif %}
 
@@ -251,14 +243,9 @@
 		const importedCountEl = document.getElementById('batch-imported-count');
 		const importFailedCountEl = document.getElementById('batch-import-failed-count');
 		const importSkippedCountEl = document.getElementById('batch-import-skipped-count');
-		const progressLabelEl = document.getElementById('batch-status-label');
-		const progressJobEl = document.getElementById('batch-job-label');
 		const progressTextEl = document.getElementById('batch-progress-text');
-		const progressPhaseEl = document.getElementById('batch-phase-label');
 		const progressInvoiceTextEl = document.getElementById('batch-invoice-progress-text');
 		const progressFillEl = document.getElementById('batch-progress-fill');
-		const progressSummaryEl = document.getElementById('batch-summary-text');
-		const progressHeartbeatEl = document.getElementById('batch-heartbeat-text');
 		const progressSuccessEl = document.getElementById('batch-success-count');
 		const progressErrorEl = document.getElementById('batch-error-count');
 		const progressCreditsEl = document.getElementById('batch-credits-count');
@@ -338,21 +325,9 @@
 
 		function updateProgress(payload) {
 			if (!payload || !progressRoot) return;
-			if (progressLabelEl) progressLabelEl.textContent = payload.status_label || payload.status || "";
-			if (progressJobEl) {
-				const jobLabel = payload.active_job_type === 'extract_pdf'
-					? 'Extrakce PDF'
-					: payload.active_job_type === 'import_abra'
-						? 'Import do ABRA'
-						: 'Bez aktivního jobu';
-				progressJobEl.textContent = payload.active_job_status_label ? `${jobLabel} • ${payload.active_job_status_label}` : jobLabel;
-			}
 			if (progressTextEl) progressTextEl.textContent = `${payload.processed_files}/${payload.total_files}`;
-			if (progressPhaseEl) progressPhaseEl.textContent = payload.current_phase_label || "Zpracování";
 			if (progressInvoiceTextEl) progressInvoiceTextEl.textContent = `${payload.processed_invoices || 0}/${payload.total_invoices_estimate || 0} faktur`;
 			if (progressFillEl) progressFillEl.style.width = `${payload.invoice_progress_percent || 0}%`;
-			if (progressSummaryEl) progressSummaryEl.textContent = payload.summary_message || "";
-			if (progressHeartbeatEl) progressHeartbeatEl.textContent = `Poslední heartbeat: ${payload.last_heartbeat_at || "—"}`;
 			if (progressSuccessEl) progressSuccessEl.textContent = String(payload.success_count || 0);
 			if (progressErrorEl) progressErrorEl.textContent = String(payload.error_count || 0);
 			if (selectedCountEl) selectedCountEl.textContent = String(payload.selected_count || 0);
