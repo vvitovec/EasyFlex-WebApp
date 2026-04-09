@@ -1035,3 +1035,10 @@ fieldset legend {
 		transform: translateX(330%);
 	}
 }
+
+.batch-progress-note {
+	margin: 10px 0 0;
+	color: #445064;
+	font-size: 14px;
+	line-height: 1.5;
+}
