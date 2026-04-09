@@ -40,7 +40,7 @@ JOB_STATUS_LABELS = {
 	JOB_STATUS_RUNNING: "Zpracovává se",
 	JOB_STATUS_COMPLETED: "Dokončeno",
 	JOB_STATUS_COMPLETED_WITH_ERRORS: "Dokončeno s chybami",
-	JOB_STATUS_RETRYABLE_FAILED: "Vyžaduje zásah",
+	JOB_STATUS_RETRYABLE_FAILED: "Čeká na retry",
 	JOB_STATUS_FAILED: "Selhalo",
 	JOB_STATUS_CANCELLED: "Zrušeno",
 }

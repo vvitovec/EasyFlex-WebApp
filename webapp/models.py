@@ -395,6 +395,7 @@ class BatchJob(db.Model):
 	max_attempts = db.Column(db.Integer, nullable=False, default=3, server_default=text("3"))
 	claimed_by = db.Column(db.String(255), nullable=True)
 	claimed_at = db.Column(db.DateTime, nullable=True)
+	next_attempt_at = db.Column(db.DateTime, nullable=True, index=True)
 	last_heartbeat_at = db.Column(db.DateTime, nullable=True, index=True)
 	started_at = db.Column(db.DateTime, nullable=True)
 	finished_at = db.Column(db.DateTime, nullable=True)
@@ -487,6 +488,8 @@ def init_db(app) -> None:
 					_execute_migration_sql(engine, "ALTER TABLE batch_job ADD COLUMN resume_cursor TEXT")
 				if "payload" not in job_columns:
 					_execute_migration_sql(engine, "ALTER TABLE batch_job ADD COLUMN payload TEXT")
+				if "next_attempt_at" not in job_columns:
+					_execute_migration_sql(engine, "ALTER TABLE batch_job ADD COLUMN next_attempt_at TIMESTAMP")
 			# If the process restarted while batch processing was in-flight, expose partial results as interrupted.
 			# Keep this update narrowly scoped to avoid heavy startup scans.
 			with engine.begin() as conn:

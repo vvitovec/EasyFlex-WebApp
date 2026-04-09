@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly EasyFlex PostgreSQL backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=10m
+Unit=easyflex-backup.service
+
+[Install]
+WantedBy=timers.target

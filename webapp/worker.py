@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -13,16 +15,19 @@ from flask import Flask
 from EasyFlex.invoice_warnings import get_warning, set_warning
 from EasyFlex.models import InvoiceData
 
-from .abra_context import apply_context_to_config, current_context
+from .abra_context import apply_context_to_config, current_context_for_user
 from .batch_jobs import (
 	active_job_for_batch,
 	batch_storage_root,
 	cancel_non_terminal_jobs_for_batch,
 	claim_next_job,
+	cleanup_old_terminal_jobs,
+	cleanup_orphaned_batch_storage,
 	finalize_job,
 	get_worker_id,
 	heartbeat_job,
 	is_terminal_batch_status,
+	job_retry_delay_s,
 	job_status_label,
 	load_batch_payload,
 	persist_batch_payload,
@@ -32,7 +37,7 @@ from .batch_jobs import (
 	run_db_write_with_retry,
 	utcnow,
 )
-from .config_utils import get_user_config_for_user
+from .config_utils import get_user_config_for_user_id
 from .constants import (
 	BATCH_STATUS_COMPLETED,
 	BATCH_STATUS_COMPLETED_WITH_ERRORS,
@@ -63,6 +68,11 @@ DEFAULT_PDF_BATCH_MAX_RUNTIME_S = 60 * 60
 DEFAULT_JOB_POLL_INTERVAL_S = 2.0
 DEFAULT_JOB_HEARTBEAT_INTERVAL_S = 5.0
 DEFAULT_STALE_JOB_SECONDS = 90
+DEFAULT_IDLE_BACKOFF_MAX_S = 10.0
+DEFAULT_MAINTENANCE_INTERVAL_S = 60.0
+DEFAULT_JOB_RETENTION_HOURS = 24 * 14
+DEFAULT_BATCH_STORAGE_RETENTION_HOURS = 24 * 7
+HEARTBEAT_DIR = Path("/tmp")
 
 
 def _load_batch_runtime_limit_s() -> int:
@@ -74,6 +84,34 @@ def _load_batch_runtime_limit_s() -> int:
 	except ValueError:
 		return DEFAULT_PDF_BATCH_MAX_RUNTIME_S
 	return max(60, value)
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+	raw = (os.getenv(name) or "").strip()
+	if not raw:
+		return max(minimum, default)
+	try:
+		return max(minimum, int(raw))
+	except ValueError:
+		return max(minimum, default)
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.1) -> float:
+	raw = (os.getenv(name) or "").strip()
+	if not raw:
+		return max(minimum, default)
+	try:
+		return max(minimum, float(raw))
+	except ValueError:
+		return max(minimum, default)
+
+
+def _touch_heartbeat_file(name: str) -> None:
+	try:
+		path = HEARTBEAT_DIR / f"easyflex-{name}.heartbeat"
+		path.write_text(str(int(time.time())), encoding="utf-8")
+	except Exception:  # noqa: BLE001
+		logger.debug("Nepodařilo se zapsat heartbeat file %s", name, exc_info=True)
 
 
 def _build_extractor(cfg):
@@ -428,28 +466,35 @@ def _process_extract_job(job_id: int, worker_id: str) -> None:
 	job = db.session.get(BatchJob, job_id)
 	if job is None:
 		return
-	batch = db.session.get(InvoiceBatch, job.batch_id)
-	user = db.session.get(User, job.user_id)
+	batch_id = int(job.batch_id)
+	user_id = int(job.user_id)
+	initial_payload = dict(job.payload or {})
+	initial_resume_cursor = dict(job.resume_cursor or {})
+	batch = db.session.get(InvoiceBatch, batch_id)
+	user = db.session.get(User, user_id)
 	if batch is None or user is None:
 		finalize_job(job_id=job_id, status=JOB_STATUS_FAILED, summary_message="Chybí dávka nebo uživatel.", last_error="Batch/User missing")
 		db.session.commit()
 		return
-	run_db_write_with_retry(f"job {job_id} start extract", lambda: _set_batch_extract_running(batch))
-	cfg = get_user_config_for_user(user)
+	run_db_write_with_retry(
+		f"job {job_id} start extract",
+		lambda: _set_batch_extract_running(db.session.get(InvoiceBatch, batch_id)),
+	)
+	cfg = get_user_config_for_user_id(user_id)
 	extractor = _build_extractor(cfg)
-	payload = dict(job.payload or load_batch_payload(batch.id))
+	payload = dict(initial_payload or load_batch_payload(batch_id))
 	files = list(payload.get("files") or [])
 	if not files:
 		finalize_job(job_id=job_id, status=JOB_STATUS_FAILED, summary_message="Chybí seznam PDF souborů.", last_error="Missing files payload")
 		db.session.commit()
 		return
-	cursor = dict(job.resume_cursor or {})
+	cursor = dict(initial_resume_cursor)
 	start_file_index = int(cursor.get("file_index", 0) or 0)
 	next_row_index = int(cursor.get("next_row_index", 0) or 0)
 	if next_row_index <= 0:
 		max_row = (
 			db.session.query(db.func.max(InvoiceRow.row_index))
-			.filter(InvoiceRow.batch_id == batch.id)
+			.filter(InvoiceRow.batch_id == batch_id)
 			.scalar()
 		)
 		next_row_index = int(max_row) + 1 if max_row is not None else 0
@@ -457,6 +502,7 @@ def _process_extract_job(job_id: int, worker_id: str) -> None:
 	started_perf = time.perf_counter()
 	stop_reason: Optional[str] = None
 	auto_import_payload: Optional[dict[str, Any]] = None
+	last_error: Optional[str] = None
 
 	for file_index in range(start_file_index, len(files)):
 		if not heartbeat_job(job_id, worker_id):
@@ -468,12 +514,13 @@ def _process_extract_job(job_id: int, worker_id: str) -> None:
 		file_meta = files[file_index]
 		display_name = str(file_meta.get("display_name") or f"upload-{file_index + 1}.pdf")
 		rel_path = str(file_meta.get("relative_path") or "")
-		pdf_path = batch_storage_root(batch.id) / rel_path
+		pdf_path = batch_storage_root(batch_id) / rel_path
 		if not pdf_path.exists():
 			stop_reason = "failed"
-			job.last_error = f"Chybí soubor {display_name}."
+			last_error = f"Chybí soubor {display_name}."
 			break
-		credits = max(0, int(user.credits or 0))
+		user = db.session.get(User, user_id)
+		credits = max(0, int(user.credits or 0)) if user is not None else 0
 		if credits <= 0:
 			stop_reason = "credits"
 			break
@@ -503,8 +550,8 @@ def _process_extract_job(job_id: int, worker_id: str) -> None:
 			def _writer():
 				return _persist_extract_result(
 					job_id=job_id,
-					batch_id=batch.id,
-					user_id=user.id,
+					batch_id=batch_id,
+					user_id=user_id,
 					file_index=file_index,
 					display_name=display_name,
 					source_invoice_index=group_index,
@@ -532,7 +579,7 @@ def _process_extract_job(job_id: int, worker_id: str) -> None:
 			f"job {job_id} mark file processed",
 			lambda: _mark_file_processed(
 				job_id=job_id,
-				batch_id=batch.id,
+				batch_id=batch_id,
 				processed_files_target=file_index + 1,
 				total_files=len(files),
 			),
@@ -541,7 +588,7 @@ def _process_extract_job(job_id: int, worker_id: str) -> None:
 			break
 
 	if getattr(cfg, "auto_import", False):
-		company_code, direction, doc_type_code = current_context(user.settings, base_cfg=cfg)
+		company_code, direction, doc_type_code = current_context_for_user(user_id, base_cfg=cfg)
 		auto_import_payload = {
 			"company_code": company_code,
 			"direction": direction,
@@ -560,7 +607,7 @@ def _process_extract_job(job_id: int, worker_id: str) -> None:
 	job_status, summary = run_db_write_with_retry(f"job {job_id} finalize extract", _finalize)
 	run_db_write_with_retry(
 		f"job {job_id} finalize state",
-		lambda: finalize_job(job_id=job_id, status=job_status, summary_message=summary, last_error=getattr(job, "last_error", None)),
+		lambda: finalize_job(job_id=job_id, status=job_status, summary_message=summary, last_error=last_error),
 	)
 
 
@@ -568,46 +615,65 @@ def _process_import_job(job_id: int, worker_id: str) -> None:
 	job = db.session.get(BatchJob, job_id)
 	if job is None:
 		return
-	batch = db.session.get(InvoiceBatch, job.batch_id)
-	user = db.session.get(User, job.user_id)
+	batch_id = int(job.batch_id)
+	user_id = int(job.user_id)
+	payload = dict(job.payload or {})
+	batch = db.session.get(InvoiceBatch, batch_id)
+	user = db.session.get(User, user_id)
 	if batch is None or user is None:
 		finalize_job(job_id=job_id, status=JOB_STATUS_FAILED, summary_message="Chybí dávka nebo uživatel.", last_error="Batch/User missing")
 		db.session.commit()
 		return
-	run_db_write_with_retry(f"job {job_id} start import", lambda: _set_batch_import_running(batch))
-	cfg = get_user_config_for_user(user)
-	payload = dict(job.payload or {})
-	apply_context_to_config(cfg, payload.get("company_code"), payload.get("direction"), payload.get("doc_type_code"))
-	rows = (
-		InvoiceRow.query
-		.filter(InvoiceRow.batch_id == batch.id, InvoiceRow.marked_for_import.is_(True))
-		.order_by(InvoiceRow.row_index.asc())
-		.all()
+	run_db_write_with_retry(
+		f"job {job_id} start import",
+		lambda: _set_batch_import_running(db.session.get(InvoiceBatch, batch_id)),
 	)
-	for row in rows:
+	cfg = get_user_config_for_user_id(user_id)
+	apply_context_to_config(cfg, payload.get("company_code"), payload.get("direction"), payload.get("doc_type_code"))
+	row_ids = [
+		int(row_id)
+		for (row_id,) in (
+			db.session.query(InvoiceRow.id)
+			.filter(InvoiceRow.batch_id == batch_id, InvoiceRow.marked_for_import.is_(True))
+			.order_by(InvoiceRow.row_index.asc())
+			.all()
+		)
+	]
+	for row_id in row_ids:
 		if not heartbeat_job(job_id, worker_id):
 			break
 		db.session.commit()
+		row = db.session.get(InvoiceRow, row_id)
+		if row is None:
+			continue
 		if row.import_status == ROW_IMPORT_STATUS_IMPORTED:
 			continue
 		inv_dict = dict(row.invoice_data or {})
+		row_index = int(row.row_index or 0)
 		if not _has_minimal_invoice_data(inv_dict):
 			def _skip_writer():
+				row = db.session.get(InvoiceRow, row_id)
+				if row is None:
+					return False
 				row.import_status = ROW_IMPORT_STATUS_SKIPPED
 				row.status = "Přeskočeno – chybí data"
 				row.error = None
 				row.last_import_error = None
 				return True
-			run_db_write_with_retry(f"job {job_id} skip row {row.id}", _skip_writer)
+			run_db_write_with_retry(f"job {job_id} skip row {row_id}", _skip_writer)
 			continue
 		def _mark_running():
+			row = db.session.get(InvoiceRow, row_id)
+			batch = db.session.get(InvoiceBatch, batch_id)
+			if row is None or batch is None:
+				return False
 			row.import_status = ROW_IMPORT_STATUS_RUNNING
 			row.import_attempts = int(row.import_attempts or 0) + 1
 			row.last_import_error = None
 			batch.last_heartbeat_at = utcnow()
-			batch.summary_message = f"Importuji řádek {row.row_index + 1} do ABRA."
+			batch.summary_message = f"Importuji řádek {row_index + 1} do ABRA."
 			return True
-		run_db_write_with_retry(f"job {job_id} mark running row {row.id}", _mark_running)
+		run_db_write_with_retry(f"job {job_id} mark running row {row_id}", _mark_running)
 		try:
 			try:
 				payload_obj = InvoiceData.model_validate(inv_dict)
@@ -620,6 +686,10 @@ def _process_import_job(job_id: int, worker_id: str) -> None:
 			logger.exception("Chyba importu do ABRA")
 			import_status, error_text, status_text = ROW_IMPORT_STATUS_FAILED, str(exc), ""
 		def _finish_row():
+			row = db.session.get(InvoiceRow, row_id)
+			batch = db.session.get(InvoiceBatch, batch_id)
+			if row is None or batch is None:
+				return False
 			row.import_status = import_status
 			row.status = status_text or None
 			row.error = error_text
@@ -628,7 +698,7 @@ def _process_import_job(job_id: int, worker_id: str) -> None:
 				row.imported_at = utcnow()
 			batch.last_heartbeat_at = utcnow()
 			return True
-		run_db_write_with_retry(f"job {job_id} finalize row {row.id}", _finish_row)
+		run_db_write_with_retry(f"job {job_id} finalize row {row_id}", _finish_row)
 
 	job_status, summary = run_db_write_with_retry(f"job {job_id} finalize import", lambda: _finalize_import_job(job_id=job_id))
 	run_db_write_with_retry(
@@ -658,29 +728,73 @@ def process_job(job_id: int, worker_id: str) -> None:
 			)
 	except Exception as exc:  # noqa: BLE001
 		logger.exception("Worker job %s selhal", job_id)
+		job = db.session.get(BatchJob, job_id)
+		next_attempt_at = None
+		status = JOB_STATUS_FAILED
+		summary = "Job selhal."
+		if job is not None and int(job.attempt_count or 0) < int(job.max_attempts or 1):
+			next_attempt_at = utcnow() + timedelta(seconds=job_retry_delay_s(int(job.attempt_count or 1)))
+			status = JOB_STATUS_RETRYABLE_FAILED
+			summary = "Job selhal a čeká na automatický retry."
 		run_db_write_with_retry(
 			f"job {job_id} crash finalize",
 			lambda: finalize_job(
 				job_id=job_id,
-				status=JOB_STATUS_RETRYABLE_FAILED,
-				summary_message="Job selhal a čeká na obnovení workerem.",
+				status=status,
+				summary_message=summary,
 				last_error=str(exc),
+				next_attempt_at=next_attempt_at,
 			),
 		)
 
 
-def run_forever(app: Flask, *, poll_interval_s: float = DEFAULT_JOB_POLL_INTERVAL_S) -> None:
-	worker_id = get_worker_id()
+def _run_maintenance_cycle(app: Flask) -> None:
+	with app.app_context():
+		requeued = requeue_stale_running_jobs(stale_after_s=_env_int("JOB_STALE_AFTER_S", DEFAULT_STALE_JOB_SECONDS, minimum=15))
+		removed_jobs = cleanup_old_terminal_jobs(
+			retention_hours=_env_int("JOB_RETENTION_HOURS", DEFAULT_JOB_RETENTION_HOURS, minimum=24),
+		)
+		removed_dirs = cleanup_orphaned_batch_storage(
+			retention_hours=_env_int("BATCH_STORAGE_RETENTION_HOURS", DEFAULT_BATCH_STORAGE_RETENTION_HOURS, minimum=24),
+		)
+		if requeued or removed_jobs or removed_dirs:
+			logger.info(
+				"Maintenance cycle: requeued=%s removed_jobs=%s removed_dirs=%s",
+				requeued,
+				removed_jobs,
+				removed_dirs,
+			)
+
+
+def _maintenance_loop(app: Flask, *, interval_s: float) -> None:
+	logger.info("EasyFlex maintenance loop start: interval=%ss", interval_s)
+	while True:
+		try:
+			_touch_heartbeat_file("maintenance")
+			_run_maintenance_cycle(app)
+		except Exception:  # noqa: BLE001
+			logger.exception("Maintenance cycle selhal")
+		time.sleep(interval_s)
+
+
+def run_forever(app: Flask, *, poll_interval_s: float = DEFAULT_JOB_POLL_INTERVAL_S, worker_name: Optional[str] = None) -> None:
+	worker_id = get_worker_id() if not worker_name else f"{get_worker_id()}:{worker_name}"
 	logger.info("EasyFlex worker start: %s", worker_id)
 	with app.app_context():
-		requeue_stale_running_jobs(stale_after_s=DEFAULT_STALE_JOB_SECONDS)
+		requeue_stale_running_jobs(stale_after_s=_env_int("JOB_STALE_AFTER_S", DEFAULT_STALE_JOB_SECONDS, minimum=15))
+	idle_sleep_s = max(0.25, poll_interval_s)
 	while True:
+		_touch_heartbeat_file(worker_name or "worker")
 		with app.app_context():
-			requeue_stale_running_jobs(stale_after_s=DEFAULT_STALE_JOB_SECONDS)
 			job = claim_next_job(worker_id)
 			if job is None:
-				time.sleep(poll_interval_s)
+				time.sleep(idle_sleep_s)
+				idle_sleep_s = min(
+					_env_float("WORKER_IDLE_BACKOFF_MAX_S", DEFAULT_IDLE_BACKOFF_MAX_S, minimum=0.5),
+					idle_sleep_s + poll_interval_s,
+				)
 				continue
+			idle_sleep_s = max(0.25, poll_interval_s)
 			logger.info("Worker %s claimed job %s (%s)", worker_id, job.id, job.job_type)
 			process_job(job.id, worker_id)
 
@@ -689,7 +803,33 @@ def main() -> None:
 	from .app import create_app
 
 	app = create_app()
-	run_forever(app)
+	poll_interval_s = _env_float("JOB_POLL_INTERVAL_S", DEFAULT_JOB_POLL_INTERVAL_S, minimum=0.25)
+	worker_concurrency = _env_int("WORKER_CONCURRENCY", 1, minimum=1)
+	maintenance_interval_s = _env_float("MAINTENANCE_INTERVAL_S", DEFAULT_MAINTENANCE_INTERVAL_S, minimum=10.0)
+	maintenance_thread = threading.Thread(
+		target=_maintenance_loop,
+		name="easyflex-maintenance",
+		args=(app,),
+		kwargs={"interval_s": maintenance_interval_s},
+		daemon=True,
+	)
+	maintenance_thread.start()
+	if worker_concurrency <= 1:
+		run_forever(app, poll_interval_s=poll_interval_s, worker_name="worker-1")
+		return
+	threads: list[threading.Thread] = []
+	for index in range(worker_concurrency):
+		thread = threading.Thread(
+			target=run_forever,
+			name=f"easyflex-worker-{index + 1}",
+			args=(app,),
+			kwargs={"poll_interval_s": poll_interval_s, "worker_name": f"worker-{index + 1}"},
+			daemon=False,
+		)
+		thread.start()
+		threads.append(thread)
+	for thread in threads:
+		thread.join()
 
 
 if __name__ == "__main__":

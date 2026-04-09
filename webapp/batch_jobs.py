@@ -32,6 +32,10 @@ from .models import BatchJob, InvoiceBatch, db
 _DbResultT = TypeVar("_DbResultT")
 DEFAULT_DB_RETRY_ATTEMPTS = 3
 DEFAULT_STALE_JOB_SECONDS = 90
+DEFAULT_RETRY_BASE_DELAY_S = 30
+DEFAULT_RETRY_MAX_DELAY_S = 15 * 60
+DEFAULT_JOB_RETENTION_HOURS = 24 * 14
+DEFAULT_BATCH_DIR_RETENTION_HOURS = 24 * 7
 
 
 def utcnow() -> datetime:
@@ -161,9 +165,16 @@ def queue_batch_job(
 		max_attempts=max(1, int(max_attempts)),
 		payload=payload or {},
 		resume_cursor={},
+		next_attempt_at=None,
 	)
 	db.session.add(job)
 	return job
+
+
+def job_retry_delay_s(attempt_count: int) -> int:
+	safe_attempt = max(1, int(attempt_count or 1))
+	delay = DEFAULT_RETRY_BASE_DELAY_S * (2 ** (safe_attempt - 1))
+	return int(min(DEFAULT_RETRY_MAX_DELAY_S, delay))
 
 
 def active_job_for_batch(batch_id: int) -> BatchJob | None:
@@ -191,11 +202,17 @@ def requeue_stale_running_jobs(*, stale_after_s: int = DEFAULT_STALE_JOB_SECONDS
 	)
 	count = 0
 	for job in jobs:
-		job.status = JOB_STATUS_RETRYABLE_FAILED
+		next_attempt_at = utcnow() + timedelta(seconds=job_retry_delay_s(int(job.attempt_count or 1)))
+		if int(job.attempt_count or 0) >= int(job.max_attempts or 1):
+			job.status = JOB_STATUS_FAILED
+			job.summary_message = (job.summary_message or "").strip() or "Job vyčerpal maximální počet pokusů po výpadku workeru."
+		else:
+			job.status = JOB_STATUS_RETRYABLE_FAILED
+			job.summary_message = (job.summary_message or "").strip() or "Job vyžaduje obnovení po restartu workeru."
 		job.claimed_by = None
 		job.claimed_at = None
-		job.summary_message = (job.summary_message or "").strip() or "Job vyžaduje obnovení po restartu workeru."
 		job.last_error = "Worker heartbeat vypršel."
+		job.next_attempt_at = None if job.status == JOB_STATUS_FAILED else next_attempt_at
 		batch = db.session.get(InvoiceBatch, job.batch_id)
 		if batch is not None and batch.active_job_type == job.job_type:
 			batch.active_job_type = job.job_type
@@ -219,6 +236,7 @@ def claim_next_job(worker_id: str) -> BatchJob | None:
 					SET status = :running,
 					    claimed_by = :worker_id,
 					    claimed_at = :now,
+					    next_attempt_at = NULL,
 					    last_heartbeat_at = :now,
 					    started_at = COALESCE(started_at, :now),
 					    attempt_count = attempt_count + 1
@@ -226,6 +244,7 @@ def claim_next_job(worker_id: str) -> BatchJob | None:
 						SELECT id
 						FROM batch_job
 						WHERE status IN (:queued, :retryable_failed)
+						  AND (next_attempt_at IS NULL OR next_attempt_at <= :now)
 						ORDER BY priority DESC, id ASC
 						FOR UPDATE SKIP LOCKED
 						LIMIT 1
@@ -248,6 +267,7 @@ def claim_next_job(worker_id: str) -> BatchJob | None:
 	job = (
 		BatchJob.query
 		.filter(BatchJob.status.in_([JOB_STATUS_QUEUED, JOB_STATUS_RETRYABLE_FAILED]))
+		.filter((BatchJob.next_attempt_at.is_(None)) | (BatchJob.next_attempt_at <= now))
 		.order_by(BatchJob.priority.desc(), BatchJob.id.asc())
 		.first()
 	)
@@ -256,6 +276,7 @@ def claim_next_job(worker_id: str) -> BatchJob | None:
 	job.status = JOB_STATUS_RUNNING
 	job.claimed_by = worker_id
 	job.claimed_at = now
+	job.next_attempt_at = None
 	job.last_heartbeat_at = now
 	job.started_at = job.started_at or now
 	job.attempt_count = int(job.attempt_count or 0) + 1
@@ -278,6 +299,7 @@ def finalize_job(
 	summary_message: Optional[str] = None,
 	last_error: Optional[str] = None,
 	resume_cursor: Optional[dict[str, Any]] = None,
+	next_attempt_at: Optional[datetime] = None,
 ) -> bool:
 	job = db.session.get(BatchJob, job_id)
 	if job is None:
@@ -289,6 +311,7 @@ def finalize_job(
 	job.last_error = last_error
 	if resume_cursor is not None:
 		job.resume_cursor = resume_cursor
+	job.next_attempt_at = next_attempt_at
 	job.claimed_by = None if status != JOB_STATUS_RUNNING else job.claimed_by
 	job.claimed_at = None if status != JOB_STATUS_RUNNING else job.claimed_at
 	return True
@@ -309,6 +332,54 @@ def cancel_non_terminal_jobs_for_batch(batch_id: int, *, keep_job_id: Optional[i
 			continue
 		job.status = JOB_STATUS_CANCELLED
 		job.finished_at = utcnow()
+		job.next_attempt_at = None
 		job.summary_message = "Job byl nahrazen novějším požadavkem."
 		count += 1
 	return count
+
+
+def cleanup_old_terminal_jobs(*, retention_hours: int = DEFAULT_JOB_RETENTION_HOURS) -> int:
+	cutoff = utcnow() - timedelta(hours=max(1, int(retention_hours)))
+	jobs = (
+		BatchJob.query
+		.filter(
+			BatchJob.status.in_(list(JOB_TERMINAL_STATUSES)),
+			BatchJob.finished_at.isnot(None),
+			BatchJob.finished_at < cutoff,
+		)
+		.all()
+	)
+	count = len(jobs)
+	for job in jobs:
+		db.session.delete(job)
+	if count:
+		db.session.commit()
+	return count
+
+
+def cleanup_orphaned_batch_storage(*, retention_hours: int = DEFAULT_BATCH_DIR_RETENTION_HOURS) -> int:
+	instance_batches_root = Path(current_app.instance_path) / "batches"
+	if not instance_batches_root.exists():
+		return 0
+	cutoff = utcnow() - timedelta(hours=max(1, int(retention_hours)))
+	active_batch_ids = {
+		str(item[0])
+		for item in db.session.query(InvoiceBatch.id).all()
+	}
+	removed = 0
+	for child in instance_batches_root.iterdir():
+		if not child.is_dir():
+			continue
+		if child.name in active_batch_ids:
+			continue
+		mtime = datetime.fromtimestamp(child.stat().st_mtime)
+		if mtime >= cutoff:
+			continue
+		for nested in sorted(child.rglob("*"), reverse=True):
+			if nested.is_file() or nested.is_symlink():
+				nested.unlink(missing_ok=True)
+			elif nested.is_dir():
+				nested.rmdir()
+		child.rmdir()
+		removed += 1
+	return removed

@@ -101,6 +101,12 @@ EASYFLEX_SECURE_COOKIES=false
 
 CADDY_SITE_ADDRESS=:80
 WEB_CONCURRENCY=2
+WORKER_CONCURRENCY=2
+JOB_STALE_AFTER_S=120
+MAINTENANCE_INTERVAL_S=60
+JOB_RETENTION_HOURS=336
+BATCH_STORAGE_RETENTION_HOURS=168
+BACKUP_RETENTION_DAYS=14
 
 MAX_PDF_FILES_PER_BATCH=100
 MAX_PDF_FILE_BYTES=26214400
@@ -225,6 +231,8 @@ cd ~/EasyFlex-WebApp
 bash scripts/selfhost/update_stack.sh
 ```
 
+Skript nově schválně zastaví update, pokud najde lokální změny v tracked souborech. Tím se snižuje riziko nechtěného konfliktu při `git pull`.
+
 ## 12. Jak udělat zálohu databáze
 
 Spusťte:
@@ -239,6 +247,61 @@ Záloha se uloží do:
 ```text
 ~/EasyFlex-WebApp/backups/
 ```
+
+Záloha se teď komprimuje do `.sql.gz` a staré backupy se automaticky mažou podle `BACKUP_RETENTION_DAYS`.
+
+Pro automatickou noční zálohu si můžete přidat cron:
+
+```bash
+crontab -e
+```
+
+A vložit například:
+
+```bash
+15 3 * * * cd ~/EasyFlex-WebApp && bash scripts/selfhost/backup_postgres.sh >> ~/easyflex-backup.log 2>&1
+```
+
+Alternativně jsou v repu připravené systemd šablony:
+
+```text
+scripts/selfhost/systemd/easyflex-backup.service
+scripts/selfhost/systemd/easyflex-backup.timer
+```
+
+Na serveru je můžete zkopírovat do:
+
+```text
+/etc/systemd/system/
+```
+
+A potom aktivovat:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now easyflex-backup.timer
+sudo systemctl list-timers easyflex-backup.timer
+```
+
+## 12b. Co se teď udržuje automaticky
+
+Worker nově sám průběžně:
+- znovu zařazuje stuck joby po vypršení heartbeat,
+- plánuje retry s backoffem,
+- čistí staré záznamy dokončených jobů,
+- a maže orphaned dávkové soubory podle retention.
+
+## 12c. Health a readiness
+
+Pro jednoduchý dohled jsou k dispozici endpointy:
+
+```text
+/healthz
+/readyz
+```
+
+- `/healthz` slouží jako liveness check procesu webu
+- `/readyz` navíc ověřuje dostupnost databáze a vrací `503`, pokud DB není připravená
 
 ## 13. Jak službu vypnout nebo znovu spustit
 

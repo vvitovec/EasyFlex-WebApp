@@ -58,10 +58,10 @@ def _as_bool(value):
 	return bool(value)
 
 
-def _ensure_settings_row(user, base_cfg: AppConfig) -> UserSettings:
-	settings = getattr(user, "settings", None)
+def _ensure_settings_row_for_user_id(user_id: int, base_cfg: AppConfig) -> UserSettings:
+	settings = UserSettings.query.filter_by(user_id=user_id).first()
 	if settings is None:
-		settings = UserSettings(user=user)
+		settings = UserSettings(user_id=user_id)
 		# Pre-fill with base values so the settings page is informative
 		# Sensitive values must stay empty for new users
 		settings.abra_company = None
@@ -75,11 +75,16 @@ def _ensure_settings_row(user, base_cfg: AppConfig) -> UserSettings:
 	return settings
 
 
+def _ensure_settings_row(user, base_cfg: AppConfig) -> UserSettings:
+	user_id = int(getattr(user, "id"))
+	return _ensure_settings_row_for_user_id(user_id, base_cfg)
+
+
 def _get_admin_settings(base_cfg: AppConfig) -> UserSettings | None:
 	admin = User.query.filter_by(is_admin=True).order_by(User.id.asc()).first()
 	if admin is None:
 		return None
-	return _ensure_settings_row(admin, base_cfg)
+	return _ensure_settings_row_for_user_id(int(admin.id), base_cfg)
 
 
 def _apply_overrides(cfg: AppConfig, overrides: dict) -> None:
@@ -112,9 +117,12 @@ def _ensure_base_config() -> AppConfig:
 	return cfg
 
 
-def _build_user_config(user: User, base_cfg: AppConfig) -> AppConfig:
-	"""Return a deep-copied AppConfig with overrides from the provided user settings."""
-	settings = _ensure_settings_row(user, base_cfg)
+def _build_user_config_for_user_id(user_id: int, base_cfg: AppConfig) -> AppConfig:
+	"""Return a deep-copied AppConfig with overrides from persisted user settings."""
+	user = db.session.get(User, int(user_id))
+	if user is None:
+		raise LookupError(f"User {user_id} not found")
+	settings = _ensure_settings_row_for_user_id(int(user.id), base_cfg)
 	admin_settings = _get_admin_settings(base_cfg)
 	# Build per-user copy
 	cfg = deepcopy(base_cfg)
@@ -150,13 +158,24 @@ def _build_user_config(user: User, base_cfg: AppConfig) -> AppConfig:
 	return cfg
 
 
+def _build_user_config(user: User, base_cfg: AppConfig) -> AppConfig:
+	"""Return a deep-copied AppConfig with overrides from the provided user settings."""
+	return _build_user_config_for_user_id(int(getattr(user, "id")), base_cfg)
+
+
 def get_user_config() -> AppConfig:
 	"""Return a deep-copied AppConfig with overrides from current user's settings."""
 	base_cfg = _ensure_base_config()
-	return _build_user_config(current_user, base_cfg)
+	return _build_user_config_for_user_id(int(current_user.id), base_cfg)
 
 
 def get_user_config_for_user(user: User) -> AppConfig:
 	"""Return AppConfig for an explicit user (safe to use in background jobs)."""
 	base_cfg = _ensure_base_config()
-	return _build_user_config(user, base_cfg)
+	return _build_user_config_for_user_id(int(getattr(user, "id")), base_cfg)
+
+
+def get_user_config_for_user_id(user_id: int) -> AppConfig:
+	"""Return AppConfig for a user id without relying on a session-bound ORM instance."""
+	base_cfg = _ensure_base_config()
+	return _build_user_config_for_user_id(int(user_id), base_cfg)

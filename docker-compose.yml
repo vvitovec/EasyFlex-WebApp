@@ -2,6 +2,7 @@ services:
   db:
     image: postgres:17-alpine
     container_name: easyflex-db
+    init: true
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-easyflex}
@@ -20,7 +21,9 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: easyflex-web
+    init: true
     restart: unless-stopped
+    stop_grace_period: 45s
     depends_on:
       db:
         condition: service_healthy
@@ -30,8 +33,14 @@ services:
       EASYFLEX_ENV: production
       DATABASE_URL: postgresql://${POSTGRES_USER:-easyflex}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-easyflex}
       PORT: 10000
+      JOB_STALE_AFTER_S: ${JOB_STALE_AFTER_S:-120}
     volumes:
       - easyflex_instance:/app/instance
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:10000/readyz', timeout=5).read()\""]
+      interval: 30s
+      timeout: 15s
+      retries: 3
     command: >
       sh -c "gunicorn webapp.app:app
       --bind 0.0.0.0:10000
@@ -44,7 +53,9 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: easyflex-worker
+    init: true
     restart: unless-stopped
+    stop_grace_period: 60s
     depends_on:
       db:
         condition: service_healthy
@@ -53,8 +64,20 @@ services:
     environment:
       EASYFLEX_ENV: production
       DATABASE_URL: postgresql://${POSTGRES_USER:-easyflex}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-easyflex}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      JOB_POLL_INTERVAL_S: ${JOB_POLL_INTERVAL_S:-2}
+      WORKER_IDLE_BACKOFF_MAX_S: ${WORKER_IDLE_BACKOFF_MAX_S:-10}
+      JOB_STALE_AFTER_S: ${JOB_STALE_AFTER_S:-120}
+      MAINTENANCE_INTERVAL_S: ${MAINTENANCE_INTERVAL_S:-60}
+      JOB_RETENTION_HOURS: ${JOB_RETENTION_HOURS:-336}
+      BATCH_STORAGE_RETENTION_HOURS: ${BATCH_STORAGE_RETENTION_HOURS:-168}
     volumes:
       - easyflex_instance:/app/instance
+    healthcheck:
+      test: ["CMD-SHELL", "find /tmp -maxdepth 1 -name 'easyflex-worker-*.heartbeat' -mmin -2 | grep -q . && find /tmp -maxdepth 1 -name 'easyflex-maintenance.heartbeat' -mmin -2 | grep -q ."]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     command: python -m webapp.worker
 
   caddy:

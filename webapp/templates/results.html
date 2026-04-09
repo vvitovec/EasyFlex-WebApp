@@ -15,23 +15,54 @@
 			data-status="{{ batch_progress.status }}"
 			data-row-count="{{ batch_progress.row_count }}"
 			data-terminal="{% if batch_progress.is_terminal %}1{% else %}0{% endif %}"
+			data-working="{% if batch_progress.working %}1{% else %}0{% endif %}"
+			data-invoice-indeterminate="{% if batch_progress.invoice_progress_indeterminate %}1{% else %}0{% endif %}"
 		>
 			<div class="batch-progress-head">
-				<strong id="batch-status-label">{{ batch_progress.status_label }}</strong>
-				<span id="batch-job-label">
+				<div class="batch-progress-status">
+					<span class="batch-live-dot{% if batch_progress.working %} is-active{% endif %}" id="batch-live-dot" aria-hidden="true"></span>
+					<strong id="batch-status-label">{{ batch_progress.status_label }}</strong>
+				</div>
+				<span class="batch-job-pill" id="batch-job-label">
 					{% if batch_progress.active_job_type == 'extract_pdf' %}Extrakce PDF{% elif batch_progress.active_job_type == 'import_abra' %}Import do ABRA{% else %}Bez aktivního jobu{% endif %}
 					{% if batch_progress.active_job_status_label %}• {{ batch_progress.active_job_status_label }}{% endif %}
 				</span>
 			</div>
-			<div class="batch-progress-head">
-				<strong id="batch-phase-label">{{ batch_progress.current_phase_label }}</strong>
-				<span id="batch-invoice-progress-text">{{ batch_progress.processed_invoices }}/{{ batch_progress.total_invoices_estimate }} faktur</span>
+			<div class="batch-progress-hero">
+				<div>
+					<strong class="batch-progress-activity" id="batch-phase-label">{{ batch_progress.current_phase_label }}</strong>
+					<div class="muted" id="batch-activity-label">{{ batch_progress.activity_label }}</div>
+				</div>
+				<div class="batch-progress-spinner{% if batch_progress.working %} is-active{% endif %}" id="batch-progress-spinner" aria-hidden="true"></div>
 			</div>
-			<div class="batch-progress-track">
-				<div class="batch-progress-fill" id="batch-progress-fill" style="width: {{ batch_progress.invoice_progress_percent }}%;"></div>
+			<div class="batch-progress-bars">
+				<div class="batch-progress-block">
+					<div class="batch-progress-row-label">
+						<span>PDF soubory</span>
+						<strong id="batch-progress-text">{{ batch_progress.processed_files }}/{{ batch_progress.total_files }}</strong>
+					</div>
+					<div class="batch-progress-track">
+						<div class="batch-progress-fill" id="batch-file-progress-fill" style="width: {{ batch_progress.file_progress_percent }}%;"></div>
+					</div>
+				</div>
+				<div class="batch-progress-block">
+					<div class="batch-progress-row-label">
+						<span>Faktury</span>
+						<strong id="batch-invoice-progress-text">
+							{% if batch_progress.invoice_progress_indeterminate and batch_progress.working %}
+								Nalezeno zatím {{ batch_progress.processed_invoices }} faktur
+							{% else %}
+								{{ batch_progress.processed_invoices }}/{{ batch_progress.total_invoices_estimate }} faktur
+							{% endif %}
+						</strong>
+					</div>
+					<div class="batch-progress-track batch-progress-track-secondary{% if batch_progress.invoice_progress_indeterminate and batch_progress.working %} is-indeterminate{% endif %}">
+						<div class="batch-progress-fill batch-progress-fill-secondary" id="batch-progress-fill" style="width: {{ batch_progress.invoice_progress_percent }}%;"></div>
+					</div>
+				</div>
 			</div>
-			<div class="batch-progress-meta">
-				<span>PDF: <strong id="batch-progress-text">{{ batch_progress.processed_files }}/{{ batch_progress.total_files }}</strong></span>
+				<div class="batch-progress-meta">
+					<span>PDF: <strong>{{ batch_progress.processed_files }}/{{ batch_progress.total_files }}</strong></span>
 				<span>Úspěšně extrahováno: <strong id="batch-success-count">{{ batch_progress.success_count }}</strong></span>
 				<span>Extrakční chyby: <strong id="batch-error-count">{{ batch_progress.error_count }}</strong></span>
 				<span>Označeno k importu: <strong id="batch-selected-count">{{ batch_progress.selected_count }}</strong></span>
@@ -40,8 +71,19 @@
 				<span>Přeskočeno: <strong id="batch-import-skipped-count">{{ batch_progress.import_skipped_count }}</strong></span>
 				<span>Kredity: <strong id="batch-credits-count">{{ batch_progress.credits_charged }}</strong></span>
 			</div>
+			<div class="batch-progress-extra">
+				<span id="batch-queue-position">{% if batch_progress.queue_position %}Pozice ve frontě: {{ batch_progress.queue_position }}{% elif batch_progress.next_retry_in_s is not none %}Retry za {{ batch_progress.next_retry_in_s }} s{% else %}Fronta aktivní{% endif %}</span>
+				<span id="batch-eta-text">{% if batch_progress.eta_seconds %}ETA ~ {{ batch_progress.eta_seconds }} s{% else %}ETA: —{% endif %}</span>
+				<span id="batch-attempts-text">{% if batch_progress.active_job_attempt_count %}Pokus {{ batch_progress.active_job_attempt_count }}/{{ batch_progress.active_job_max_attempts }}{% else %}Pokusy: —{% endif %}</span>
+				<span id="batch-stale-text">{% if batch_progress.stale %}Heartbeat stale: {{ batch_progress.stale_seconds }} s{% else %}Heartbeat v limitu{% endif %}</span>
+			</div>
 			<p class="muted" id="batch-summary-text">{{ batch_progress.summary_message or "Čeká na zpracování…" }}</p>
 			<p class="muted" id="batch-heartbeat-text">Poslední heartbeat: {{ batch_progress.last_heartbeat_at or "—" }}</p>
+			{% if batch_progress.active_job_last_error %}
+				<p class="muted danger-text" id="batch-last-error-text">{{ batch_progress.active_job_last_error }}</p>
+			{% else %}
+				<p class="muted" id="batch-last-error-text"></p>
+			{% endif %}
 		</div>
 	{% endif %}
 
@@ -253,15 +295,24 @@
 		const importSkippedCountEl = document.getElementById('batch-import-skipped-count');
 		const progressLabelEl = document.getElementById('batch-status-label');
 		const progressJobEl = document.getElementById('batch-job-label');
+		const progressLiveDotEl = document.getElementById('batch-live-dot');
+		const progressSpinnerEl = document.getElementById('batch-progress-spinner');
 		const progressTextEl = document.getElementById('batch-progress-text');
 		const progressPhaseEl = document.getElementById('batch-phase-label');
+		const progressActivityEl = document.getElementById('batch-activity-label');
 		const progressInvoiceTextEl = document.getElementById('batch-invoice-progress-text');
+		const progressFileFillEl = document.getElementById('batch-file-progress-fill');
 		const progressFillEl = document.getElementById('batch-progress-fill');
 		const progressSummaryEl = document.getElementById('batch-summary-text');
 		const progressHeartbeatEl = document.getElementById('batch-heartbeat-text');
 		const progressSuccessEl = document.getElementById('batch-success-count');
 		const progressErrorEl = document.getElementById('batch-error-count');
 		const progressCreditsEl = document.getElementById('batch-credits-count');
+		const progressQueueEl = document.getElementById('batch-queue-position');
+		const progressEtaEl = document.getElementById('batch-eta-text');
+		const progressAttemptsEl = document.getElementById('batch-attempts-text');
+		const progressStaleEl = document.getElementById('batch-stale-text');
+		const progressLastErrorEl = document.getElementById('batch-last-error-text');
 		let lastKnownStatus = progressRoot ? (progressRoot.dataset.status || "") : "";
 		let lastKnownRowCount = progressRoot ? Number(progressRoot.dataset.rowCount || "0") : 0;
 		let lastReloadAt = Date.now();
@@ -338,6 +389,8 @@
 
 		function updateProgress(payload) {
 			if (!payload || !progressRoot) return;
+			progressRoot.dataset.working = payload.working ? "1" : "0";
+			progressRoot.dataset.invoiceIndeterminate = payload.invoice_progress_indeterminate ? "1" : "0";
 			if (progressLabelEl) progressLabelEl.textContent = payload.status_label || payload.status || "";
 			if (progressJobEl) {
 				const jobLabel = payload.active_job_type === 'extract_pdf'
@@ -347,10 +400,21 @@
 						: 'Bez aktivního jobu';
 				progressJobEl.textContent = payload.active_job_status_label ? `${jobLabel} • ${payload.active_job_status_label}` : jobLabel;
 			}
+			if (progressLiveDotEl) progressLiveDotEl.classList.toggle('is-active', Boolean(payload.working));
+			if (progressSpinnerEl) progressSpinnerEl.classList.toggle('is-active', Boolean(payload.working));
 			if (progressTextEl) progressTextEl.textContent = `${payload.processed_files}/${payload.total_files}`;
 			if (progressPhaseEl) progressPhaseEl.textContent = payload.current_phase_label || "Zpracování";
-			if (progressInvoiceTextEl) progressInvoiceTextEl.textContent = `${payload.processed_invoices || 0}/${payload.total_invoices_estimate || 0} faktur`;
+			if (progressActivityEl) progressActivityEl.textContent = payload.activity_label || "";
+			if (progressInvoiceTextEl) {
+				progressInvoiceTextEl.textContent = payload.invoice_progress_indeterminate && payload.working
+					? `Nalezeno zatím ${payload.processed_invoices || 0} faktur`
+					: `${payload.processed_invoices || 0}/${payload.total_invoices_estimate || 0} faktur`;
+			}
+			if (progressFileFillEl) progressFileFillEl.style.width = `${payload.file_progress_percent || 0}%`;
 			if (progressFillEl) progressFillEl.style.width = `${payload.invoice_progress_percent || 0}%`;
+			if (progressFillEl && progressFillEl.parentElement) {
+				progressFillEl.parentElement.classList.toggle('is-indeterminate', Boolean(payload.invoice_progress_indeterminate && payload.working));
+			}
 			if (progressSummaryEl) progressSummaryEl.textContent = payload.summary_message || "";
 			if (progressHeartbeatEl) progressHeartbeatEl.textContent = `Poslední heartbeat: ${payload.last_heartbeat_at || "—"}`;
 			if (progressSuccessEl) progressSuccessEl.textContent = String(payload.success_count || 0);
@@ -360,6 +424,27 @@
 			if (importFailedCountEl) importFailedCountEl.textContent = String(payload.import_failed_count || 0);
 			if (importSkippedCountEl) importSkippedCountEl.textContent = String(payload.import_skipped_count || 0);
 			if (progressCreditsEl) progressCreditsEl.textContent = String(payload.credits_charged || 0);
+			if (progressQueueEl) {
+				if (payload.queue_position) {
+					progressQueueEl.textContent = `Pozice ve frontě: ${payload.queue_position}`;
+				} else if (payload.next_retry_in_s !== null && payload.next_retry_in_s !== undefined) {
+					progressQueueEl.textContent = `Retry za ${payload.next_retry_in_s} s`;
+				} else {
+					progressQueueEl.textContent = 'Fronta aktivní';
+				}
+			}
+			if (progressEtaEl) progressEtaEl.textContent = payload.eta_seconds ? `ETA ~ ${payload.eta_seconds} s` : 'ETA: —';
+			if (progressAttemptsEl) {
+				progressAttemptsEl.textContent = payload.active_job_attempt_count
+					? `Pokus ${payload.active_job_attempt_count}/${payload.active_job_max_attempts}`
+					: 'Pokusy: —';
+			}
+			if (progressStaleEl) {
+				progressStaleEl.textContent = payload.stale
+					? `Heartbeat stale: ${payload.stale_seconds || 0} s`
+					: 'Heartbeat v limitu';
+			}
+			if (progressLastErrorEl) progressLastErrorEl.textContent = payload.active_job_last_error || "";
 		}
 
 		async function pollProgress() {

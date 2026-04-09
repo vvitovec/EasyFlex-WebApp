@@ -36,7 +36,7 @@ from EasyFlex.models import InvoiceData
 
 from .models import init_db, db, User, UserSettings, InvoiceBatch, InvoiceRow, BatchJob
 from .auth import init_auth
-from .config_utils import EXTRACTOR_OVERRIDE_KEYS, get_user_config, get_user_config_for_user
+from .config_utils import EXTRACTOR_OVERRIDE_KEYS, get_user_config, get_user_config_for_user, get_user_config_for_user_id
 from .invoice_batches import (
 	DISPLAY_COLUMNS,
 	COLUMN_LABELS,
@@ -63,6 +63,7 @@ from .abra_context import (
 	add_doc_type as store_doc_type,
 	apply_context_to_config,
 	current_context,
+	current_context_for_user,
 	ensure_seed_data,
 	list_all_doc_types,
 	list_companies,
@@ -501,6 +502,136 @@ def _build_batch_summary(
 	return msg
 
 
+def _seconds_since(moment: Optional[datetime]) -> Optional[int]:
+	if moment is None:
+		return None
+	return max(0, int((_utcnow() - moment).total_seconds()))
+
+
+def _estimate_eta_seconds(*, processed: int, total: int, started_at: Optional[datetime]) -> Optional[int]:
+	if started_at is None or processed <= 0 or total <= processed:
+		return None
+	elapsed = max(1, _seconds_since(started_at) or 0)
+	rate = processed / elapsed
+	if rate <= 0:
+		return None
+	return int(round((total - processed) / rate))
+
+
+def _batch_queue_position(job: Optional[BatchJob]) -> Optional[int]:
+	if job is None:
+		return None
+	if job.status == "queued":
+		ahead = (
+			BatchJob.query
+			.filter(
+				BatchJob.status == "queued",
+				((BatchJob.priority > job.priority) | ((BatchJob.priority == job.priority) & (BatchJob.id < job.id))),
+			)
+			.count()
+		)
+		return int(ahead + 1)
+	if job.status == "retryable_failed" and job.next_attempt_at:
+		return 0
+	return None
+
+
+def _serialize_job(job: BatchJob) -> dict[str, Any]:
+	batch = db.session.get(InvoiceBatch, job.batch_id)
+	queue_position = _batch_queue_position(job)
+	last_heartbeat_age_s = _seconds_since(job.last_heartbeat_at)
+	next_retry_in_s = None
+	if job.next_attempt_at is not None:
+		next_retry_in_s = max(0, int((job.next_attempt_at - _utcnow()).total_seconds()))
+	return {
+		"id": job.id,
+		"batch_id": job.batch_id,
+		"user_id": job.user_id,
+		"job_type": job.job_type,
+		"status": job.status,
+		"status_label": job_status_label(job.status),
+		"attempt_count": int(job.attempt_count or 0),
+		"max_attempts": int(job.max_attempts or 0),
+		"priority": int(job.priority or 0),
+		"claimed_by": job.claimed_by,
+		"claimed_at": job.claimed_at.isoformat() if job.claimed_at else None,
+		"last_heartbeat_at": job.last_heartbeat_at.isoformat() if job.last_heartbeat_at else None,
+		"last_heartbeat_age_s": last_heartbeat_age_s,
+		"next_attempt_at": job.next_attempt_at.isoformat() if job.next_attempt_at else None,
+		"next_retry_in_s": next_retry_in_s,
+		"summary_message": (job.summary_message or "").strip() or None,
+		"last_error": (job.last_error or "").strip() or None,
+		"queue_position": queue_position,
+		"batch_source_label": batch.source_label if batch is not None else None,
+		"clearable": (job.status or "").strip().lower() in {"retryable_failed", "failed"},
+	}
+
+
+def _batch_file_unit_label(batch: InvoiceBatch) -> str:
+	suffix = Path((batch.source_label or "").strip()).suffix.lower()
+	if suffix in {".csv", ".xlsx", ".xls", ".xml", ".txt"}:
+		return suffix[1:].upper()
+	if (batch.source_type or "").strip().lower() == "pdf":
+		return "PDF"
+	return "soubor"
+
+
+def _serialize_batch_summary(batch: InvoiceBatch) -> dict[str, Any]:
+	progress = _batch_progress_payload(batch)
+	return {
+		"id": batch.id,
+		"source_label": batch.source_label or f"Dávka {batch.id}",
+		"file_unit_label": _batch_file_unit_label(batch),
+		"created_at": batch.created_at.isoformat() if batch.created_at else None,
+		"status": progress["status"],
+		"status_label": progress["status_label"],
+		"current_phase_label": progress["current_phase_label"],
+		"summary_message": progress["summary_message"],
+		"processed_files": progress["processed_files"],
+		"total_files": progress["total_files"],
+		"processed_invoices": progress["processed_invoices"],
+		"total_invoices_estimate": progress["total_invoices_estimate"],
+		"invoice_progress_percent": progress["invoice_progress_percent"],
+		"is_terminal": progress["is_terminal"],
+		"stale": progress["stale"],
+		"stale_seconds": progress["stale_seconds"],
+		"eta_seconds": progress["eta_seconds"],
+	}
+
+
+def _queue_overview_for_user(user_id: int) -> dict[str, int]:
+	base_query = BatchJob.query.filter(BatchJob.user_id == user_id)
+	return {
+		"queued": int(base_query.filter(BatchJob.status == "queued").count()),
+		"running": int(base_query.filter(BatchJob.status == "running").count()),
+		"retryable_failed": int(base_query.filter(BatchJob.status == "retryable_failed").count()),
+		"failed": int(base_query.filter(BatchJob.status == "failed").count()),
+	}
+
+
+def _recent_batches_for_user(user_id: int, *, limit: int = 8) -> list[dict[str, Any]]:
+	items = (
+		InvoiceBatch.query
+		.filter(InvoiceBatch.user_id == user_id)
+		.order_by(InvoiceBatch.created_at.desc(), InvoiceBatch.id.desc())
+		.limit(limit)
+		.all()
+	)
+	return [_serialize_batch_summary(batch) for batch in items]
+
+
+def _problem_jobs(*, limit: int = 20, user_id: Optional[int] = None) -> list[dict[str, Any]]:
+	query = BatchJob.query.filter(BatchJob.status.in_(["retryable_failed", "failed", "running", "queued"]))
+	if user_id is not None:
+		query = query.filter(BatchJob.user_id == user_id)
+	items = (
+		query.order_by(BatchJob.created_at.desc(), BatchJob.id.desc())
+		.limit(limit)
+		.all()
+	)
+	return [_serialize_job(job) for job in items]
+
+
 def _batch_progress_payload(batch: InvoiceBatch, *, row_count: Optional[int] = None) -> dict[str, Any]:
 	status = (batch.processing_status or BATCH_STATUS_COMPLETED).strip().lower()
 	total = max(0, int(batch.total_files or 0))
@@ -565,10 +696,62 @@ def _batch_progress_payload(batch: InvoiceBatch, *, row_count: Optional[int] = N
 		else (batch.summary_message or "")
 	)
 	last_heartbeat = None
+	last_heartbeat_dt = None
 	if active_job is not None and active_job.last_heartbeat_at:
 		last_heartbeat = active_job.last_heartbeat_at.isoformat()
+		last_heartbeat_dt = active_job.last_heartbeat_at
 	elif batch.last_heartbeat_at:
 		last_heartbeat = batch.last_heartbeat_at.isoformat()
+		last_heartbeat_dt = batch.last_heartbeat_at
+	stale_after_s = max(15, _env_int("JOB_STALE_AFTER_S", 90))
+	stale_seconds = _seconds_since(last_heartbeat_dt)
+	stale = bool(
+		not _is_terminal_batch_status(status)
+		and stale_seconds is not None
+		and stale_seconds >= stale_after_s
+	)
+	eta_seconds = _estimate_eta_seconds(
+		processed=processed if phase == "extracting" else processed_invoices,
+		total=total if phase == "extracting" else total_invoices_estimate,
+		started_at=batch.started_at,
+	)
+	queue_position = _batch_queue_position(active_job)
+	next_retry_in_s = None
+	next_attempt_at = None
+	if active_job is not None and active_job.next_attempt_at is not None:
+		next_attempt_at = active_job.next_attempt_at.isoformat()
+		next_retry_in_s = max(0, int((active_job.next_attempt_at - _utcnow()).total_seconds()))
+	working = not _is_terminal_batch_status(status)
+	invoice_progress_indeterminate = bool(
+		working
+		and active_job is not None
+		and (
+			phase in {"extracting", "persisting", "initializing"}
+			or (
+				phase == "importing"
+				and imported_count + import_failed_count + import_skipped_count < max(selected_count, 1)
+			)
+		)
+		and (
+			(phase in {"extracting", "persisting", "initializing"} and processed_invoices >= total_invoices_estimate)
+			or total_invoices_estimate <= 0
+		)
+	)
+	activity_label = "Čeká na zpracování"
+	if active_job_type == JOB_TYPE_EXTRACT_PDF:
+		if total > 0:
+			current_file = min(total, processed + 1 if working else processed)
+			activity_label = f"PDF {current_file}/{total}"
+		else:
+			activity_label = "Extrakce PDF"
+	elif active_job_type == JOB_TYPE_IMPORT_ABRA:
+		total_selected = max(selected_count, imported_count + import_failed_count + import_skipped_count)
+		if total_selected > 0:
+			done_import = imported_count + import_failed_count + import_skipped_count
+			current_import = min(total_selected, done_import + 1 if working else done_import)
+			activity_label = f"Import {current_import}/{total_selected}"
+		else:
+			activity_label = "Import do ABRA"
 	return {
 		"batch_id": batch.id,
 		"status": status,
@@ -584,9 +767,13 @@ def _batch_progress_payload(batch: InvoiceBatch, *, row_count: Optional[int] = N
 		"error_count": errors,
 		"credits_charged": charged,
 		"progress_percent": progress_pct,
+		"file_progress_percent": progress_pct,
 		"invoice_progress_percent": invoice_progress_pct,
+		"invoice_progress_indeterminate": invoice_progress_indeterminate,
 		"current_phase": phase,
 		"current_phase_label": _batch_phase_label(phase),
+		"working": working,
+		"activity_label": activity_label,
 		"summary_message": summary_message,
 		"row_count": row_count_value,
 		"selected_count": selected_count,
@@ -596,9 +783,19 @@ def _batch_progress_payload(batch: InvoiceBatch, *, row_count: Optional[int] = N
 		"active_job_type": active_job_type,
 		"active_job_status": active_job_status,
 		"active_job_status_label": job_status_label(active_job_status) if active_job_status else None,
+		"active_job_attempt_count": int(active_job.attempt_count or 0) if active_job is not None else 0,
+		"active_job_max_attempts": int(active_job.max_attempts or 0) if active_job is not None else 0,
+		"active_job_last_error": (active_job.last_error or "").strip() if active_job is not None and active_job.last_error else None,
+		"queue_position": queue_position,
+		"next_attempt_at": next_attempt_at,
+		"next_retry_in_s": next_retry_in_s,
 		"started_at": batch.started_at.isoformat() if batch.started_at else None,
 		"finished_at": batch.finished_at.isoformat() if batch.finished_at else None,
 		"last_heartbeat_at": last_heartbeat,
+		"last_heartbeat_age_s": stale_seconds,
+		"stale_seconds": stale_seconds,
+		"stale": stale,
+		"eta_seconds": eta_seconds,
 	}
 
 
@@ -620,10 +817,10 @@ def _start_batch_run(*, batch_id: int, user_id: int, file_count: int) -> bool:
 
 
 def _load_user_cfg(user_id: int):
-	user = db.session.get(User, user_id)
-	if user is None:
+	try:
+		return get_user_config_for_user_id(user_id)
+	except LookupError:
 		return None
-	return get_user_config_for_user(user)
 
 
 def _load_user_credits(user_id: int) -> int:
@@ -1070,7 +1267,7 @@ def _run_pdf_batch_job(
 					batch_for_import = db.session.get(InvoiceBatch, batch_id)
 					user_for_import = db.session.get(User, user_id)
 					if batch_for_import is not None and user_for_import is not None:
-						company_code, direction, doc_type_code = current_context(user_for_import.settings, base_cfg=cfg)
+						company_code, direction, doc_type_code = current_context_for_user(user_id, base_cfg=cfg)
 						apply_context_to_config(cfg, company_code, direction, doc_type_code)
 						ok, err, skipped = _import_batch(batch_for_import, cfg, None)
 						auto_import_note = f"Auto-import: {ok} OK, {err} chyb, {skipped} přeskočeno."
@@ -1294,11 +1491,77 @@ def create_app() -> Flask:
 	@app.route("/")
 	@login_required
 	def dashboard():
-		return render_template("dashboard.html")
+		recent_batches = _recent_batches_for_user(current_user.id, limit=20)
+		problem_jobs = _problem_jobs(limit=20, user_id=current_user.id)
+		return render_template(
+			"dashboard.html",
+			queue_overview=_queue_overview_for_user(current_user.id),
+			recent_batches=recent_batches,
+			problem_jobs=problem_jobs,
+			recent_batches_preview_limit=3,
+			problem_jobs_preview_limit=3,
+		)
+
+	@app.post("/jobs/<int:job_id>/dismiss")
+	@login_required
+	def dismiss_problem_job(job_id: int):
+		next_url = request.form.get("next") or url_for("dashboard")
+		job = BatchJob.query.filter(BatchJob.id == job_id, BatchJob.user_id == current_user.id).first_or_404()
+		if (job.status or "").strip().lower() not in {"retryable_failed", "failed"}:
+			flash("Tento job teď nelze smazat.", "warning")
+			return redirect(next_url)
+		db.session.delete(job)
+		db.session.commit()
+		flash(f"Job #{job_id} byl odstraněn ze seznamu.", "info")
+		return redirect(next_url)
+
+	@app.post("/jobs/attention/clear")
+	@login_required
+	def clear_problem_jobs():
+		next_url = request.form.get("next") or url_for("dashboard")
+		jobs = (
+			BatchJob.query
+			.filter(
+				BatchJob.user_id == current_user.id,
+				BatchJob.status.in_(["retryable_failed", "failed"]),
+			)
+			.all()
+		)
+		count = len(jobs)
+		for job in jobs:
+			db.session.delete(job)
+		db.session.commit()
+		if count:
+			flash(f"Odstraněno {count} problémových jobů.", "info")
+		else:
+			flash("Nebyly nalezeny žádné joby k odstranění.", "info")
+		return redirect(next_url)
+
+	@app.route("/admin/jobs")
+	@login_required
+	def admin_jobs():
+		if not current_user.is_admin:
+			abort(403)
+		return render_template(
+			"admin_jobs.html",
+			problem_jobs=_problem_jobs(limit=50),
+		)
 
 	@app.get("/healthz")
 	def healthz():
 		return jsonify({"status": "ok"}), 200
+
+	@app.get("/readyz")
+	def readyz():
+		try:
+			db.session.execute(db.text("SELECT 1"))
+			db.session.remove()
+			return jsonify({"status": "ready", "database": "ok"}), 200
+		except Exception as exc:  # noqa: BLE001
+			db.session.rollback()
+			db.session.remove()
+			logger.warning("Readiness check failed", exc_info=True)
+			return jsonify({"status": "degraded", "database": "error", "reason": str(exc)}), 503
 
 	@app.route("/napoveda")
 	def help_page():

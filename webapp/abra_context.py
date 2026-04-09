@@ -138,6 +138,20 @@ def current_context(settings: UserSettings, base_cfg=None) -> Tuple[Optional[str
 	return company, direction, doc_type
 
 
+def current_context_for_user(user_id: int, base_cfg=None) -> Tuple[Optional[str], str, Optional[str]]:
+	"""Return ABRA context for a user without relying on lazy-loaded ORM relationships."""
+	if base_cfg is None:
+		base_cfg = load_config()
+	settings = UserSettings.query.filter_by(user_id=user_id).first()
+	if settings is None:
+		return (
+			getattr(base_cfg, "abra_company", None),
+			getattr(base_cfg, "abra_doc_endpoint", "faktura-prijata") or "faktura-prijata",
+			getattr(base_cfg, "abra_doc_type_code", None),
+		)
+	return current_context(settings, base_cfg=base_cfg)
+
+
 def apply_context_to_config(cfg, company_code: Optional[str], direction: Optional[str], doc_type_code: Optional[str]) -> None:
 	"""Mutate AppConfig copy with the selected ABRA context."""
 	if company_code:

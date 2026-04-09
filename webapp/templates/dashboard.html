@@ -1,26 +1,192 @@
 {% extends "base.html" %}
 
 {% block content %}
-<div class="card">
-	<h2>Vítejte, {{ current_user.username }}</h2>
-	<p>Zvolte akci:</p>
-	<div class="actions">
-		<a class="button" href="{{ url_for('upload_pdf') }}">Nahrát PDF</a>
-		<a class="button" href="{{ url_for('upload_table') }}">Nahrát tabulku</a>
-		{% if current_user.is_admin %}
-			<a class="button secondary" href="{{ url_for('manage_users') }}">Správa uživatelů</a>
-		{% endif %}
+<div class="dashboard-grid">
+	<div class="card">
+		<h2>Vítejte, {{ current_user.username }}</h2>
+		<p class="muted">Self-hosted přehled pro dlouhé dávky, frontu a stav zpracování.</p>
+		<div class="actions">
+			<a class="button" href="{{ url_for('upload_pdf') }}">Nahrát PDF</a>
+			<a class="button" href="{{ url_for('upload_table') }}">Nahrát tabulku</a>
+			{% if current_user.is_admin %}
+				<a class="button secondary" href="{{ url_for('admin_jobs') }}">Problem. joby</a>
+				<a class="button secondary" href="{{ url_for('manage_users') }}">Správa uživatelů</a>
+			{% endif %}
+		</div>
+	</div>
+	<div class="card">
+		<h3>Stav kreditů</h3>
+		<p class="muted">Kredity se odečítají za každou extrakci. Pokud dojdou, další PDF dávka se korektně zastaví.</p>
+		<div class="credit-summary">
+			<div class="credit-value">{{ current_user.credits or 0 }}</div>
+			<div class="credit-label">aktuální zůstatek</div>
+		</div>
+		<div class="actions">
+			<a class="button secondary" href="{{ url_for('credits') }}">Detail a dobití kreditů</a>
+		</div>
 	</div>
 </div>
+
+<div class="stats-grid">
+	<div class="card stat-card">
+		<div class="stat-label">Ve frontě</div>
+		<div class="stat-value">{{ queue_overview.queued }}</div>
+	</div>
+	<div class="card stat-card">
+		<div class="stat-label">Běží</div>
+		<div class="stat-value">{{ queue_overview.running }}</div>
+	</div>
+	<div class="card stat-card">
+		<div class="stat-label">Čeká na retry</div>
+		<div class="stat-value">{{ queue_overview.retryable_failed }}</div>
+	</div>
+	<div class="card stat-card">
+		<div class="stat-label">Selhalo</div>
+		<div class="stat-value">{{ queue_overview.failed }}</div>
+	</div>
+</div>
+
 <div class="card">
-	<h3>Stav kreditů</h3>
-	<p class="muted">Kredity se odečítají za každou extrakci. Pokud dojdou, není možné spustit další zpracování.</p>
-	<div class="credit-summary">
-		<div class="credit-value">{{ current_user.credits or 0 }}</div>
-		<div class="credit-label">aktuální zůstatek</div>
+	<div class="card-header">
+		<h3>Poslední dávky</h3>
 	</div>
-	<div class="actions">
-		<a class="button secondary" href="{{ url_for('credits') }}">Detail a dobití kreditů</a>
+	{% if recent_batches %}
+		<div class="ops-list">
+			{% for batch in recent_batches[:recent_batches_preview_limit] %}
+				<a class="ops-item" href="{{ url_for('view_results', batch_id=batch.id) }}">
+					<div>
+						<strong>#{{ batch.id }} • {{ batch.source_label }}</strong>
+						<div class="muted">{{ batch.status_label }} • {{ batch.current_phase_label }}</div>
+					</div>
+					<div class="ops-meta">
+						<span>{{ batch.processed_files }}/{{ batch.total_files }} {{ batch.file_unit_label }}</span>
+						<span>{{ batch.processed_invoices }}/{{ batch.total_invoices_estimate }} faktur</span>
+						{% if batch.eta_seconds %}
+							<span>ETA ~ {{ batch.eta_seconds }} s</span>
+						{% endif %}
+						{% if batch.stale %}
+							<span class="danger-text">Bez heartbeat {{ batch.stale_seconds }} s</span>
+						{% endif %}
+					</div>
+				</a>
+			{% endfor %}
+		</div>
+		{% if recent_batches|length > recent_batches_preview_limit %}
+			<details class="dashboard-more">
+				<summary>Zobrazit více</summary>
+				<div class="ops-list dashboard-more-list">
+					{% for batch in recent_batches[recent_batches_preview_limit:] %}
+						<a class="ops-item" href="{{ url_for('view_results', batch_id=batch.id) }}">
+							<div>
+								<strong>#{{ batch.id }} • {{ batch.source_label }}</strong>
+								<div class="muted">{{ batch.status_label }} • {{ batch.current_phase_label }}</div>
+							</div>
+							<div class="ops-meta">
+								<span>{{ batch.processed_files }}/{{ batch.total_files }} {{ batch.file_unit_label }}</span>
+								<span>{{ batch.processed_invoices }}/{{ batch.total_invoices_estimate }} faktur</span>
+								{% if batch.eta_seconds %}
+									<span>ETA ~ {{ batch.eta_seconds }} s</span>
+								{% endif %}
+								{% if batch.stale %}
+									<span class="danger-text">Bez heartbeat {{ batch.stale_seconds }} s</span>
+								{% endif %}
+							</div>
+						</a>
+					{% endfor %}
+				</div>
+			</details>
+		{% endif %}
+	{% else %}
+		<p class="muted">Zatím tu nejsou žádné dávky.</p>
+	{% endif %}
+</div>
+
+<div class="card">
+	<div class="card-header">
+		<h3>Joby vyžadující pozornost</h3>
+		{% if problem_jobs|selectattr('clearable')|list %}
+			<form method="post" action="{{ url_for('clear_problem_jobs') }}">
+				<input type="hidden" name="next" value="{{ request.full_path if request.query_string else request.path }}">
+				<button type="submit" class="button secondary">Promazat</button>
+			</form>
+		{% endif %}
 	</div>
+	{% if problem_jobs %}
+		<div class="ops-table dashboard-jobs">
+			<div class="ops-table-head">
+				<span>Job</span>
+				<span>Stav</span>
+				<span>Pokusy</span>
+				<span>Heartbeat / retry</span>
+				<span>Akce</span>
+			</div>
+			{% for job in problem_jobs[:problem_jobs_preview_limit] %}
+				<div class="ops-table-row">
+					<span>#{{ job.id }} • batch {{ job.batch_id }} • {{ job.job_type }}</span>
+					<span>{{ job.status_label }}</span>
+					<span>{{ job.attempt_count }}/{{ job.max_attempts }}</span>
+					<span>
+						{% if job.next_retry_in_s is not none %}
+							retry za {{ job.next_retry_in_s }} s
+						{% elif job.last_heartbeat_age_s is not none %}
+							heartbeat {{ job.last_heartbeat_age_s }} s
+						{% else %}
+							—
+						{% endif %}
+					</span>
+					<span class="ops-actions">
+						<a class="button secondary button-small" href="{{ url_for('view_results', batch_id=job.batch_id) }}">Detail</a>
+						{% if job.clearable %}
+							<form method="post" action="{{ url_for('dismiss_problem_job', job_id=job.id) }}">
+								<input type="hidden" name="next" value="{{ request.full_path if request.query_string else request.path }}">
+								<button type="submit" class="button secondary button-small">Smazat</button>
+							</form>
+						{% endif %}
+					</span>
+				</div>
+			{% endfor %}
+		</div>
+		{% if problem_jobs|length > problem_jobs_preview_limit %}
+			<details class="dashboard-more">
+				<summary>Zobrazit více</summary>
+				<div class="ops-table dashboard-jobs dashboard-more-list">
+					<div class="ops-table-head">
+						<span>Job</span>
+						<span>Stav</span>
+						<span>Pokusy</span>
+						<span>Heartbeat / retry</span>
+						<span>Akce</span>
+					</div>
+					{% for job in problem_jobs[problem_jobs_preview_limit:] %}
+						<div class="ops-table-row">
+							<span>#{{ job.id }} • batch {{ job.batch_id }} • {{ job.job_type }}</span>
+							<span>{{ job.status_label }}</span>
+							<span>{{ job.attempt_count }}/{{ job.max_attempts }}</span>
+							<span>
+								{% if job.next_retry_in_s is not none %}
+									retry za {{ job.next_retry_in_s }} s
+								{% elif job.last_heartbeat_age_s is not none %}
+									heartbeat {{ job.last_heartbeat_age_s }} s
+								{% else %}
+									—
+								{% endif %}
+							</span>
+							<span class="ops-actions">
+								<a class="button secondary button-small" href="{{ url_for('view_results', batch_id=job.batch_id) }}">Detail</a>
+								{% if job.clearable %}
+									<form method="post" action="{{ url_for('dismiss_problem_job', job_id=job.id) }}">
+										<input type="hidden" name="next" value="{{ request.full_path if request.query_string else request.path }}">
+										<button type="submit" class="button secondary button-small">Smazat</button>
+									</form>
+								{% endif %}
+							</span>
+						</div>
+					{% endfor %}
+				</div>
+			</details>
+		{% endif %}
+	{% else %}
+		<p class="muted">Fronta je čistá, bez problémových jobů.</p>
+	{% endif %}
 </div>
 {% endblock %}

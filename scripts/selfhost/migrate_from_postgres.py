@@ -9,7 +9,7 @@ from typing import Iterable
 
 import psycopg2
 from psycopg2 import sql
-from psycopg2.extras import RealDictCursor, execute_values
+from psycopg2.extras import Json, RealDictCursor, execute_values
 
 TABLES_IN_ORDER = [
     "user",
@@ -70,6 +70,23 @@ def _common_columns(source_conn, target_conn, table_name: str) -> list[str]:
     return [column for column in source_cols if column in target_cols]
 
 
+def _column_types(conn, table_name: str, columns: list[str]) -> dict[str, str]:
+    if not columns:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+              AND column_name = ANY(%s)
+            """,
+            (table_name, columns),
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+
 def _fetch_rows(conn, table_name: str, columns: list[str]) -> list[dict]:
     if not columns:
         return []
@@ -91,7 +108,17 @@ def _truncate_target_tables(conn, tables: Iterable[str]) -> None:
 def _insert_rows(conn, table_name: str, columns: list[str], rows: list[dict]) -> None:
     if not rows:
         return
-    values = [[row.get(column) for column in columns] for row in rows]
+    column_types = _column_types(conn, table_name, columns)
+    values: list[list[object]] = []
+    for row in rows:
+        prepared_row: list[object] = []
+        for column in columns:
+            value = row.get(column)
+            if value is not None and column_types.get(column) in {"json", "jsonb"}:
+                prepared_row.append(Json(value))
+            else:
+                prepared_row.append(value)
+        values.append(prepared_row)
     insert_sql = sql.SQL("INSERT INTO {} ({}) VALUES %s").format(
         sql.Identifier(table_name),
         sql.SQL(", ").join(sql.Identifier(column) for column in columns),

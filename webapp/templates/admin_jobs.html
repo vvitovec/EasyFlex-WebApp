@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card wide">
+	<h2>Admin přehled jobů</h2>
+	<p class="muted">Zaměřeno na stuck, retryable a failed joby pro self-hosted provoz.</p>
+	{% if problem_jobs %}
+		<div class="ops-table">
+			<div class="ops-table-head">
+				<span>Job</span>
+				<span>Batch</span>
+				<span>Stav</span>
+				<span>Pokusy</span>
+				<span>Heartbeat</span>
+				<span>Retry</span>
+			</div>
+			{% for job in problem_jobs %}
+				<a class="ops-table-row" href="{{ url_for('view_results', batch_id=job.batch_id) }}">
+					<span>#{{ job.id }} • {{ job.job_type }}</span>
+					<span>#{{ job.batch_id }} • {{ job.batch_source_label or 'bez názvu' }}</span>
+					<span>{{ job.status_label }}</span>
+					<span>{{ job.attempt_count }}/{{ job.max_attempts }}</span>
+					<span>{% if job.last_heartbeat_age_s is not none %}{{ job.last_heartbeat_age_s }} s{% else %}—{% endif %}</span>
+					<span>{% if job.next_retry_in_s is not none %}za {{ job.next_retry_in_s }} s{% else %}—{% endif %}</span>
+				</a>
+				{% if job.last_error or job.summary_message %}
+					<div class="ops-table-note">
+						{% if job.summary_message %}<strong>{{ job.summary_message }}</strong>{% endif %}
+						{% if job.last_error %}<div class="muted">{{ job.last_error }}</div>{% endif %}
+					</div>
+				{% endif %}
+			{% endfor %}
+		</div>
+	{% else %}
+		<p class="muted">Žádné problematické joby.</p>
+	{% endif %}
+</div>
+{% endblock %}
