@@ -1,7 +1,7 @@
 """Helpers for managing per-user ABRA context (companies, doc types, selections)."""
 from __future__ import annotations
 
-from typing import Iterable, Optional, Tuple
+from typing import Optional, Tuple
 
 from EasyFlex.config import get_companies_from_settings, get_doc_types, load_config
 

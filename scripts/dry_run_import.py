@@ -13,11 +13,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
 	sys.path.insert(0, str(REPO_ROOT))
 
-from EasyFlex.abra import _build_invoice_payload
-from EasyFlex.config import AppConfig
+def _make_config(doc_endpoint: str = "faktura-vydana"):
+	from EasyFlex.config import AppConfig
 
-
-def _make_config(doc_endpoint: str = "faktura-vydana") -> AppConfig:
 	return AppConfig(
 		openai_api_key=None,
 		openai_model="gpt-5",
@@ -65,6 +63,8 @@ def _print_payload(title: str, payload: dict) -> None:
 
 
 def main() -> None:
+	from EasyFlex.abra import _build_invoice_payload
+
 	cfg = _make_config()
 	# Simulovaný match – partner_ref známý (např. z adresáře)
 	match_invoice = {

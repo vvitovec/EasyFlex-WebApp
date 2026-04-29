@@ -62,8 +62,6 @@ def _ensure_settings_row(user, base_cfg: AppConfig) -> UserSettings:
 	settings = getattr(user, "settings", None)
 	if settings is None:
 		settings = UserSettings(user=user)
-		# Pre-fill with base values so the settings page is informative
-		# Sensitive values must stay empty for new users
 		settings.abra_company = None
 		settings.abra_verify_tls = getattr(base_cfg, "abra_verify_tls", True)
 		settings.config_overrides = {}
@@ -143,9 +141,6 @@ def _build_user_config(user: User, base_cfg: AppConfig) -> AppConfig:
 				user_overrides[key] = admin_overrides[key]
 			elif key in user_overrides:
 				user_overrides.pop(key, None)
-	else:
-		# Admin keeps own overrides; ensure extractor keys present in user_overrides already
-		pass
 	_apply_overrides(cfg, user_overrides)
 	return cfg
 

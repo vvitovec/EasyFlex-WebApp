@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, Optional, Union, Tuple
+from typing import Any, Dict, Optional, Union
 import re
 import unicodedata
 import hashlib
@@ -10,7 +10,7 @@ import hashlib
 import requests
 
 from .config import load_config, get_errors_dir, AppConfig
-from .models import InvoiceData, InvoiceItem, VATRate
+from .models import InvoiceData, VATRate
 from .invoice_warnings import get_warning
 from .invoice_processor import should_use_items_logic
 from .date_helpers import domysleni_chybejicich_datumu

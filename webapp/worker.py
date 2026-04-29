@@ -15,20 +15,14 @@ from EasyFlex.models import InvoiceData
 
 from .abra_context import apply_context_to_config, current_context
 from .batch_jobs import (
-	active_job_for_batch,
 	batch_storage_root,
-	cancel_non_terminal_jobs_for_batch,
 	claim_next_job,
 	finalize_job,
 	get_worker_id,
 	heartbeat_job,
-	is_terminal_batch_status,
-	job_status_label,
 	load_batch_payload,
-	persist_batch_payload,
 	queue_batch_job,
 	requeue_stale_running_jobs,
-	run_db_read_with_retry,
 	run_db_write_with_retry,
 	utcnow,
 )
@@ -39,7 +33,6 @@ from .constants import (
 	BATCH_STATUS_FAILED,
 	BATCH_STATUS_IMPORTING,
 	BATCH_STATUS_PARTIAL_TIMEOUT,
-	BATCH_STATUS_QUEUED,
 	BATCH_STATUS_RUNNING,
 	BATCH_STATUS_WAITING_IMPORT,
 	JOB_STATUS_COMPLETED,
@@ -657,6 +650,7 @@ def process_job(job_id: int, worker_id: str) -> None:
 				),
 			)
 	except Exception as exc:  # noqa: BLE001
+		error_text = str(exc)
 		logger.exception("Worker job %s selhal", job_id)
 		run_db_write_with_retry(
 			f"job {job_id} crash finalize",
@@ -664,7 +658,7 @@ def process_job(job_id: int, worker_id: str) -> None:
 				job_id=job_id,
 				status=JOB_STATUS_RETRYABLE_FAILED,
 				summary_message="Job selhal a čeká na obnovení workerem.",
-				last_error=str(exc),
+				last_error=error_text,
 			),
 		)
 

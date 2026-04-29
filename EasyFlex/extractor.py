@@ -23,7 +23,7 @@ from PIL import Image
 from openai import OpenAI, RateLimitError, APITimeoutError, APIConnectionError, BadRequestError
 import pandas as pd
 
-from .models import InvoiceData, InvoiceItem, VATSummary, VATRate
+from .models import InvoiceData
 from .config import AppConfig, DEFAULT_OPENAI_MODEL, load_config, get_cache_dir, model_supports_sampling_params
 from .invoice_processor import process_invoice_data
 from .date_helpers import DATE_FIELDS, DATE_FRIENDLY, domysleni_chybejicich_datumu
@@ -791,14 +791,13 @@ class InvoiceExtractor:
 
 	async def batch_extract_with_tqdm(self, pdf_folder: str) -> List[ExtractResult]:
 		"""Batch process with a console progress bar using tqdm and retry failed files.
+		Respektuje automatické přepnutí na dvoufázovou segmentaci, pokud je povolena v konfiguraci.
+		"""
 		try:
 			from tqdm import tqdm  # type: ignore
 		except ModuleNotFoundError as exc:
 			raise RuntimeError("Pro konzolový režim je nutné nainstalovat balíček 'tqdm' (pip install tqdm).") from exc
 
-
-		Respektuje automatické přepnutí na dvoufázovou segmentaci, pokud je povolena v konfiguraci.
-		"""
 		pdf_files = [
 			os.path.join(pdf_folder, f)
 			for f in os.listdir(pdf_folder)
@@ -853,7 +852,7 @@ class InvoiceExtractor:
 			df = pd.DataFrame(rows)
 			df.to_csv(output_file, index=False, encoding="utf-8")
 			logger.info("CSV uloženo: %s", output_file)
-		except Exception as exc:  # noqa: BLE001
+		except Exception:  # noqa: BLE001
 			logger.exception("Selhalo ukládání CSV do %s", output_file)
 			raise
 
@@ -982,27 +981,27 @@ class InvoiceExtractor:
 		payload["mena"] = resolve_currency(None, None, fallback="CZK")
 
 	def _ensure_zero_amount_defaults(self, payload: Dict[str, Any]) -> None:
-		for field in ZERO_DEFAULT_FIELDS:
-			value = payload.get(field)
+		for field_name in ZERO_DEFAULT_FIELDS:
+			value = payload.get(field_name)
 			if value in (None, "", "null"):
-				payload[field] = 0.0
+				payload[field_name] = 0.0
 				continue
 			try:
-				payload[field] = float(value)
+				payload[field_name] = float(value)
 			except (TypeError, ValueError):
-				payload[field] = 0.0
+				payload[field_name] = 0.0
 
 	def _normalize_dates(self, payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], Set[str]]:
 		invalid_fields: List[str] = []
 		parsed: Dict[str, datetime] = {}
-		for field in DATE_FIELDS:
-			value = payload.get(field)
+		for field_name in DATE_FIELDS:
+			value = payload.get(field_name)
 			normalized, status = self._parse_date_field(value)
-			payload[field] = normalized
+			payload[field_name] = normalized
 			if status == "invalid":
-				invalid_fields.append(field)
+				invalid_fields.append(field_name)
 			elif status == "parsed" and normalized:
-				parsed[field] = datetime.strptime(normalized, "%Y-%m-%d")
+				parsed[field_name] = datetime.strptime(normalized, "%Y-%m-%d")
 		suspect_fields = self._find_suspect_dates(parsed)
 		suspect_fields.difference_update(invalid_fields)
 		return payload, invalid_fields, suspect_fields
