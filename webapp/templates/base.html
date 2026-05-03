@@ -4,35 +4,79 @@
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>EasyFlex Web</title>
+	<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23126d73'/%3E%3Cpath d='M9 10h14M9 16h11M9 22h8' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
 	<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-	<nav class="topbar">
+	{% import "_icons.html" as icons %}
+	<a class="skip-link" href="#main-content">Přeskočit na obsah</a>
+	<nav class="topbar" aria-label="Hlavní navigace">
 		<div class="brand-area">
-			<div class="brand">EasyFlex Web</div>
-			{% if current_user.is_authenticated %}
-				<span class="credit-chip">Zůstatek: {{ current_user.credits or 0 }} kreditů</span>
-			{% endif %}
+			<a class="brand" href="{{ url_for('dashboard') }}">
+				<span class="brand-mark">{{ icons.logo_mark() }}</span>
+				<span>EasyFlex</span>
+			</a>
 		</div>
-		<div class="nav-links">
-			{% if current_user.is_authenticated %}
-				<a href="{{ url_for('dashboard') }}">Dashboard</a>
-				<a href="{{ url_for('upload_pdf') }}">Nahrát PDF</a>
-				<a href="{{ url_for('upload_table') }}">Nahrát tabulku</a>
-				<a href="{{ url_for('credits') }}">Kredity</a>
-				<a href="{{ url_for('user_settings') }}">Nastavení</a>
-				{% if current_user.is_admin %}
-					<a href="{{ url_for('admin_jobs') }}">Joby</a>
-					<a href="{{ url_for('manage_users') }}">Uživatelé</a>
-				{% endif %}
-				<a href="{{ url_for('auth.logout') }}">Odhlásit se</a>
-			{% else %}
-				<a href="{{ url_for('auth.login') }}">Přihlášení</a>
-			{% endif %}
-			<a href="{{ url_for('help_page') }}">Nápověda</a>
-		</div>
+		{% if current_user.is_authenticated %}
+			<div class="topbar-nav" aria-label="Sekce">
+				<a class="nav-item{% if request.endpoint == 'dashboard' %} is-active{% endif %}" href="{{ url_for('dashboard') }}">
+					<span class="nav-icon">{{ icons.home() }}</span>
+					<span>Přehled</span>
+				</a>
+				<a class="nav-item{% if request.endpoint in ['upload_table'] or (request.endpoint == 'upload_pdf' and request.args.get('document_type', 'invoice') != 'receipt') %} is-active{% endif %}" href="{{ url_for('upload_pdf', document_type='invoice') }}">
+					<span class="nav-icon">{{ icons.file_text() }}</span>
+					<span>Faktury</span>
+				</a>
+				<a class="nav-item{% if request.endpoint == 'upload_pdf' and request.args.get('document_type') == 'receipt' %} is-active{% endif %}" href="{{ url_for('upload_pdf', document_type='receipt') }}">
+					<span class="nav-icon">{{ icons.receipt() }}</span>
+					<span>Účtenky</span>
+				</a>
+			</div>
+		{% endif %}
+		{% if current_user.is_authenticated %}
+			<div class="topbar-actions">
+				<a class="credit-pill" href="{{ url_for('credits') }}">
+					<span class="credit-icon">{{ icons.coins() }}</span>
+					<span>{{ current_user.credits or 0 }} kreditů</span>
+					<span class="credit-add">{{ icons.plus() }}</span>
+				</a>
+				<div class="settings-menu">
+					<button class="user-menu-button" type="button" id="settings-menu-button" aria-label="Otevřít uživatelské menu" aria-haspopup="true" aria-expanded="false" aria-controls="settings-menu-panel">
+						<span class="avatar" aria-hidden="true">{{ current_user.username[:2]|upper }}</span>
+						<span class="topbar-user">{{ current_user.username }}</span>
+						<span class="chevron-icon">{{ icons.chevron_down() }}</span>
+					</button>
+					<div class="settings-panel" id="settings-menu-panel" hidden>
+						<a href="{{ url_for('user_settings') }}">
+							<span>{{ icons.settings() }}</span>
+							<span>Nastavení</span>
+						</a>
+						{% if current_user.is_admin %}
+							<a href="{{ url_for('manage_users') }}">
+								<span>{{ icons.users() }}</span>
+								<span>Správa uživatelů</span>
+							</a>
+							<a href="{{ url_for('admin_jobs') }}">
+								<span>{{ icons.jobs() }}</span>
+								<span>Admin joby</span>
+							</a>
+						{% endif %}
+						<a href="{{ url_for('help_page') }}">
+							<span>{{ icons.help() }}</span>
+							<span>Nápověda</span>
+						</a>
+						<a class="danger-link" href="{{ url_for('auth.logout') }}">
+							<span>{{ icons.logout() }}</span>
+							<span>Odhlásit</span>
+						</a>
+					</div>
+				</div>
+			</div>
+		{% else %}
+			<a class="quiet-link" href="{{ url_for('help_page') }}">Nápověda</a>
+		{% endif %}
 	</nav>
-	<main class="content">
+	<main class="content" id="main-content">
 		{% with messages = get_flashed_messages(with_categories=true) %}
 			{% if messages %}
 				<div class="flash-container">
@@ -54,6 +98,22 @@
 	</div>
 	<script>
 		document.addEventListener('click', function(e) {
+			const settingsButton = document.getElementById('settings-menu-button');
+			const settingsPanel = document.getElementById('settings-menu-panel');
+			if (settingsButton && settingsPanel) {
+				const clickedButton = settingsButton.contains(e.target);
+				const clickedPanel = settingsPanel.contains(e.target);
+				if (clickedButton) {
+					const isOpen = settingsButton.getAttribute('aria-expanded') === 'true';
+					settingsButton.setAttribute('aria-expanded', String(!isOpen));
+					settingsPanel.hidden = isOpen;
+					return;
+				}
+				if (!clickedPanel) {
+					settingsButton.setAttribute('aria-expanded', 'false');
+					settingsPanel.hidden = true;
+				}
+			}
 			const btn = e.target.closest('.eye-toggle');
 			if (!btn) return;
 			const targetId = btn.dataset.target;
@@ -61,6 +121,15 @@
 			const input = document.getElementById(targetId);
 			if (!input) return;
 			input.type = input.type === 'password' ? 'text' : 'password';
+		});
+		document.addEventListener('keydown', function(e) {
+			if (e.key !== 'Escape') return;
+			const settingsButton = document.getElementById('settings-menu-button');
+			const settingsPanel = document.getElementById('settings-menu-panel');
+			if (!settingsButton || !settingsPanel) return;
+			settingsButton.setAttribute('aria-expanded', 'false');
+			settingsPanel.hidden = true;
+			settingsButton.focus();
 		});
 		// Show loading overlay on long-running submissions
 		document.addEventListener('submit', function(e) {

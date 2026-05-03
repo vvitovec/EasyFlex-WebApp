@@ -19,6 +19,9 @@ from .currency_utils import currency_reference, normalize_currency
 
 logger = logging.getLogger(__name__)
 
+RECEIPT_DOCUMENT_TYPE = "receipt"
+RECEIPT_ENDPOINT = "pokladni-pohyb"
+
 
 def _build_base_url(server: str, port: Optional[int]) -> str:
 	if port is None:
@@ -28,6 +31,9 @@ def _build_base_url(server: str, port: Optional[int]) -> str:
 
 def _normalize_companies_payload(payload: Any) -> list[dict]:
 	"""Try to normalize various server responses to a list of company dicts."""
+	entries = _extract_winstrom_entries(payload, ("c", "companies", "items", "data", "result"))
+	if entries:
+		return entries
 	# Already a list of dicts
 	if isinstance(payload, list):
 		return [c for c in payload if isinstance(c, dict)]
@@ -436,6 +442,131 @@ def _map_vat_rate_to_code(vat_rate: VATRate) -> str:
         return "typSzbDph.dphSniz"    # 12%
     else:
         return "typSzbDph.dphOsv"     # 0%
+
+
+def _is_receipt_document(faktura_data: Union[Dict[str, Any], InvoiceData]) -> bool:
+	if isinstance(faktura_data, InvoiceData):
+		raw = getattr(faktura_data, "document_type", None)
+	else:
+		raw = faktura_data.get("document_type") or faktura_data.get("typ_dokumentu") or faktura_data.get("druh_dokladu")
+	return str(raw or "").strip().lower() == RECEIPT_DOCUMENT_TYPE
+
+
+def _receipt_currency_code(faktura: Dict[str, Any]) -> str:
+	normalized = normalize_currency(faktura.get("mena"))
+	return "EUR" if normalized == "EUR" else "CZK"
+
+
+def _receipt_cashbox_refs(currency_code: str) -> tuple[str, str]:
+	if currency_code == "EUR":
+		return "code:POKLADNA EUR", "code:POKLADNA EUR-"
+	return "code:POKLADNA KČ", "code:POKLADNA-"
+
+
+def _receipt_document_code(faktura: Dict[str, Any]) -> str:
+	for key in ("cislo_dokladu", "cislo_uctenky", "kod", "variabilni_symbol"):
+		value = faktura.get(key)
+		if value:
+			return str(value).strip()
+	row_id = faktura.get("easyflex_row_id") or faktura.get("row_id") or faktura.get("_row_id")
+	if row_id not in (None, ""):
+		return f"EFUCT-{row_id}"
+	raw = json.dumps(faktura, sort_keys=True, ensure_ascii=False)
+	digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+	return f"EFUCT-{digest}"
+
+
+def _numeric_or_none(value: Any) -> Optional[float]:
+	if value in (None, "", "null"):
+		return None
+	try:
+		return float(value)
+	except (TypeError, ValueError):
+		return None
+
+
+def _build_receipt_positions(faktura: Dict[str, Any]) -> list[Dict[str, Any]]:
+	positions = _build_positions_from_totals(faktura)
+	for position in positions:
+		position["typPolozkyK"] = "typPolozky.obecny"
+		if "nazev" not in position:
+			position["nazev"] = "Nákup"
+	if positions:
+		return positions
+
+	fallback_base = _numeric_or_none(faktura.get("zaklad_dane"))
+	vat_total = _numeric_or_none(faktura.get("vyse_dph"))
+	if fallback_base is None and (vat_total is None or abs(vat_total) <= 0.0001):
+		fallback_base = _numeric_or_none(faktura.get("celkova_cena"))
+	if fallback_base is None or fallback_base <= 0:
+		return []
+	return [{
+		"nazev": str(faktura.get("popis") or "Nákup 0% DPH"),
+		"typPolozkyK": "typPolozky.obecny",
+		"mnozMj": 1,
+		"cenaMj": float(fallback_base),
+		"typSzbDphK": "typSzbDph.dphOsv",
+	}]
+
+
+def _prepare_receipt_partner_section(faktura: Dict[str, Any], partner_ref: Optional[str]) -> Dict[str, Any]:
+	body: Dict[str, Any] = {}
+	if partner_ref:
+		body["firma"] = partner_ref
+	name = faktura.get("dodavatel_jmeno")
+	street, psc, city = _split_address_components(faktura.get("dodavatel_adresa"))
+	state = _normalize_country_reference(faktura.get("dodavatel_stat"))
+	ico = _normalize_ico(faktura.get("dodavatel_ic"))
+	dic = _normalize_dic(faktura.get("dodavatel_dic"))
+	if name:
+		body["nazFirmy"] = str(name).strip()
+	if street:
+		body["ulice"] = street
+	if psc:
+		body["psc"] = psc
+	if city:
+		body["mesto"] = city
+	if state:
+		body["stat"] = state
+	if ico:
+		body["ic"] = ico
+	if dic:
+		body["dic"] = dic
+	return body
+
+
+def _build_receipt_payload(
+	faktura_data: Union[Dict[str, Any], InvoiceData],
+	cfg: AppConfig,
+	partner_ref: Optional[str],
+) -> Dict[str, Any]:
+	if isinstance(faktura_data, InvoiceData):
+		faktura = faktura_data.model_dump()
+	else:
+		faktura = dict(faktura_data or {})
+
+	currency_code = _receipt_currency_code(faktura)
+	cashbox_ref, series_ref = _receipt_cashbox_refs(currency_code)
+	doc_code = _receipt_document_code(faktura)
+	dat_vyst = faktura.get("datum_vystaveni") or faktura.get("datum_duzp")
+	body: Dict[str, Any] = {
+		"id": _compute_ext_id({**faktura, "cislo_dokladu": doc_code}, RECEIPT_ENDPOINT),
+		"typPohybuK": "typPohybu.vydej",
+		"typDokl": "code:STANDARD",
+		"pokladna": cashbox_ref,
+		"rada": series_ref,
+		"mena": currency_reference(currency_code, fallback="CZK"),
+		"datVyst": dat_vyst,
+		"kod": doc_code,
+		"varSym": faktura.get("variabilni_symbol"),
+		"popis": faktura.get("popis") or faktura.get("dodavatel_jmeno") or doc_code,
+		"metodaZaokrDoklK": "metodaZaokr.individ",
+		"vytvaretKorPol": False,
+		"zdrojProSkl": True,
+		"polozkyDokladu": _build_receipt_positions(faktura),
+	}
+	body.update(_prepare_receipt_partner_section(faktura, partner_ref))
+	return _wrap_winstrom(RECEIPT_ENDPOINT, body)
 
 
 def _request_with_retry(method: str, url: str, *, auth: tuple[str, str], timeout_s: int, json_body: Optional[Dict] = None, verify: bool = True) -> requests.Response:
@@ -975,10 +1106,12 @@ def _compute_ext_id(faktura: Dict[str, Any], doc_endpoint: str) -> str:
 	candidates = [
 		faktura.get("external_id"),
 		faktura.get("cislo_dokladu"),
+		faktura.get("cislo_uctenky"),
 		faktura.get("variabilni_symbol"),
 		faktura.get("cisDokl"),
 		faktura.get("cisDosle"),
 		faktura.get("kod"),
+		faktura.get("easyflex_row_id"),
 	]
 
 	def _sanitize(value: str) -> str:
@@ -1155,9 +1288,9 @@ def import_to_abra(faktura_data: Union[Dict[str, Any], InvoiceData], cfg: Option
 	auth = (cfg.abra_username, cfg.abra_password)
 	logger.info("ABRA import attempt: server=%s, company_hint=%s", base_url, cfg.abra_company)
 
-	# Probe connectivity to faktura endpoint (instructions step 1)
+	is_receipt = _is_receipt_document(faktura_data)
 	probe_company = cfg.abra_company or "demo"
-	doc_endpoint = cfg.abra_doc_endpoint or "faktura-prijata"
+	doc_endpoint = RECEIPT_ENDPOINT if is_receipt else (cfg.abra_doc_endpoint or "faktura-prijata")
 	probe_url = f"{base_url}/c/{probe_company}/{doc_endpoint}.json"
 	probe_resp = _request_with_retry("GET", probe_url, auth=auth, timeout_s=cfg.abra_timeout_s, verify=cfg.abra_verify_tls)
 	if probe_resp.status_code >= 400:
@@ -1166,9 +1299,13 @@ def import_to_abra(faktura_data: Union[Dict[str, Any], InvoiceData], cfg: Option
 	# Resolve company code used in path
 	company_code = _ensure_company_id(base_url, auth, cfg.abra_timeout_s, cfg.abra_verify_tls, cfg.abra_company, faktura_data if isinstance(faktura_data, dict) else faktura_data.model_dump())
 	# Best-effort lookup of partner in ABRA adresář (bez vytváření nových)
-	partner_ref = _ensure_partner_ext_id(base_url, auth, cfg.abra_timeout_s, company_code, faktura_data if isinstance(faktura_data, dict) else faktura_data.model_dump(), cfg.abra_verify_tls, cfg.abra_partner_rel_code, doc_endpoint)
+	partner_lookup_endpoint = "faktura-prijata" if is_receipt else doc_endpoint
+	partner_ref = _ensure_partner_ext_id(base_url, auth, cfg.abra_timeout_s, company_code, faktura_data if isinstance(faktura_data, dict) else faktura_data.model_dump(), cfg.abra_verify_tls, cfg.abra_partner_rel_code, partner_lookup_endpoint)
 
-	payload = _build_invoice_payload(faktura_data, cfg, partner_ref, doc_endpoint)
+	if is_receipt:
+		payload = _build_receipt_payload(faktura_data, cfg, partner_ref)
+	else:
+		payload = _build_invoice_payload(faktura_data, cfg, partner_ref, doc_endpoint)
 	try:
 		logger.debug("ABRA payload faktura: %s", json.dumps(payload, ensure_ascii=False))
 	except Exception:

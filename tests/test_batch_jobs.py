@@ -200,15 +200,17 @@ def test_process_extract_job_survives_session_retries(monkeypatch, tmp_path) -> 
 		)
 		app_module.db.session.add(job)
 		app_module.db.session.commit()
+		job_id = job.id
+		batch_id = batch.id
 
 		pdf_path = worker_module.batch_storage_root(batch.id) / "sample.pdf"
 		pdf_path.write_bytes(b"%PDF-1.4\n%stub\n")
 
-		worker_module._process_extract_job(job.id, "worker-test")
+		worker_module._process_extract_job(job_id, "worker-test")
 
-		job = app_module.db.session.get(app_module.BatchJob, job.id)
-		batch = app_module.db.session.get(app_module.InvoiceBatch, batch.id)
-		row = app_module.InvoiceRow.query.filter_by(batch_id=batch.id).one()
+		job = app_module.db.session.get(app_module.BatchJob, job_id)
+		batch = app_module.db.session.get(app_module.InvoiceBatch, batch_id)
+		row = app_module.InvoiceRow.query.filter_by(batch_id=batch_id).one()
 
 		assert job is not None
 		assert job.status == "completed"
@@ -255,12 +257,15 @@ def test_process_import_job_survives_session_retries(monkeypatch, tmp_path) -> N
 		)
 		app_module.db.session.add_all([row, job])
 		app_module.db.session.commit()
+		job_id = job.id
+		batch_id = batch.id
+		row_id = row.id
 
-		worker_module._process_import_job(job.id, "worker-test")
+		worker_module._process_import_job(job_id, "worker-test")
 
-		job = app_module.db.session.get(app_module.BatchJob, job.id)
-		batch = app_module.db.session.get(app_module.InvoiceBatch, batch.id)
-		row = app_module.db.session.get(app_module.InvoiceRow, row.id)
+		job = app_module.db.session.get(app_module.BatchJob, job_id)
+		batch = app_module.db.session.get(app_module.InvoiceBatch, batch_id)
+		row = app_module.db.session.get(app_module.InvoiceRow, row_id)
 
 		assert job is not None
 		assert job.status == "completed"

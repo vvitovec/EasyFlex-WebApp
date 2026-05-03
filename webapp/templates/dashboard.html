@@ -1,192 +1,170 @@
 {% extends "base.html" %}
 
 {% block content %}
-<div class="dashboard-grid">
-	<div class="card">
-		<h2>Vítejte, {{ current_user.username }}</h2>
-		<p class="muted">Self-hosted přehled pro dlouhé dávky, frontu a stav zpracování.</p>
-		<div class="actions">
-			<a class="button" href="{{ url_for('upload_pdf') }}">Nahrát PDF</a>
-			<a class="button" href="{{ url_for('upload_table') }}">Nahrát tabulku</a>
-			{% if current_user.is_admin %}
-				<a class="button secondary" href="{{ url_for('admin_jobs') }}">Problem. joby</a>
-				<a class="button secondary" href="{{ url_for('manage_users') }}">Správa uživatelů</a>
-			{% endif %}
-		</div>
-	</div>
-	<div class="card">
-		<h3>Stav kreditů</h3>
-		<p class="muted">Kredity se odečítají za každou extrakci. Pokud dojdou, další PDF dávka se korektně zastaví.</p>
-		<div class="credit-summary">
-			<div class="credit-value">{{ current_user.credits or 0 }}</div>
-			<div class="credit-label">aktuální zůstatek</div>
-		</div>
-		<div class="actions">
-			<a class="button secondary" href="{{ url_for('credits') }}">Detail a dobití kreditů</a>
-		</div>
-	</div>
-</div>
+{% import "_icons.html" as icons %}
+<div class="dashboard-page">
+	<section class="workspace-hero dashboard-hero" aria-labelledby="dashboard-title">
+		<h1 id="dashboard-title">Co chcete zpracovat?</h1>
+	</section>
 
-<div class="stats-grid">
-	<div class="card stat-card">
-		<div class="stat-label">Ve frontě</div>
-		<div class="stat-value">{{ queue_overview.queued }}</div>
-	</div>
-	<div class="card stat-card">
-		<div class="stat-label">Běží</div>
-		<div class="stat-value">{{ queue_overview.running }}</div>
-	</div>
-	<div class="card stat-card">
-		<div class="stat-label">Čeká na retry</div>
-		<div class="stat-value">{{ queue_overview.retryable_failed }}</div>
-	</div>
-	<div class="card stat-card">
-		<div class="stat-label">Selhalo</div>
-		<div class="stat-value">{{ queue_overview.failed }}</div>
-	</div>
-</div>
+	<section class="choice-flow" aria-label="Výběr typu zpracování">
+		<div class="primary-choice-grid">
+			<button class="choice-option" type="button" data-flow-choice="invoice" aria-expanded="false" aria-controls="invoice-upload-options">
+				<span class="choice-media">{{ icons.file_text() }}</span>
+				<span class="choice-text">
+					<span class="choice-label">Faktury</span>
+					<span class="choice-copy">Import přijatých nebo vydaných faktur do ABRA.</span>
+				</span>
+				<span class="choice-arrow">{{ icons.arrow_right() }}</span>
+			</button>
+			<a class="choice-option" href="{{ url_for('upload_pdf', document_type='receipt') }}">
+				<span class="choice-media">{{ icons.receipt() }}</span>
+				<span class="choice-text">
+					<span class="choice-label">Účtenky</span>
+					<span class="choice-copy">Nahrání PDF nebo fotografie účtenky pro pokladní výdaj.</span>
+				</span>
+				<span class="choice-arrow">{{ icons.arrow_right() }}</span>
+			</a>
+		</div>
 
-<div class="card">
-	<div class="card-header">
-		<h3>Poslední dávky</h3>
-	</div>
-	{% if recent_batches %}
-		<div class="ops-list">
-			{% for batch in recent_batches[:recent_batches_preview_limit] %}
-				<a class="ops-item" href="{{ url_for('view_results', batch_id=batch.id) }}">
-					<div>
-						<strong>#{{ batch.id }} • {{ batch.source_label }}</strong>
-						<div class="muted">{{ batch.status_label }} • {{ batch.current_phase_label }}</div>
-					</div>
-					<div class="ops-meta">
-						<span>{{ batch.processed_files }}/{{ batch.total_files }} {{ batch.file_unit_label }}</span>
-						<span>{{ batch.processed_invoices }}/{{ batch.total_invoices_estimate }} faktur</span>
-						{% if batch.eta_seconds %}
-							<span>ETA ~ {{ batch.eta_seconds }} s</span>
-						{% endif %}
-						{% if batch.stale %}
-							<span class="danger-text">Bez heartbeat {{ batch.stale_seconds }} s</span>
-						{% endif %}
-					</div>
+		<div class="secondary-choice" id="invoice-upload-options" hidden>
+			<div class="section-heading">
+				<h2>Jak chcete faktury nahrát?</h2>
+			</div>
+			<div class="upload-choice-grid">
+				<a class="choice-line" href="{{ url_for('upload_table') }}">
+					<span class="line-icon">{{ icons.spreadsheet() }}</span>
+					<span>
+						<strong>Nahrání tabulky</strong>
+						<small>CSV, XLSX, XLS nebo XML s připravenými řádky.</small>
+					</span>
+					<span class="choice-arrow">{{ icons.arrow_right() }}</span>
 				</a>
-			{% endfor %}
+				<a class="choice-line" href="{{ url_for('upload_pdf', document_type='invoice') }}">
+					<span class="line-icon">{{ icons.file_text() }}</span>
+					<span>
+						<strong>Nahrání PDF/foto</strong>
+						<small>PDF, JPG nebo PNG. Extrakce poběží na pozadí.</small>
+					</span>
+					<span class="choice-arrow">{{ icons.arrow_right() }}</span>
+				</a>
+			</div>
 		</div>
-		{% if recent_batches|length > recent_batches_preview_limit %}
-			<details class="dashboard-more">
-				<summary>Zobrazit více</summary>
-				<div class="ops-list dashboard-more-list">
-					{% for batch in recent_batches[recent_batches_preview_limit:] %}
-						<a class="ops-item" href="{{ url_for('view_results', batch_id=batch.id) }}">
-							<div>
-								<strong>#{{ batch.id }} • {{ batch.source_label }}</strong>
-								<div class="muted">{{ batch.status_label }} • {{ batch.current_phase_label }}</div>
-							</div>
-							<div class="ops-meta">
-								<span>{{ batch.processed_files }}/{{ batch.total_files }} {{ batch.file_unit_label }}</span>
-								<span>{{ batch.processed_invoices }}/{{ batch.total_invoices_estimate }} faktur</span>
-								{% if batch.eta_seconds %}
-									<span>ETA ~ {{ batch.eta_seconds }} s</span>
-								{% endif %}
-								{% if batch.stale %}
-									<span class="danger-text">Bez heartbeat {{ batch.stale_seconds }} s</span>
-								{% endif %}
-							</div>
+	</section>
+
+	{% if current_user.is_authenticated %}
+		<section class="recent-work" aria-labelledby="recent-title">
+			<div class="section-heading">
+				<div>
+					<p class="eyebrow">Poslední práce</p>
+					<h2 id="recent-title">Rozpracované a dokončené dávky</h2>
+				</div>
+				{% if current_user.is_admin %}
+					<div class="section-actions">
+						<a href="{{ url_for('admin_jobs') }}">Joby</a>
+						<a href="{{ url_for('manage_users') }}">Uživatelé</a>
+					</div>
+				{% endif %}
+			</div>
+			{% if recent_batches %}
+				<div class="work-list">
+					{% for batch in recent_batches[:recent_batches_preview_limit] %}
+						<a class="work-row" href="{{ url_for('view_results', batch_id=batch.id) }}">
+							<span class="work-main">
+								<span class="pdf-thumb">{{ icons.pdf_badge() }}</span>
+								<span>
+									<strong>{{ batch.source_label }}</strong>
+									<small>{{ batch.status_label }} · {{ batch.current_phase_label }}</small>
+								</span>
+							</span>
+							<span class="work-meta">{{ batch.processed_files }}/{{ batch.total_files }} {{ batch.file_unit_label }} · {{ batch.processed_invoices }}/{{ batch.total_invoices_estimate }} faktur</span>
+							<span class="work-kebab">{{ icons.dots_vertical() }}</span>
 						</a>
 					{% endfor %}
 				</div>
-			</details>
-		{% endif %}
-	{% else %}
-		<p class="muted">Zatím tu nejsou žádné dávky.</p>
+				{% if recent_batches|length > recent_batches_preview_limit %}
+					<details class="quiet-details">
+						<summary>Zobrazit více</summary>
+						<div class="work-list">
+							{% for batch in recent_batches[recent_batches_preview_limit:] %}
+								<a class="work-row" href="{{ url_for('view_results', batch_id=batch.id) }}">
+									<span class="work-main">
+										<span class="pdf-thumb">{{ icons.pdf_badge() }}</span>
+										<span>
+											<strong>{{ batch.source_label }}</strong>
+											<small>{{ batch.status_label }} · {{ batch.current_phase_label }}</small>
+										</span>
+									</span>
+									<span class="work-meta">{{ batch.processed_files }}/{{ batch.total_files }} {{ batch.file_unit_label }} · {{ batch.processed_invoices }}/{{ batch.total_invoices_estimate }} faktur</span>
+									<span class="work-kebab">{{ icons.dots_vertical() }}</span>
+								</a>
+							{% endfor %}
+						</div>
+					</details>
+				{% endif %}
+			{% else %}
+				<p class="empty-state">Zatím tu nejsou žádné dávky. Začněte výběrem faktur nebo účtenek.</p>
+			{% endif %}
+		</section>
+	{% endif %}
+
+	{% if current_user.is_authenticated and problem_jobs %}
+		<section class="attention-strip" aria-labelledby="attention-title">
+			<div class="section-heading">
+				<div>
+					<p class="eyebrow">Vyžaduje pozornost</p>
+					<h2 id="attention-title">Některé dávky se nepodařilo dokončit</h2>
+				</div>
+				{% if problem_jobs|selectattr('clearable')|list %}
+					<form method="post" action="{{ url_for('clear_problem_jobs') }}">
+						<input type="hidden" name="next" value="{{ request.full_path if request.query_string else request.path }}">
+						<button type="submit" class="secondary">Promazat</button>
+					</form>
+				{% endif %}
+			</div>
+			<div class="work-list">
+				{% for job in problem_jobs[:problem_jobs_preview_limit] %}
+					<a class="work-row" href="{{ url_for('view_results', batch_id=job.batch_id) }}">
+						<span>
+							<strong>Batch {{ job.batch_id }}</strong>
+							<small>{{ job.status_label }}</small>
+						</span>
+						<span>Detail</span>
+					</a>
+				{% endfor %}
+			</div>
+			{% if problem_jobs|length > problem_jobs_preview_limit %}
+				<details class="quiet-details">
+					<summary>Zobrazit více</summary>
+					<div class="work-list">
+						{% for job in problem_jobs[problem_jobs_preview_limit:] %}
+							<a class="work-row" href="{{ url_for('view_results', batch_id=job.batch_id) }}">
+								<span>
+									<strong>Batch {{ job.batch_id }}</strong>
+									<small>{{ job.status_label }}</small>
+								</span>
+								<span>Detail</span>
+							</a>
+						{% endfor %}
+					</div>
+				</details>
+			{% endif %}
+		</section>
 	{% endif %}
 </div>
 
-<div class="card">
-	<div class="card-header">
-		<h3>Joby vyžadující pozornost</h3>
-		{% if problem_jobs|selectattr('clearable')|list %}
-			<form method="post" action="{{ url_for('clear_problem_jobs') }}">
-				<input type="hidden" name="next" value="{{ request.full_path if request.query_string else request.path }}">
-				<button type="submit" class="button secondary">Promazat</button>
-			</form>
-		{% endif %}
-	</div>
-	{% if problem_jobs %}
-		<div class="ops-table dashboard-jobs">
-			<div class="ops-table-head">
-				<span>Job</span>
-				<span>Stav</span>
-				<span>Pokusy</span>
-				<span>Heartbeat / retry</span>
-				<span>Akce</span>
-			</div>
-			{% for job in problem_jobs[:problem_jobs_preview_limit] %}
-				<div class="ops-table-row">
-					<span>#{{ job.id }} • batch {{ job.batch_id }} • {{ job.job_type }}</span>
-					<span>{{ job.status_label }}</span>
-					<span>{{ job.attempt_count }}/{{ job.max_attempts }}</span>
-					<span>
-						{% if job.next_retry_in_s is not none %}
-							retry za {{ job.next_retry_in_s }} s
-						{% elif job.last_heartbeat_age_s is not none %}
-							heartbeat {{ job.last_heartbeat_age_s }} s
-						{% else %}
-							—
-						{% endif %}
-					</span>
-					<span class="ops-actions">
-						<a class="button secondary button-small" href="{{ url_for('view_results', batch_id=job.batch_id) }}">Detail</a>
-						{% if job.clearable %}
-							<form method="post" action="{{ url_for('dismiss_problem_job', job_id=job.id) }}">
-								<input type="hidden" name="next" value="{{ request.full_path if request.query_string else request.path }}">
-								<button type="submit" class="button secondary button-small">Smazat</button>
-							</form>
-						{% endif %}
-					</span>
-				</div>
-			{% endfor %}
-		</div>
-		{% if problem_jobs|length > problem_jobs_preview_limit %}
-			<details class="dashboard-more">
-				<summary>Zobrazit více</summary>
-				<div class="ops-table dashboard-jobs dashboard-more-list">
-					<div class="ops-table-head">
-						<span>Job</span>
-						<span>Stav</span>
-						<span>Pokusy</span>
-						<span>Heartbeat / retry</span>
-						<span>Akce</span>
-					</div>
-					{% for job in problem_jobs[problem_jobs_preview_limit:] %}
-						<div class="ops-table-row">
-							<span>#{{ job.id }} • batch {{ job.batch_id }} • {{ job.job_type }}</span>
-							<span>{{ job.status_label }}</span>
-							<span>{{ job.attempt_count }}/{{ job.max_attempts }}</span>
-							<span>
-								{% if job.next_retry_in_s is not none %}
-									retry za {{ job.next_retry_in_s }} s
-								{% elif job.last_heartbeat_age_s is not none %}
-									heartbeat {{ job.last_heartbeat_age_s }} s
-								{% else %}
-									—
-								{% endif %}
-							</span>
-							<span class="ops-actions">
-								<a class="button secondary button-small" href="{{ url_for('view_results', batch_id=job.batch_id) }}">Detail</a>
-								{% if job.clearable %}
-									<form method="post" action="{{ url_for('dismiss_problem_job', job_id=job.id) }}">
-										<input type="hidden" name="next" value="{{ request.full_path if request.query_string else request.path }}">
-										<button type="submit" class="button secondary button-small">Smazat</button>
-									</form>
-								{% endif %}
-							</span>
-						</div>
-					{% endfor %}
-				</div>
-			</details>
-		{% endif %}
-	{% else %}
-		<p class="muted">Fronta je čistá, bez problémových jobů.</p>
-	{% endif %}
-</div>
+<script>
+	(function() {
+		const invoiceButton = document.querySelector('[data-flow-choice="invoice"]');
+		const invoiceOptions = document.getElementById('invoice-upload-options');
+		if (!invoiceButton || !invoiceOptions) return;
+		invoiceButton.addEventListener('click', () => {
+			const isOpen = invoiceButton.getAttribute('aria-expanded') === 'true';
+			invoiceButton.setAttribute('aria-expanded', String(!isOpen));
+			invoiceButton.classList.toggle('is-selected', !isOpen);
+			invoiceOptions.hidden = isOpen;
+			if (!isOpen) invoiceOptions.querySelector('a')?.focus({ preventScroll: true });
+		});
+	})();
+</script>
 {% endblock %}

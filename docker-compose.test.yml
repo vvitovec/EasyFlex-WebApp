@@ -1,0 +1,97 @@
+services:
+  db:
+    image: postgres:17-alpine
+    init: true
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-easyflex_test}
+      POSTGRES_USER: ${POSTGRES_USER:-easyflex_test}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-easyflex_test} -d ${POSTGRES_DB:-easyflex_test}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 45s
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env.test.local
+    environment:
+      EASYFLEX_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-easyflex_test}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-easyflex_test}
+      PORT: 10000
+      JOB_STALE_AFTER_S: ${JOB_STALE_AFTER_S:-120}
+    ports:
+      - "${TEST_WEB_PORT:-10080}:10000"
+    volumes:
+      - easyflex_test_instance:/app/instance
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:10000/readyz', timeout=5).read()\""]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+    command: >
+      sh -c "gunicorn webapp.app:app
+      --bind 0.0.0.0:10000
+      --timeout 300
+      --graceful-timeout 30
+      --workers ${WEB_CONCURRENCY:-1}"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 60s
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env.test.local
+    environment:
+      EASYFLEX_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-easyflex_test}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-easyflex_test}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
+      JOB_POLL_INTERVAL_S: ${JOB_POLL_INTERVAL_S:-2}
+      WORKER_IDLE_BACKOFF_MAX_S: ${WORKER_IDLE_BACKOFF_MAX_S:-10}
+      JOB_STALE_AFTER_S: ${JOB_STALE_AFTER_S:-120}
+      MAINTENANCE_INTERVAL_S: ${MAINTENANCE_INTERVAL_S:-60}
+      JOB_RETENTION_HOURS: ${JOB_RETENTION_HOURS:-336}
+      BATCH_STORAGE_RETENTION_HOURS: ${BATCH_STORAGE_RETENTION_HOURS:-168}
+    volumes:
+      - easyflex_test_instance:/app/instance
+    healthcheck:
+      test: ["CMD-SHELL", "find /tmp -maxdepth 1 -name 'easyflex-worker-*.heartbeat' -mmin -2 | grep -q . && find /tmp -maxdepth 1 -name 'easyflex-maintenance.heartbeat' -mmin -2 | grep -q ."]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    command: python -m webapp.worker
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    init: true
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+    profiles:
+      - cloudflare
+    env_file:
+      - .env.test.local
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+
+volumes:
+  postgres_test_data:
+  easyflex_test_instance:

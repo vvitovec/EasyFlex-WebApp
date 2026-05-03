@@ -8,11 +8,16 @@
 	{% endif %}
 	<form method="post" class="form">
 		<label for="username">Uživatelské jméno</label>
-		<input id="username" name="username" type="text" required autofocus>
+		<input id="username" name="username" type="text" autocomplete="username" required autofocus>
 		<label for="password">Heslo</label>
 		<div class="input-with-eye">
-			<input id="password" name="password" type="password" required>
-			<button type="button" class="eye-toggle" data-target="password" aria-label="Zobrazit heslo">&#128065;</button>
+			<input id="password" name="password" type="password" autocomplete="current-password" required>
+			<button type="button" class="eye-toggle" data-target="password" aria-label="Zobrazit heslo">
+				<svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"></path>
+					<circle cx="12" cy="12" r="3"></circle>
+				</svg>
+			</button>
 		</div>
 		<button type="submit">Přihlásit</button>
 	</form>

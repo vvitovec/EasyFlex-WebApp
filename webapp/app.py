@@ -25,7 +25,7 @@ from flask import (
 	jsonify,
 )
 from flask_login import login_required, current_user
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
@@ -109,6 +109,7 @@ _DbResultT = TypeVar("_DbResultT")
 
 
 EDITABLE_FIELDS = [
+	("document_type", "Typ dokumentu"),
 	("cislo_dokladu", "Číslo dokladu"),
 	("variabilni_symbol", "Variabilní symbol"),
 	("dodavatel_jmeno", "Dodavatel – název"),
@@ -122,6 +123,7 @@ EDITABLE_FIELDS = [
 	("zaklad_dane", "Základ daně (celkem)"),
 	("vyse_dph", "DPH celkem"),
 	("celkova_cena", "Celkem k úhradě"),
+	("popis", "Popis"),
 	("zaklad_dane_0", "Základ daně 0 %"),
 	("zaklad_dane_12", "Základ daně 12 %"),
 	("zaklad_dane_21", "Základ daně 21 %"),
@@ -140,20 +142,27 @@ FLOAT_FIELDS = {
 	"celkova_cena",
 }
 
+SUPPORTED_UPLOAD_DOCUMENT_EXTENSIONS = {
+	".pdf": "pdf",
+	".jpg": "image",
+	".jpeg": "image",
+	".png": "image",
+}
+
 
 def _run_extraction(
 	extractor: InvoiceExtractor,
-	pdf_path: Path,
+	document_path: Path,
 	*,
 	on_result: Optional[Callable[[ExtractResult], None]] = None,
 ) -> List[ExtractResult]:
 	"""Run async extractor in a blocking context."""
 	try:
-		return asyncio.run(extractor.extract_auto(str(pdf_path), on_result=on_result))
+		return asyncio.run(extractor.extract_auto(str(document_path), on_result=on_result))
 	except RuntimeError:
 		loop = asyncio.new_event_loop()
 		try:
-			return loop.run_until_complete(extractor.extract_auto(str(pdf_path), on_result=on_result))
+			return loop.run_until_complete(extractor.extract_auto(str(document_path), on_result=on_result))
 		finally:
 			loop.close()
 
@@ -162,6 +171,16 @@ def _normalize_upload_label(filename: str, index: int) -> str:
 	"""Return a safe label for displaying the uploaded path."""
 	name = (filename or "").replace("\\", "/").strip().lstrip("./")
 	return name or f"upload-{index + 1}.pdf"
+
+
+def _upload_document_type(filename: str) -> Optional[str]:
+	"""Return internal upload type for supported invoice documents."""
+	return SUPPORTED_UPLOAD_DOCUMENT_EXTENSIONS.get(Path(filename or "").suffix.lower())
+
+
+def _fallback_upload_filename(index: int, file_type: str) -> str:
+	suffix = ".pdf" if file_type == "pdf" else ".jpg"
+	return f"upload-{index + 1}{suffix}"
 
 
 def _dedupe_filename(base_name: str, used: set[str], *, fallback: str) -> str:
@@ -237,7 +256,7 @@ def _build_csv_processor(cfg):
 def _derive_batch_label(display_names: List[str]) -> str:
 	"""Derive human-friendly source label for a batch."""
 	if not display_names:
-		return "nahraná PDF"
+		return "nahrané dokumenty"
 	if len(display_names) == 1:
 		return Path(display_names[0]).name
 	folder_hint = None
@@ -247,8 +266,8 @@ def _derive_batch_label(display_names: List[str]) -> str:
 			folder_hint = parts[0]
 			break
 	if folder_hint:
-		return f"Složka {folder_hint} ({len(display_names)} PDF)"
-	return f"{len(display_names)} PDF souborů"
+		return f"Složka {folder_hint} ({len(display_names)} dokumentů)"
+	return f"{len(display_names)} dokumentů"
 
 
 def _parse_float_value(value: str) -> float:
@@ -263,7 +282,40 @@ def _parse_float_value(value: str) -> float:
 
 def _has_minimal_invoice_data(inv: Dict[str, object]) -> bool:
 	"""Minimal sanity check to avoid importing empty rows."""
+	if str(inv.get("document_type") or "").strip().lower() == "receipt":
+		return bool(
+			inv.get("cislo_dokladu")
+			or inv.get("variabilni_symbol")
+			or inv.get("dodavatel_jmeno")
+			or inv.get("celkova_cena")
+		)
 	return bool(inv.get("cislo_dokladu") or inv.get("variabilni_symbol") or inv.get("odberatel_jmeno"))
+
+
+def _is_receipt_batch(batch: InvoiceBatch) -> bool:
+	if (batch.source_type or "").strip().lower() == "receipt":
+		return True
+	for row in batch.rows:
+		data = row.invoice_data or {}
+		if isinstance(data, dict) and str(data.get("document_type") or "").strip().lower() == "receipt":
+			return True
+	return False
+
+
+def _document_labels_for_batch(batch: InvoiceBatch) -> dict[str, str]:
+	if _is_receipt_batch(batch):
+		return {
+			"singular": "účtenka",
+			"plural": "účtenky",
+			"plural_genitive": "účtenek",
+			"capital_plural": "Účtenky",
+		}
+	return {
+		"singular": "faktura",
+		"plural": "faktury",
+		"plural_genitive": "faktur",
+		"capital_plural": "Faktury",
+	}
 
 
 def _deduct_credits(user: User, amount: int) -> int:
@@ -573,6 +625,8 @@ def _batch_file_unit_label(batch: InvoiceBatch) -> str:
 		return suffix[1:].upper()
 	if (batch.source_type or "").strip().lower() == "pdf":
 		return "PDF"
+	if (batch.source_type or "").strip().lower() == "receipt":
+		return "doklad"
 	return "soubor"
 
 
@@ -894,6 +948,8 @@ def _persist_invoice_row(
 		}
 
 	local_invoice = dict(invoice_data or {})
+	if local_invoice and (batch.source_type or "").strip().lower() == "receipt":
+		local_invoice["document_type"] = "receipt"
 	local_error = (row_error or "").strip() or None
 	credits_exhausted = False
 
@@ -1363,6 +1419,7 @@ def _import_batch(batch: InvoiceBatch, cfg: Any, selected_ids: Optional[List[int
 				payload_dict = dict(payload)
 		except Exception:
 			payload_dict = inv_dict
+		payload_dict["easyflex_row_id"] = row.id
 
 		partner_preview = {
 			"odberatel_jmeno": payload_dict.get("odberatel_jmeno"),
@@ -1489,13 +1546,17 @@ def create_app() -> Flask:
 		}
 
 	@app.route("/")
-	@login_required
 	def dashboard():
-		recent_batches = _recent_batches_for_user(current_user.id, limit=20)
-		problem_jobs = _problem_jobs(limit=20, user_id=current_user.id)
+		recent_batches: list[dict[str, Any]] = []
+		problem_jobs: list[dict[str, Any]] = []
+		queue_overview = {"queued": 0, "running": 0, "retryable_failed": 0, "failed": 0}
+		if current_user.is_authenticated:
+			recent_batches = _recent_batches_for_user(current_user.id, limit=20)
+			problem_jobs = _problem_jobs(limit=20, user_id=current_user.id)
+			queue_overview = _queue_overview_for_user(current_user.id)
 		return render_template(
 			"dashboard.html",
-			queue_overview=_queue_overview_for_user(current_user.id),
+			queue_overview=queue_overview,
 			recent_batches=recent_batches,
 			problem_jobs=problem_jobs,
 			recent_batches_preview_limit=3,
@@ -1597,15 +1658,22 @@ def create_app() -> Flask:
 		segmentation_enabled = bool(getattr(cfg, "enable_multi_invoice_segmentation", False))
 		ensure_seed_data(current_user, cfg)
 		if request.method == "POST":
-			segmentation_enabled = bool(request.form.get("enable_multi_invoice_segmentation"))
-			cfg.enable_multi_invoice_segmentation = segmentation_enabled
-			settings = getattr(current_user, "settings", None)
-			if settings is not None:
-				overrides = dict(settings.config_overrides or {})
-				if overrides.get("enable_multi_invoice_segmentation") != segmentation_enabled:
-					overrides["enable_multi_invoice_segmentation"] = segmentation_enabled
-					settings.config_overrides = overrides
-					db.session.commit()
+			document_type = (request.form.get("document_type") or "invoice").strip().lower()
+			if document_type not in {"invoice", "receipt"}:
+				document_type = "invoice"
+			setattr(cfg, "document_type", document_type)
+			if document_type == "receipt":
+				segmentation_enabled = bool(getattr(cfg, "enable_multi_invoice_segmentation", False))
+			else:
+				segmentation_enabled = bool(request.form.get("enable_multi_invoice_segmentation"))
+				cfg.enable_multi_invoice_segmentation = segmentation_enabled
+				settings = getattr(current_user, "settings", None)
+				if settings is not None:
+					overrides = dict(settings.config_overrides or {})
+					if overrides.get("enable_multi_invoice_segmentation") != segmentation_enabled:
+						overrides["enable_multi_invoice_segmentation"] = segmentation_enabled
+						settings.config_overrides = overrides
+						db.session.commit()
 			if not cfg.openai_api_key:
 				flash("Nejprve vyplňte svůj OpenAI API klíč v Nastavení.", "warning")
 				return redirect(url_for("user_settings"))
@@ -1618,29 +1686,30 @@ def create_app() -> Flask:
 				if fallback and fallback.filename:
 					uploaded_files = [fallback]
 			if not uploaded_files:
-				flash("Vyberte prosím alespoň jeden PDF soubor nebo složku.", "warning")
+				flash("Vyberte prosím alespoň jeden dokument nebo složku.", "warning")
 				return render_template("upload_pdf.html", cfg=cfg)
-			pdf_files = []
-			skipped_non_pdf: list[str] = []
+			document_files: list[tuple[Any, str]] = []
+			skipped_unsupported: list[str] = []
 			for item in uploaded_files:
-				if (item.filename or "").lower().endswith(".pdf"):
-					pdf_files.append(item)
+				file_type = _upload_document_type(item.filename or "")
+				if file_type:
+					document_files.append((item, file_type))
 				else:
-					skipped_non_pdf.append(item.filename or "")
-			if skipped_non_pdf:
+					skipped_unsupported.append(item.filename or "")
+			if skipped_unsupported:
 				flash(
-					"Následující soubory byly přeskočeny (nejsou PDF): "
-					+ ", ".join(filter(None, skipped_non_pdf)),
+					"Následující soubory byly přeskočeny (nepodporovaný formát): "
+					+ ", ".join(filter(None, skipped_unsupported)),
 					"warning",
 				)
-			if not pdf_files:
-				flash("V nahraných souborech není žádné PDF.", "warning")
+			if not document_files:
+				flash("V nahraných souborech není žádný podporovaný dokument (PDF, JPG/JPEG nebo PNG).", "warning")
 				return render_template("upload_pdf.html", cfg=cfg)
 			limits = _pdf_upload_limits()
-			if len(pdf_files) > limits["max_files"]:
+			if len(document_files) > limits["max_files"]:
 				flash(
-					f"V jedné dávce lze nahrát maximálně {limits['max_files']} PDF. "
-					f"Vybráno: {len(pdf_files)}.",
+					f"V jedné dávce lze nahrát maximálně {limits['max_files']} dokumentů. "
+					f"Vybráno: {len(document_files)}.",
 					"danger",
 				)
 				return render_template("upload_pdf.html", cfg=cfg)
@@ -1649,52 +1718,63 @@ def create_app() -> Flask:
 			saved_files: list[dict[str, Any]] = []
 			total_bytes = 0
 			total_pages = 0
-			source_label = _derive_batch_label([_normalize_upload_label(item.filename, idx) for idx, item in enumerate(pdf_files)])
+			source_label = _derive_batch_label(
+				[_normalize_upload_label(item.filename, idx) for idx, (item, _file_type) in enumerate(document_files)]
+			)
+			source_type = "receipt" if document_type == "receipt" else "pdf"
+			document_label = "účtenek" if document_type == "receipt" else "dokumentů"
 			batch = InvoiceBatch(
 				user=current_user,
 				source_label=source_label,
-				source_type="pdf",
+				source_type=source_type,
 				processing_status=BATCH_STATUS_QUEUED,
-				total_files=len(pdf_files),
+				total_files=len(document_files),
 				processed_files=0,
 				processed_invoices=0,
-				total_invoices_estimate=max(1, len(pdf_files)),
+				total_invoices_estimate=max(1, len(document_files)),
 				current_phase="queued",
 				success_count=0,
 				error_count=0,
 				credits_charged=0,
 				selected_count=0,
 				active_job_type=JOB_TYPE_EXTRACT_PDF,
-				summary_message=f"Dávka čeká na worker ({len(pdf_files)} PDF).",
+				summary_message=f"Dávka čeká na worker ({len(document_files)} {document_label}).",
 				last_heartbeat_at=_utcnow(),
 			)
 			db.session.add(batch)
 			db.session.commit()
 			storage_root = batch_storage_root(batch.id)
 			try:
-				for idx, storage in enumerate(pdf_files):
+				for idx, (storage, file_type) in enumerate(document_files):
 					display_name = _normalize_upload_label(storage.filename, idx)
 					display_names.append(display_name)
-					save_name = _dedupe_filename(display_name, used_names, fallback=f"upload-{idx + 1}.pdf")
-					pdf_path = storage_root / save_name
-					storage.save(pdf_path)
-					size_bytes = int(pdf_path.stat().st_size)
+					save_name = _dedupe_filename(
+						display_name,
+						used_names,
+						fallback=_fallback_upload_filename(idx, file_type),
+					)
+					document_path = storage_root / save_name
+					storage.save(document_path)
+					size_bytes = int(document_path.stat().st_size)
 					total_bytes += size_bytes
 					if size_bytes > limits["max_file_bytes"]:
 						raise ValueError(
-							f"Soubor {display_name} je příliš velký ({size_bytes} B). "
+							f"Dokument {display_name} je příliš velký ({size_bytes} B). "
 							f"Limit je {limits['max_file_bytes']} B."
 						)
 					if total_bytes > limits["max_total_bytes"]:
 						raise ValueError(
 							f"Celková velikost dávky překročila limit {limits['max_total_bytes']} B."
 						)
-					page_count = _read_pdf_page_count(pdf_path, poppler_path=getattr(cfg, "poppler_path", None))
+					if file_type == "pdf":
+						page_count = _read_pdf_page_count(document_path, poppler_path=getattr(cfg, "poppler_path", None))
+					else:
+						page_count = 1
 					if page_count > 0:
 						total_pages += page_count
 						if total_pages > limits["max_total_pages"]:
 							raise ValueError(
-								f"Dávka překračuje limit {limits['max_total_pages']} stran PDF."
+								f"Dávka překračuje limit {limits['max_total_pages']} stran dokumentů."
 							)
 					saved_files.append(
 						{
@@ -1702,20 +1782,22 @@ def create_app() -> Flask:
 							"display_name": display_name,
 							"size_bytes": size_bytes,
 							"page_count": page_count,
+							"file_type": file_type,
 						}
 					)
 			except Exception as exc:  # noqa: BLE001
-				logger.exception("Nepodařilo se uložit/validovat nahraná PDF.")
+				logger.exception("Nepodařilo se uložit/validovat nahrané dokumenty.")
 				shutil.rmtree(storage_root, ignore_errors=True)
 				db.session.delete(batch)
 				db.session.commit()
-				flash(f"Nepodařilo se připravit PDF dávku: {exc}", "danger")
+				flash(f"Nepodařilo se připravit dávku dokumentů: {exc}", "danger")
 				return render_template("upload_pdf.html", cfg=cfg)
 			persist_batch_payload(
 				batch.id,
 				{
 					"batch_id": batch.id,
 					"source_label": source_label,
+					"document_type": document_type,
 					"files": saved_files,
 					"runtime_limit_s": _load_batch_runtime_limit_s(),
 				},
@@ -1725,13 +1807,13 @@ def create_app() -> Flask:
 					batch_id=batch.id,
 					user_id=current_user.id,
 					job_type=JOB_TYPE_EXTRACT_PDF,
-					payload={"files": saved_files, "runtime_limit_s": _load_batch_runtime_limit_s()},
+					payload={"files": saved_files, "runtime_limit_s": _load_batch_runtime_limit_s(), "document_type": document_type},
 					priority=10,
 					max_attempts=3,
 				)
 				db.session.commit()
 			except Exception as exc:  # noqa: BLE001
-				logger.exception("Nepodařilo se zařadit PDF batch do fronty.")
+				logger.exception("Nepodařilo se zařadit dávku dokumentů do fronty.")
 				batch.processing_status = BATCH_STATUS_FAILED
 				batch.finished_at = _utcnow()
 				batch.last_heartbeat_at = _utcnow()
@@ -1743,13 +1825,16 @@ def create_app() -> Flask:
 				return redirect(url_for("view_results", batch_id=batch.id))
 
 			flash(
-				f"Extrakce byla zařazena do fronty pro {len(saved_files)} PDF. "
+				f"Extrakce byla zařazena do fronty pro {len(saved_files)} dokumentů. "
 				"Worker bude výsledky průběžně doplňovat.",
 				"info",
 			)
 			return redirect(url_for("view_results", batch_id=batch.id))
 		cfg.enable_multi_invoice_segmentation = segmentation_enabled
-		return render_template("upload_pdf.html", cfg=cfg)
+		selected_document_type = (request.args.get("document_type") or "invoice").strip().lower()
+		if selected_document_type not in {"invoice", "receipt"}:
+			selected_document_type = "invoice"
+		return render_template("upload_pdf.html", cfg=cfg, selected_document_type=selected_document_type)
 
 	@app.route("/upload-table", methods=["GET", "POST"])
 	@login_required
@@ -1850,6 +1935,8 @@ def create_app() -> Flask:
 			filter_name=filter_name,
 		)
 		rows = rows_for_display(batch, row_items)
+		is_receipt_batch = _is_receipt_batch(batch)
+		document_labels = _document_labels_for_batch(batch)
 		settings = current_user.settings
 		company_code, direction, doc_type_code = current_context(settings, base_cfg=cfg)
 		company_override = request.args.get("company") or request.args.get("company_code") or None
@@ -1858,10 +1945,14 @@ def create_app() -> Flask:
 			company_code = company_override
 		if direction_override:
 			direction = direction_override or direction
+		if is_receipt_batch:
+			direction = "pokladni-pohyb"
+			doc_type_code = "STANDARD"
 		companies = list_companies(current_user)
-		doc_types = list_doc_types(current_user, company_code, direction)
+		doc_types = [] if is_receipt_batch else list_doc_types(current_user, company_code, direction)
 		if doc_type_code and not any(dt.code == doc_type_code for dt in doc_types):
-			doc_type_code = None
+			if not is_receipt_batch:
+				doc_type_code = None
 		progress = _batch_progress_payload(batch, row_count=total_rows)
 		page_count = max(1, (int(total_rows) + page_size - 1) // page_size) if total_rows else 1
 		return render_template(
@@ -1884,6 +1975,8 @@ def create_app() -> Flask:
 			sort_key=sort_key,
 			sort_direction=sort_direction,
 			filter_name=filter_name,
+			is_receipt_batch=is_receipt_batch,
+			document_labels=document_labels,
 		)
 
 	@app.route("/results/<int:batch_id>/progress")
@@ -2069,6 +2162,7 @@ def create_app() -> Flask:
 				error = "Port musí být číslo."
 			else:
 				settings.abra_port = int(port_raw) if port_raw else None
+			settings.abra_company = (request.form.get("abra_company") or "").strip() or None
 			settings.abra_username = (request.form.get("abra_username") or "").strip() or None
 			settings.abra_password = (request.form.get("abra_password") or "").strip() or None
 			settings.abra_verify_tls = bool(request.form.get("abra_verify_tls"))
@@ -2119,6 +2213,7 @@ def create_app() -> Flask:
 			if error is None:
 				_set_override("use_doc_number_as_variable_symbol", bool(request.form.get("use_doc_number_as_variable_symbol")))
 				_set_override("infer_missing_dates", bool(request.form.get("infer_missing_dates")))
+				_set_override("enable_multi_invoice_segmentation", bool(request.form.get("enable_multi_invoice_segmentation")))
 				_set_override("csv_enable_llm_mapping", bool(request.form.get("csv_enable_llm_mapping")))
 				_set_override("auto_import", bool(request.form.get("auto_import")))
 				date_order = (request.form.get("date_order") or "dd-mm").strip().lower()
@@ -2127,14 +2222,25 @@ def create_app() -> Flask:
 					_set_override("abra_doc_endpoint", (request.form.get("abra_doc_endpoint") or "").strip() or None)
 				if "abra_doc_type_code" in request.form:
 					_set_override("abra_doc_type_code", (request.form.get("abra_doc_type_code") or "").strip() or None)
+				if "abra_use_kod" in request.form or active_tab == "import":
+					_set_override("abra_use_kod", bool(request.form.get("abra_use_kod")))
+				if "abra_duplicate_kod_strategy" in request.form:
+					duplicate_strategy = (request.form.get("abra_duplicate_kod_strategy") or "safe_update").strip().lower()
+					if duplicate_strategy not in {"safe_update", "skip"}:
+						error = "Neplatná strategie duplicitního kódu dokladu."
+					else:
+						_set_override("abra_duplicate_kod_strategy", duplicate_strategy)
 				if not current_user.is_admin:
 					for key in EXTRACTOR_OVERRIDE_KEYS:
 						overrides.pop(key, None)
-				settings.config_overrides = overrides
-				db.session.commit()
-				flash("Nastavení uloženo.", "success")
-				cfg = get_user_config()  # reload to reflect new overrides
+				if error is None:
+					settings.config_overrides = overrides
+					db.session.commit()
+					flash("Nastavení uloženo.", "success")
+					cfg = get_user_config()  # reload to reflect new overrides
 			else:
+				db.session.rollback()
+			if error is not None:
 				db.session.rollback()
 		companies = list_companies(current_user)
 		doc_types_all = list_all_doc_types(current_user)
@@ -2161,13 +2267,24 @@ def create_app() -> Flask:
 		company_code = (request.form.get("company_code") or "").strip() or None
 		direction = (request.form.get("direction") or "").strip() or "faktura-prijata"
 		doc_type_code = (request.form.get("doc_type_code") or "").strip() or None
-		persist_context(current_user.settings, company_code, direction, doc_type_code)
+		is_receipt_batch = _is_receipt_batch(batch)
+		if is_receipt_batch:
+			direction = "pokladni-pohyb"
+			doc_type_code = "STANDARD"
+		if not company_code:
+			flash("Vyberte prosím firmu pro import do ABRA.", "warning")
+			return redirect(url_for("view_results", batch_id=batch.id))
+		if is_receipt_batch:
+			current_user.settings.abra_company = company_code
+			db.session.commit()
+		else:
+			persist_context(current_user.settings, company_code, direction, doc_type_code)
 		if batch.processing_status in {BATCH_STATUS_RUNNING, BATCH_STATUS_QUEUED, BATCH_STATUS_IMPORTING}:
 			flash("Dávka se ještě zpracovává nebo se právě importuje. Zkuste to znovu za chvíli.", "warning")
 			return redirect(url_for("view_results", batch_id=batch.id))
 		selected_count = count_selected_rows(batch.id)
 		if selected_count <= 0:
-			flash("Vyberte alespoň jednu fakturu k importu.", "warning")
+			flash(f"Vyberte alespoň jednu {_document_labels_for_batch(batch)['singular']} k importu.", "warning")
 			return redirect(url_for("view_results", batch_id=batch.id))
 		active_job = active_job_for_batch(batch.id)
 		if active_job is not None and active_job.job_type == JOB_TYPE_IMPORT_ABRA:
@@ -2181,6 +2298,7 @@ def create_app() -> Flask:
 				"company_code": company_code,
 				"direction": direction,
 				"doc_type_code": doc_type_code,
+				"document_type": "receipt" if is_receipt_batch else "invoice",
 				"selected_count": selected_count,
 			},
 			priority=5,
@@ -2190,10 +2308,10 @@ def create_app() -> Flask:
 		batch.current_phase = "waiting_import"
 		batch.active_job_type = JOB_TYPE_IMPORT_ABRA
 		batch.selected_count = selected_count
-		batch.summary_message = f"Import do ABRA byl zařazen do fronty pro {selected_count} označených faktur."
+		batch.summary_message = f"Import do ABRA byl zařazen do fronty pro {selected_count} označených {_document_labels_for_batch(batch)['plural_genitive']}."
 		batch.last_heartbeat_at = _utcnow()
 		db.session.commit()
-		flash(f"Import do ABRA byl zařazen do fronty pro {selected_count} faktur.", "info")
+		flash(f"Import do ABRA byl zařazen do fronty pro {selected_count} {_document_labels_for_batch(batch)['plural_genitive']}.", "info")
 		return redirect(url_for("view_results", batch_id=batch.id))
 
 	@app.route("/abra/company", methods=["POST"])
@@ -2337,6 +2455,18 @@ def create_app() -> Flask:
 				db.session.remove()
 				app.logger.warning(
 					"ensure_admin_user: transient DB error on attempt %s/%s: %s",
+					attempt + 1,
+					max_attempts,
+					exc,
+				)
+				if attempt + 1 < max_attempts:
+					time.sleep(0.2)
+				else:
+					return False
+			except IntegrityError as exc:
+				db.session.rollback()
+				app.logger.warning(
+					"ensure_admin_user: admin row already exists on attempt %s/%s, retrying lookup: %s",
 					attempt + 1,
 					max_attempts,
 					exc,

@@ -3,8 +3,10 @@ import pytest
 
 from EasyFlex.abra import (
 	_build_invoice_payload,
+	_build_receipt_payload,
 	_ensure_partner_ext_id,
 	_map_invoice_json,
+	_normalize_companies_payload,
 	_prepare_partner_section,
 	_request_with_retry,
 	import_to_abra,
@@ -218,6 +220,20 @@ def test_build_payload_match_includes_firma(monkeypatch) -> None:
 def test_request_guard_blocks_adresar_write() -> None:
 	with pytest.raises(RuntimeError):
 		_request_with_retry("POST", "https://server/c/demo/adresar.json", auth=("u", "p"), timeout_s=1, verify=False)
+
+
+def test_normalize_companies_payload_accepts_winstrom_wrapper() -> None:
+	payload = {
+		"winstrom": {
+			"c": [
+				{"firma": "demo", "nazev": "Demo s.r.o.", "ico": "12345678"},
+			]
+		}
+	}
+
+	companies = _normalize_companies_payload(payload)
+
+	assert companies == [{"firma": "demo", "nazev": "Demo s.r.o.", "ico": "12345678"}]
 
 
 def test_import_to_abra_logs_ext_id_without_nameerror(monkeypatch, caplog) -> None:
@@ -475,3 +491,99 @@ def test_payload_contains_currency_reference_and_no_exchange_rate_fields() -> No
 	assert entry.get("mena") == "code:EUR"
 	assert "kurz" not in entry
 	assert "kurzMnozstvi" not in entry
+
+
+def test_receipt_payload_maps_to_cash_expense_czk() -> None:
+	cfg = _make_config()
+	receipt = {
+		"document_type": "receipt",
+		"cislo_dokladu": "UCT-1",
+		"dodavatel_jmeno": "Papirnictvi s.r.o.",
+		"dodavatel_ic": "12345678",
+		"datum_vystaveni": "2026-04-01",
+		"mena": "CZK",
+		"zaklad_dane_21": 100.0,
+		"vyse_dph_21": 21.0,
+		"celkova_cena": 121.0,
+	}
+	payload = _build_receipt_payload(receipt, cfg, None)
+	entry = payload["winstrom"]["pokladni-pohyb"][0]
+	assert entry["typPohybuK"] == "typPohybu.vydej"
+	assert entry["typDokl"] == "code:STANDARD"
+	assert entry["pokladna"] == "code:POKLADNA KČ"
+	assert entry["rada"] == "code:POKLADNA-"
+	assert entry["mena"] == "code:CZK"
+	assert entry["datVyst"] == "2026-04-01"
+	assert entry["kod"] == "UCT-1"
+	assert entry["metodaZaokrDoklK"] == "metodaZaokr.individ"
+	assert entry["vytvaretKorPol"] is False
+	assert entry["zdrojProSkl"] is True
+	assert entry["ic"] == "12345678"
+	assert entry["polozkyDokladu"][0]["typPolozkyK"] == "typPolozky.obecny"
+	assert entry["polozkyDokladu"][0]["typSzbDphK"] == "typSzbDph.dphZakl"
+	assert entry["polozkyDokladu"][0]["cenaMj"] == 100.0
+
+
+def test_receipt_payload_maps_eur_cashbox_and_fallback_code() -> None:
+	cfg = _make_config()
+	receipt = {
+		"document_type": "receipt",
+		"easyflex_row_id": 42,
+		"datum_vystaveni": "2026-04-02",
+		"mena": "EUR",
+		"zaklad_dane_12": 50.0,
+		"vyse_dph_12": 6.0,
+	}
+	payload = _build_receipt_payload(receipt, cfg, None)
+	entry = payload["winstrom"]["pokladni-pohyb"][0]
+	assert entry["pokladna"] == "code:POKLADNA EUR"
+	assert entry["rada"] == "code:POKLADNA EUR-"
+	assert entry["mena"] == "code:EUR"
+	assert entry["kod"] == "EFUCT-42"
+	assert entry["polozkyDokladu"][0]["typSzbDphK"] == "typSzbDph.dphSniz"
+
+
+def test_receipt_payload_uses_zero_vat_fallback_when_vat_missing() -> None:
+	cfg = _make_config()
+	receipt = {
+		"document_type": "receipt",
+		"easyflex_row_id": 7,
+		"datum_vystaveni": "2026-04-03",
+		"celkova_cena": 80.0,
+	}
+	payload = _build_receipt_payload(receipt, cfg, None)
+	entry = payload["winstrom"]["pokladni-pohyb"][0]
+	assert entry["kod"] == "EFUCT-7"
+	assert entry["polozkyDokladu"] == [{
+		"nazev": "Nákup 0% DPH",
+		"typPolozkyK": "typPolozky.obecny",
+		"mnozMj": 1,
+		"cenaMj": 80.0,
+		"typSzbDphK": "typSzbDph.dphOsv",
+	}]
+
+
+def test_import_to_abra_posts_receipt_to_cash_movement(monkeypatch) -> None:
+	captured = {}
+
+	def _fake_request(method, url, auth, timeout_s, json_body=None, verify=True):
+		if method == "GET":
+			return _DummyResponse({}, 200)
+		if method == "POST":
+			captured["url"] = url
+			captured["payload"] = json_body
+			return _DummyResponse({"id": "POK-1"}, 200)
+		raise RuntimeError(f"Unexpected method {method}")
+
+	monkeypatch.setattr("EasyFlex.abra._request_with_retry", _fake_request)
+	monkeypatch.setattr("EasyFlex.abra._ensure_company_id", lambda *args, **kwargs: "demo")
+	monkeypatch.setattr("EasyFlex.abra._ensure_partner_ext_id", lambda *args, **kwargs: None)
+	cfg = _make_config(abra_doc_endpoint="faktura-vydana")
+	receipt = {"document_type": "receipt", "easyflex_row_id": 5, "celkova_cena": 10.0}
+
+	result = import_to_abra(receipt, cfg)
+
+	assert result["__status"] == "created"
+	assert captured["url"].endswith("/pokladni-pohyb.json")
+	entry = captured["payload"]["winstrom"]["pokladni-pohyb"][0]
+	assert entry["kod"] == "EFUCT-5"

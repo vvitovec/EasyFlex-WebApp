@@ -1,5 +1,7 @@
 import asyncio
 
+from PIL import Image
+
 from EasyFlex.config import AppConfig, model_supports_sampling_params
 from EasyFlex.extractor import InvoiceExtractor, SegmentInfo, ExtractResult
 
@@ -245,3 +247,78 @@ def test_extract_auto_streams_group_results(monkeypatch) -> None:
 	results = asyncio.run(extractor.extract_auto("dummy.pdf", on_result=_on_result))
 	assert len(results) == 3
 	assert streamed_indexes == [1, 2, 3]
+
+
+def test_extract_auto_image_uses_vision_without_pdf_conversion(monkeypatch, tmp_path) -> None:
+	extractor = InvoiceExtractor(
+		config=_make_config(enable_multi_invoice_segmentation=False),
+		api_key="sk-test",
+	)
+	image_path = tmp_path / "invoice.jpg"
+	Image.new("RGB", (16, 16), "white").save(image_path, format="JPEG")
+
+	async def _unexpected_pdf_to_images(_pdf_path: str):
+		raise AssertionError("PDF conversion should not run for images")
+
+	async def _fake_run_vision(images_b64, *, invoice_deadline_monotonic=None):
+		assert len(images_b64) == 1
+		return {"cislo_dokladu": "IMG-001", "mena": "CZK"}, []
+
+	monkeypatch.setattr(extractor, "_pdf_to_images", _unexpected_pdf_to_images)
+	monkeypatch.setattr(extractor, "_run_vision_extraction", _fake_run_vision)
+
+	results = asyncio.run(extractor.extract_auto(str(image_path)))
+	assert len(results) == 1
+	assert results[0].error is None
+	assert results[0].data is not None
+	assert results[0].data.cislo_dokladu == "IMG-001"
+
+
+def test_extract_auto_image_ignores_pdf_segmentation(monkeypatch, tmp_path) -> None:
+	extractor = InvoiceExtractor(
+		config=_make_config(enable_multi_invoice_segmentation=True),
+		api_key="sk-test",
+	)
+	image_path = tmp_path / "invoice.png"
+	Image.new("RGB", (16, 16), "white").save(image_path, format="PNG")
+
+	async def _unexpected_segment_images(_images):
+		raise AssertionError("PDF segmentation should not run for images")
+
+	async def _fake_run_vision(images_b64, *, invoice_deadline_monotonic=None):
+		assert len(images_b64) == 1
+		return {"cislo_dokladu": "IMG-002", "mena": "CZK"}, []
+
+	monkeypatch.setattr(extractor, "_segment_images", _unexpected_segment_images)
+	monkeypatch.setattr(extractor, "_run_vision_extraction", _fake_run_vision)
+
+	streamed_indexes = []
+
+	def _on_result(res):
+		streamed_indexes.append(getattr(res, "_invoice_group_index", None))
+
+	results = asyncio.run(extractor.extract_auto(str(image_path), on_result=_on_result))
+	assert len(results) == 1
+	assert streamed_indexes == [1]
+	assert results[0].data is not None
+	assert results[0].data.cislo_dokladu == "IMG-002"
+
+
+def test_extract_auto_invalid_image_returns_error(monkeypatch, tmp_path) -> None:
+	extractor = InvoiceExtractor(
+		config=_make_config(enable_multi_invoice_segmentation=True),
+		api_key="sk-test",
+	)
+	image_path = tmp_path / "broken.png"
+	image_path.write_bytes(b"not an image")
+
+	async def _unexpected_run_vision(*_args, **_kwargs):
+		raise AssertionError("Vision extraction should not run for invalid images")
+
+	monkeypatch.setattr(extractor, "_run_vision_extraction", _unexpected_run_vision)
+
+	results = asyncio.run(extractor.extract_auto(str(image_path)))
+	assert len(results) == 1
+	assert results[0].data is None
+	assert results[0].error is not None
+	assert "Načtení obrázku selhalo" in results[0].error

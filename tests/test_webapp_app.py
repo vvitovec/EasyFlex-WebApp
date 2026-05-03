@@ -3,7 +3,7 @@ import io
 import json
 from datetime import timedelta
 
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 
 def _load_app_module(monkeypatch):
@@ -16,14 +16,25 @@ def _load_app_module(monkeypatch):
 
 def _load_app_module_with_db(monkeypatch, tmp_path):
 	monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'test_webapp.db'}")
-	monkeypatch.delenv("EASYFLEX_ADMIN_PASSWORD", raising=False)
+	monkeypatch.setenv("EASYFLEX_ADMIN_PASSWORD", "secret")
+	import webapp.auth as auth_module
+
+	importlib.reload(auth_module)
 	import webapp.app as app_module
 	return importlib.reload(app_module)
 
 
-def _create_user(app_module, app, *, username: str = "admin", password: str = "secret", credits: int = 20):
+def _create_user(
+	app_module,
+	app,
+	*,
+	username: str = "admin",
+	password: str = "secret",
+	credits: int = 20,
+	is_admin: bool = True,
+):
 	with app.app_context():
-		user = app_module.User(username=username, is_admin=True, credits=credits)
+		user = app_module.User(username=username, is_admin=is_admin, credits=credits)
 		user.set_password(password)
 		settings = app_module.UserSettings(user=user, openai_api_key="sk-test")
 		app_module.db.session.add(user)
@@ -81,6 +92,102 @@ def test_readyz_returns_503_on_db_error(monkeypatch, tmp_path) -> None:
 	assert payload["database"] == "error"
 
 
+def test_admin_settings_menu_contains_admin_links(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+	_create_user(app_module, app)
+
+	client = app.test_client()
+	_login(client)
+	resp = client.get("/")
+	html = resp.get_data(as_text=True)
+
+	assert resp.status_code == 200
+	assert 'href="/users"' in html
+	assert "Správa uživatelů" in html
+	assert 'href="/admin/jobs"' in html
+	assert "Admin joby" in html
+
+
+def test_regular_settings_menu_hides_admin_links(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+	_create_user(app_module, app, username="user", is_admin=False)
+
+	client = app.test_client()
+	_login(client, username="user")
+	resp = client.get("/")
+	html = resp.get_data(as_text=True)
+
+	assert resp.status_code == 200
+	assert "Správa uživatelů" not in html
+	assert "Admin joby" not in html
+
+
+def test_settings_page_saves_extraction_and_import_options(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+	user_id = _create_user(app_module, app)
+
+	with app.app_context():
+		user = app_module.db.session.get(app_module.User, user_id)
+		app_module.store_company(user, "DEMO", "Demo firma")
+
+	client = app.test_client()
+	_login(client)
+	resp = client.post(
+		"/settings",
+		data={
+			"active_tab": "import",
+			"openai_api_key": "sk-admin",
+			"abra_server": "abra.local",
+			"abra_port": "443",
+			"abra_company": "DEMO",
+			"abra_username": "flexi",
+			"abra_password": "secret",
+			"abra_verify_tls": "1",
+			"openai_model": "gpt-5",
+			"reasoning_effort": "medium",
+			"concurrency": "2",
+			"max_tokens": "4000",
+			"pdf_dpi": "180",
+			"max_pages": "10",
+			"timeout_s": "90",
+			"connection_timeout_s": "10",
+			"request_delay": "0.2",
+			"max_retries": "3",
+			"image_max_width": "1600",
+			"image_jpeg_quality": "85",
+			"use_doc_number_as_variable_symbol": "1",
+			"infer_missing_dates": "1",
+			"enable_multi_invoice_segmentation": "1",
+			"csv_enable_llm_mapping": "1",
+			"auto_import": "1",
+			"date_order": "mm-dd",
+			"abra_doc_endpoint": "faktura-vydana",
+			"abra_doc_type_code": "FV",
+			"abra_use_kod": "1",
+			"abra_duplicate_kod_strategy": "skip",
+		},
+		follow_redirects=False,
+	)
+	assert resp.status_code == 200
+
+	with app.app_context():
+		settings = app_module.UserSettings.query.filter_by(user_id=user_id).first()
+		assert settings.abra_company == "DEMO"
+		assert settings.config_overrides["enable_multi_invoice_segmentation"] is True
+		assert settings.config_overrides["date_day_first"] is False
+		assert settings.config_overrides["abra_doc_endpoint"] == "faktura-vydana"
+		assert settings.config_overrides["abra_doc_type_code"] == "FV"
+		assert settings.config_overrides["abra_use_kod"] is True
+		assert settings.config_overrides["abra_duplicate_kod_strategy"] == "skip"
+		assert settings.config_overrides["auto_import"] is True
+
+
 def test_admin_init_operational_error_is_handled(monkeypatch) -> None:
 	app_module = _load_app_module(monkeypatch)
 	app = app_module.create_app()
@@ -117,6 +224,46 @@ def test_admin_init_operational_error_is_handled(monkeypatch) -> None:
 	assert app.config.get("_ADMIN_INITIALIZED") is not True
 
 
+def test_admin_init_retries_duplicate_admin_insert(monkeypatch) -> None:
+	app_module = _load_app_module(monkeypatch)
+	app = app_module.create_app()
+	monkeypatch.setenv("EASYFLEX_ADMIN_PASSWORD", "secret")
+
+	existing_admin = app_module.User(username="admin", is_admin=False, credits=None)
+	query_results = [None, existing_admin]
+	commit_calls = {"count": 0}
+
+	def _commit():
+		commit_calls["count"] += 1
+		if commit_calls["count"] == 1:
+			raise IntegrityError("INSERT", {}, Exception("duplicate admin"))
+
+	class _DummyQuery:
+		def filter_by(self, **kwargs):
+			return self
+
+		def first(self):
+			return query_results.pop(0)
+
+	with app.app_context():
+		monkeypatch.setattr(app_module.User, "query", _DummyQuery(), raising=False)
+		monkeypatch.setattr(app_module.db.session, "add", lambda *_args, **_kwargs: None)
+		monkeypatch.setattr(app_module.db.session, "commit", _commit)
+		monkeypatch.setattr(app_module.db.session, "rollback", lambda: None)
+
+		before_funcs = app.before_request_funcs.get(None, [])
+		run_once = next(func for func in before_funcs if func.__name__ == "_run_admin_init_once")
+
+		with app.test_request_context("/"):
+			run_once()
+
+	assert app.config.get("_ADMIN_INITIALIZED") is True
+	assert commit_calls["count"] == 2
+	assert existing_admin.is_admin is True
+	assert existing_admin.credits == app_module.STARTING_CREDITS
+	assert existing_admin.password_hash
+
+
 def test_upload_pdf_creates_queued_batch_and_redirects(monkeypatch, tmp_path) -> None:
 	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
 	app = app_module.create_app()
@@ -131,7 +278,8 @@ def test_upload_pdf_creates_queued_batch_and_redirects(monkeypatch, tmp_path) ->
 		data={
 			"pdfs": [
 				(io.BytesIO(b"%PDF-1.4 fake a"), "faktura-a.pdf"),
-				(io.BytesIO(b"%PDF-1.4 fake b"), "faktura-b.pdf"),
+				(io.BytesIO(b"fake jpg"), "faktura-b.jpg"),
+				(io.BytesIO(b"fake png"), "faktura-c.png"),
 			],
 		},
 		content_type="multipart/form-data",
@@ -148,12 +296,136 @@ def test_upload_pdf_creates_queued_batch_and_redirects(monkeypatch, tmp_path) ->
 		batch = app_module.db.session.get(app_module.InvoiceBatch, job.batch_id)
 		assert batch is not None
 		assert batch.processing_status == "queued"
-		assert batch.total_files == 2
+		assert batch.total_files == 3
 		assert batch.processed_files == 0
 		assert batch.success_count == 0
 		assert batch.error_count == 0
 		payload = json.loads(app_module.batch_payload_path(batch.id).read_text(encoding="utf-8"))
-		assert len(payload["files"]) == 2
+		assert len(payload["files"]) == 3
+		assert [item["file_type"] for item in payload["files"]] == ["pdf", "image", "image"]
+		assert [item["page_count"] for item in payload["files"]] == [0, 1, 1]
+
+
+def test_upload_receipt_creates_receipt_batch(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+	_create_user(app_module, app)
+	monkeypatch.setattr(app_module, "ensure_seed_data", lambda *_args, **_kwargs: None)
+
+	client = app.test_client()
+	_login(client)
+	resp = client.post(
+		"/upload-pdf",
+		data={
+			"document_type": "receipt",
+			"pdfs": [(io.BytesIO(b"fake png"), "uctenka.png")],
+		},
+		content_type="multipart/form-data",
+		follow_redirects=False,
+	)
+	assert resp.status_code == 302
+
+	with app.app_context():
+		job = app_module.BatchJob.query.order_by(app_module.BatchJob.id.desc()).first()
+		assert job is not None
+		assert job.payload["document_type"] == "receipt"
+		batch = app_module.db.session.get(app_module.InvoiceBatch, job.batch_id)
+		assert batch is not None
+		assert batch.source_type == "receipt"
+		payload = json.loads(app_module.batch_payload_path(batch.id).read_text(encoding="utf-8"))
+		assert payload["document_type"] == "receipt"
+
+
+def test_upload_pdf_keeps_document_type_context_out_of_duplicate_choice(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+	user_id = _create_user(app_module, app)
+	monkeypatch.setattr(app_module, "ensure_seed_data", lambda *_args, **_kwargs: None)
+
+	client = app.test_client()
+	_login(client)
+	resp = client.get("/upload-pdf?document_type=receipt")
+	assert resp.status_code == 200
+	body = resp.get_data(as_text=True)
+	assert 'name="document_type" value="receipt"' in body
+	assert "Typ dokladů" not in body
+	assert 'type="radio" name="document_type"' not in body
+	assert "Povolit rozdělení více faktur" not in body
+
+	with app.app_context():
+		settings = app_module.UserSettings.query.filter_by(user_id=user_id).first()
+		assert settings is not None
+		settings.config_overrides = {"enable_multi_invoice_segmentation": True}
+		app_module.db.session.commit()
+
+	resp = client.post(
+		"/upload-pdf",
+		data={
+			"document_type": "receipt",
+			"pdfs": [(io.BytesIO(b"fake png"), "uctenka.png")],
+		},
+		content_type="multipart/form-data",
+		follow_redirects=False,
+	)
+	assert resp.status_code == 302
+	with app.app_context():
+		settings = app_module.UserSettings.query.filter_by(user_id=user_id).first()
+		assert settings is not None
+		assert settings.config_overrides["enable_multi_invoice_segmentation"] is True
+
+
+def test_upload_pdf_skips_unsupported_files(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+	_create_user(app_module, app)
+	monkeypatch.setattr(app_module, "ensure_seed_data", lambda *_args, **_kwargs: None)
+
+	client = app.test_client()
+	_login(client)
+	resp = client.post(
+		"/upload-pdf",
+		data={
+			"pdfs": [
+				(io.BytesIO(b"%PDF-1.4 fake"), "faktura.pdf"),
+				(io.BytesIO(b"plain text"), "poznamka.txt"),
+			],
+		},
+		content_type="multipart/form-data",
+		follow_redirects=False,
+	)
+	assert resp.status_code == 302
+
+	with app.app_context():
+		batch = app_module.InvoiceBatch.query.order_by(app_module.InvoiceBatch.id.desc()).first()
+		assert batch is not None
+		payload = json.loads(app_module.batch_payload_path(batch.id).read_text(encoding="utf-8"))
+		assert len(payload["files"]) == 1
+		assert payload["files"][0]["display_name"] == "faktura.pdf"
+
+
+def test_upload_pdf_rejects_batch_with_only_unsupported_files(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+	_create_user(app_module, app)
+	monkeypatch.setattr(app_module, "ensure_seed_data", lambda *_args, **_kwargs: None)
+
+	client = app.test_client()
+	_login(client)
+	resp = client.post(
+		"/upload-pdf",
+		data={"pdfs": [(io.BytesIO(b"plain text"), "poznamka.txt")]},
+		content_type="multipart/form-data",
+		follow_redirects=True,
+	)
+	assert resp.status_code == 200
+	assert "není žádný podporovaný dokument".encode("utf-8") in resp.data
+
+	with app.app_context():
+		assert app_module.InvoiceBatch.query.count() == 0
 
 
 def test_batch_progress_endpoint_returns_json(monkeypatch, tmp_path) -> None:
@@ -224,6 +496,135 @@ def test_batch_progress_endpoint_returns_json(monkeypatch, tmp_path) -> None:
 	assert payload["next_retry_in_s"] is not None
 	assert payload["active_job_attempt_count"] == 2
 	assert payload["active_job_last_error"] == "Test retry"
+
+
+def test_import_abra_requires_company_selection(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+	user_id = _create_user(app_module, app)
+	monkeypatch.setattr(app_module, "ensure_seed_data", lambda *_args, **_kwargs: None)
+
+	with app.app_context():
+		settings = app_module.UserSettings.query.filter_by(user_id=user_id).first()
+		assert settings is not None
+		settings.abra_server = "server"
+		settings.abra_port = 443
+		settings.abra_username = "user"
+		settings.abra_password = "pass"
+		user = app_module.db.session.get(app_module.User, user_id)
+		batch = app_module.InvoiceBatch(
+			user=user,
+			source_label="Test batch",
+			source_type="pdf",
+			processing_status="completed",
+			total_files=1,
+			processed_files=1,
+			processed_invoices=1,
+			total_invoices_estimate=1,
+			current_phase="completed",
+			success_count=1,
+			error_count=0,
+		)
+		app_module.db.session.add(batch)
+		app_module.db.session.flush()
+		row = app_module.InvoiceRow(
+			batch=batch,
+			row_index=0,
+			source="faktura-a.pdf",
+			invoice_data={"cislo_dokladu": "A1"},
+			warning=None,
+			error=None,
+			marked_for_import=True,
+		)
+		app_module.db.session.add(row)
+		app_module.db.session.commit()
+		batch_id = batch.id
+
+	client = app.test_client()
+	_login(client)
+	resp = client.post(
+		f"/import-abra/{batch_id}",
+		data={"company_code": "", "direction": "faktura-prijata", "doc_type_code": ""},
+		follow_redirects=True,
+	)
+	assert resp.status_code == 200
+	assert "Vyberte prosím firmu pro import do ABRA.".encode("utf-8") in resp.data
+
+	with app.app_context():
+		job = app_module.BatchJob.query.filter_by(batch_id=batch_id, job_type="import_abra").first()
+		assert job is None
+
+
+def test_receipt_results_preview_and_import_queue(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+	user_id = _create_user(app_module, app)
+	monkeypatch.setattr(app_module, "ensure_seed_data", lambda *_args, **_kwargs: None)
+
+	with app.app_context():
+		settings = app_module.UserSettings.query.filter_by(user_id=user_id).first()
+		assert settings is not None
+		settings.abra_server = "server"
+		settings.abra_port = 443
+		settings.abra_username = "user"
+		settings.abra_password = "pass"
+		user = app_module.db.session.get(app_module.User, user_id)
+		app_module.store_company(user, "ing__blanka_vitovcova", "Blanka")
+		batch = app_module.InvoiceBatch(
+			user=user,
+			source_label="uctenky",
+			source_type="receipt",
+			processing_status="completed",
+			total_files=1,
+			processed_files=1,
+			processed_invoices=1,
+			total_invoices_estimate=1,
+			current_phase="done",
+			success_count=1,
+			error_count=0,
+			selected_count=1,
+		)
+		app_module.db.session.add(batch)
+		app_module.db.session.flush()
+		row = app_module.InvoiceRow(
+			batch=batch,
+			row_index=0,
+			source="uctenka.png",
+			invoice_data={
+				"document_type": "receipt",
+				"datum_vystaveni": "2026-04-01",
+				"dodavatel_jmeno": "Papirnictvi",
+				"celkova_cena": 121.0,
+			},
+			marked_for_import=True,
+		)
+		app_module.db.session.add(row)
+		app_module.db.session.commit()
+		batch_id = batch.id
+
+	client = app.test_client()
+	_login(client)
+	resp = client.get(f"/results/{batch_id}?company_code=ing__blanka_vitovcova")
+	assert resp.status_code == 200
+	body = resp.get_data(as_text=True)
+	assert "ABRA pokladna" in body
+	assert "pokladni-pohyb" in body
+	assert "Pokladní výdaj" in body
+
+	resp = client.post(
+		f"/import-abra/{batch_id}",
+		data={"company_code": "ing__blanka_vitovcova"},
+		follow_redirects=False,
+	)
+	assert resp.status_code == 302
+	with app.app_context():
+		job = app_module.BatchJob.query.filter_by(batch_id=batch_id, job_type="import_abra").first()
+		assert job is not None
+		assert job.payload["document_type"] == "receipt"
+		assert job.payload["direction"] == "pokladni-pohyb"
+		assert job.payload["doc_type_code"] == "STANDARD"
 
 
 def test_current_context_for_user_works_without_user_relationship(monkeypatch, tmp_path) -> None:
@@ -321,6 +722,57 @@ def test_dashboard_renders_recent_batches_and_problem_jobs(monkeypatch, tmp_path
 	body = resp.get_data(as_text=True)
 	assert "Domaci batch" in body
 	assert "Čeká na retry" in body
+
+
+def test_dashboard_is_public_choice_page_for_anonymous_users(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+
+	client = app.test_client()
+	resp = client.get("/")
+	assert resp.status_code == 200
+	body = resp.get_data(as_text=True)
+	assert "Co chcete zpracovat?" in body
+	assert "Faktury" in body
+	assert "Účtenky" in body
+	assert "Poslední práce" not in body
+
+
+def test_anonymous_invoice_pdf_choice_requires_login(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+
+	client = app.test_client()
+	resp = client.get("/upload-pdf?document_type=invoice", follow_redirects=False)
+	assert resp.status_code == 302
+	assert "/login" in resp.headers["Location"]
+	assert "next=" in resp.headers["Location"]
+
+
+def test_anonymous_receipt_choice_requires_login(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+
+	client = app.test_client()
+	resp = client.get("/upload-pdf?document_type=receipt", follow_redirects=False)
+	assert resp.status_code == 302
+	assert "/login" in resp.headers["Location"]
+	assert "next=" in resp.headers["Location"]
+
+
+def test_anonymous_table_choice_requires_login(monkeypatch, tmp_path) -> None:
+	app_module = _load_app_module_with_db(monkeypatch, tmp_path)
+	app = app_module.create_app()
+	app.config["TESTING"] = True
+
+	client = app.test_client()
+	resp = client.get("/upload-table", follow_redirects=False)
+	assert resp.status_code == 302
+	assert "/login" in resp.headers["Location"]
+	assert "next=" in resp.headers["Location"]
 
 
 def test_dashboard_limits_preview_and_shows_csv_label(monkeypatch, tmp_path) -> None:

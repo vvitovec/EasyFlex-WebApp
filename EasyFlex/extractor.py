@@ -42,6 +42,9 @@ ZERO_DEFAULT_FIELDS = (
 	"vyse_dph_21",
 )
 
+SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+SUPPORTED_IMAGE_FORMATS = {"JPEG", "PNG"}
+
 _global_rate_lock = threading.Lock()
 _global_last_request_time = 0.0
 
@@ -218,15 +221,31 @@ class InvoiceExtractor:
 
 	async def extract_auto(
 		self,
-		pdf_path: str,
+		file_path: str,
 		on_result: Optional[Callable[[ExtractResult], None]] = None,
 	) -> List[ExtractResult]:
-		"""Rozhodne dle konfigurace, zda provést jednoduchou extrakci nebo dvoufázovou (segmentace → skupiny)."""
+		"""Rozhodne dle typu souboru a konfigurace, jak dokument vytěžit."""
+		suffix = Path(file_path).suffix.lower()
+		if suffix in SUPPORTED_IMAGE_EXTENSIONS:
+			res = await self.extract_from_image(file_path)
+			setattr(res, "_invoice_group_index", 1)
+			setattr(res, "_invoice_group_total", 1)
+			if on_result is not None:
+				on_result(res)
+			return [res]
+		if suffix != ".pdf":
+			message = "Nepodporovaný formát dokumentu. Podporované formáty jsou PDF, JPG/JPEG a PNG."
+			res = ExtractResult(file_path=file_path, data=None, error=message)
+			setattr(res, "_invoice_group_index", 1)
+			setattr(res, "_invoice_group_total", 1)
+			if on_result is not None:
+				on_result(res)
+			return [res]
 		cfg = self._config
 		if getattr(cfg, "enable_multi_invoice_segmentation", False):
-			return await self.extract_from_pdf_multi_segmented(pdf_path, on_result=on_result)
+			return await self.extract_from_pdf_multi_segmented(file_path, on_result=on_result)
 		else:
-			res = await self.extract_from_pdf(pdf_path)
+			res = await self.extract_from_pdf(file_path)
 			setattr(res, "_invoice_group_index", 1)
 			setattr(res, "_invoice_group_total", 1)
 			if on_result is not None:
@@ -238,11 +257,13 @@ class InvoiceExtractor:
 		try:
 			# Použijeme velikost souboru a čas modifikace pro rychlý cache klíč
 			stat = os.stat(pdf_path)
-			key_data = f"{pdf_path}:{stat.st_size}:{stat.st_mtime}"
+			document_type = str(getattr(self._config, "document_type", "invoice") or "invoice")
+			key_data = f"{document_type}:{pdf_path}:{stat.st_size}:{stat.st_mtime}"
 			return hashlib.md5(key_data.encode()).hexdigest()
 		except Exception:
 			# Fallback na hash cesty
-			return hashlib.md5(pdf_path.encode()).hexdigest()
+			document_type = str(getattr(self._config, "document_type", "invoice") or "invoice")
+			return hashlib.md5(f"{document_type}:{pdf_path}".encode()).hexdigest()
 	
 	def _get_cached_result(self, pdf_path: str) -> Optional[Tuple[Dict[str, Any], List[str]]]:
 		"""Získá výsledek z cache pokud existuje."""
@@ -357,6 +378,50 @@ class InvoiceExtractor:
 		except Exception as exc:  # noqa: BLE001
 			logger.exception("Selhala extrakce pro %s", pdf_path)
 			return ExtractResult(file_path=pdf_path, data=None, error=str(exc), warnings=warnings)
+
+	async def extract_from_image(self, image_path: str) -> ExtractResult:
+		"""Extract structured invoice data from a single invoice image."""
+		logger.info("Začínám extrakci obrázku: %s", image_path)
+		warnings: List[str] = []
+
+		cached_result = self._get_cached_result(image_path)
+		if cached_result:
+			payload_cached, cached_warnings = cached_result
+			logger.info("Používám výsledek z cache: %s", image_path)
+			validated = InvoiceData.model_validate(payload_cached)
+			processed_invoice = process_invoice_data(validated)
+			return ExtractResult(file_path=image_path, data=processed_invoice, warnings=cached_warnings)
+
+		try:
+			images = await self._image_to_images(image_path)
+			if not images:
+				raise ValueError("Obrázek se nepodařilo načíst.")
+
+			b64_images = [self._pil_image_to_base64(img) for img in images]
+			invoice_deadline = time.monotonic() + max(15, self.invoice_runtime_limit_s)
+			payload, warnings = await self._run_vision_extraction(
+				b64_images,
+				invoice_deadline_monotonic=invoice_deadline,
+			)
+
+			cfg = self._config
+			day_first = getattr(cfg, "date_day_first", True)
+			if cfg.use_doc_number_as_variable_symbol and payload.get("cislo_dokladu"):
+				payload["variabilni_symbol"] = payload["cislo_dokladu"]
+			if getattr(cfg, "infer_missing_dates", False):
+				payload, inferred_warnings = domysleni_chybejicich_datumu(payload, day_first=day_first)
+				if inferred_warnings:
+					warnings.extend(inferred_warnings)
+
+			validated = InvoiceData.model_validate(payload)
+			self._cache_result(image_path, payload, warnings)
+			processed_invoice = process_invoice_data(validated)
+
+			logger.info("Extrakce obrázku OK: %s", image_path)
+			return ExtractResult(file_path=image_path, data=processed_invoice, warnings=warnings)
+		except Exception as exc:  # noqa: BLE001
+			logger.exception("Selhala extrakce obrázku pro %s", image_path)
+			return ExtractResult(file_path=image_path, data=None, error=str(exc), warnings=warnings)
 
 
 	async def batch_extract(
@@ -913,6 +978,22 @@ class InvoiceExtractor:
 				raise RuntimeError(f"Konverze PDF selhala: {exc}") from exc
 		return images
 
+	async def _image_to_images(self, image_path: str) -> List[Image.Image]:
+		"""Load and validate a supported raster image in a background thread."""
+		def _load() -> List[Image.Image]:
+			try:
+				with Image.open(image_path) as img:
+					if (img.format or "").upper() not in SUPPORTED_IMAGE_FORMATS:
+						raise ValueError("podporované jsou jen obrázky JPG/JPEG a PNG")
+					img.verify()
+				with Image.open(image_path) as img:
+					img.load()
+					return [img.convert("RGB").copy()]
+			except Exception as exc:  # noqa: BLE001
+				raise RuntimeError(f"Načtení obrázku selhalo: {exc}") from exc
+
+		return await asyncio.to_thread(_load)
+
 	def _pil_image_to_base64(self, image: Image.Image) -> str:
 		# Downscale if necessary and compress to reduce payload size
 		try:
@@ -967,6 +1048,9 @@ class InvoiceExtractor:
 	def _postprocess_payload(self, payload: Dict) -> Dict:
 		if isinstance(payload, dict) and "polozky" in payload and "položky" not in payload:
 			payload["položky"] = payload.pop("polozky")
+		document_type = str(getattr(self._config, "document_type", "invoice") or "invoice").strip().lower()
+		if document_type == "receipt":
+			payload["document_type"] = "receipt"
 		self._normalize_currency(payload)
 		self._ensure_zero_amount_defaults(payload)
 		return payload
@@ -1141,6 +1225,7 @@ class InvoiceExtractor:
 	def _build_json_schema(self) -> Dict:
 		properties = {
 			# Původní pole pro zpětnou kompatibilitu
+			"document_type": {"type": ["string", "null"], "enum": ["invoice", "receipt", None]},
 			"cislo_dokladu": {"type": ["string", "null"]},
 			"variabilni_symbol": {"type": ["string", "null"]},
 			"dodavatel_jmeno": {"type": ["string", "null"]},
@@ -1168,6 +1253,7 @@ class InvoiceExtractor:
 			# Položky jsou mimo hru – chceme vždy null, aby se schema zjednodušilo
 			"položky": {"type": ["null"]},
 			"mena": {"type": ["string", "null"]},
+			"popis": {"type": ["string", "null"]},
 		}
 		# OpenAI structured JSON vyžaduje, aby required obsahovalo všechny klíče z properties
 		required = list(properties.keys())
@@ -1289,8 +1375,11 @@ class InvoiceExtractor:
 	) -> Dict:
 		"""Call OpenAI with images and return parsed JSON dict with robust retry logic and timeout."""
 		client = self._get_client()
+		document_type = str(getattr(self._config, "document_type", "invoice") or "invoice").strip().lower()
+		is_receipt = document_type == "receipt"
+		document_name = "účtenek/paragonů" if is_receipt else "faktur"
 		system_prompt = (
-			"Jsi extraktor českých/slovenských faktur. Vždy vrať jediný validní JSON dle schématu InvoiceData a nic jiného. "
+			f"Jsi extraktor českých/slovenských {document_name}. Vždy vrať jediný validní JSON dle schématu InvoiceData a nic jiného. "
 			"Pravidla: (1) čti jen údaje jasně vytištěné na faktuře, nic nepočítej a neodvozuj; (2) částky převeď na čísla s tečkou, "
 			"bez měnových symbolů a tisícových oddělovačů; (3) datumy vrať jako YYYY-MM-DD, pokud nejdou bezpečně přečíst, dej null; "
 			"(4) pole 'položky' vždy null; (5) oprav drobné OCR záměny (0/O, I/1, čárka/tečka) jen pokud je jistota, při nejistotě vrať null; "
@@ -1300,6 +1389,14 @@ class InvoiceExtractor:
 			"Extrahuj číslo dokladu, variabilní symbol, dodavatel/odběratel (název, adresa, stát, IČ, DIČ), datumy vystavení/DUZP/splatnosti, měnu, "
 			"a částky zaklad_dane_0/12/21, vyse_dph_12/21, celkova_cena."
 		)
+		if is_receipt:
+			system_prompt += (
+				" Dokument je účtenka pro pokladní výdaj: nastav document_type na 'receipt', číslo účtenky dej do cislo_dokladu, "
+				"dodavatele čti jako prodejce na účtence, datum nákupu dej do datum_vystaveni, popis vyplň krátkým názvem nákupu nebo dodavatele. "
+				"Pokud účtenka nemá odběratele, ponech odběratelská pole null."
+			)
+		else:
+			system_prompt += " Nastav document_type na 'invoice'."
 		if strict_dates:
 			system_prompt += (
 				" DŮSLEDNĚ ověř správnost všech datumů. Pokud datum není na faktuře jasně uvedené, vrať null "

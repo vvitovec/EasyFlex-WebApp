@@ -1,18 +1,27 @@
 {% extends "base.html" %}
 
 {% block content %}
-<div class="card">
-	<h2>Nahrát tabulku s fakturami</h2>
-	<p>Podporované formáty: CSV, XLSX/XLS, XML.</p>
-	<p class="muted">Během zpracování prosím nezavírejte okno.</p>
-	<p><strong>Cena:</strong> {{ table_upload_credit_cost }} kreditů za celou tabulku. Aktuální zůstatek: {{ current_user.credits or 0 }} kreditů.</p>
+<section class="page-intro" aria-labelledby="upload-table-title">
+	<a class="back-link" href="{{ url_for('dashboard') }}">← Zpět na výběr</a>
+	<p class="eyebrow">Faktury</p>
+	<h1 id="upload-table-title">Nahrání tabulky</h1>
+	<p>Vložte soubor s připravenými fakturami. Po zpracování zkontrolujete řádky a vyberete cílový import do ABRA.</p>
+</section>
+
+<section class="upload-workspace" aria-label="Nahrání tabulky faktur">
 	{% if error %}
 		<div class="flash danger">{{ error }}</div>
 	{% endif %}
 	<form method="post" enctype="multipart/form-data" class="form show-loading" data-loading-message="Zpracovávám tabulku… prosím nezavírejte okno.">
-		<label for="table">Tabulkový soubor</label>
-		<input id="table" name="table" type="file" accept=".csv,.xlsx,.xls,.xml" required>
-		<button type="submit">Odeslat</button>
+		<div class="form-line">
+			<label for="table">Tabulkový soubor</label>
+			<input id="table" name="table" type="file" accept=".csv,.xlsx,.xls,.xml" required>
+			<p class="field-help">CSV, XLSX, XLS nebo XML. Cena: {{ table_upload_credit_cost }} kreditů za celou tabulku.</p>
+		</div>
+		<div class="submit-row">
+			<span>Zůstatek: {{ current_user.credits or 0 }} kreditů</span>
+			<button type="submit">Pokračovat na výsledky</button>
+		</div>
 	</form>
-</div>
+</section>
 {% endblock %}

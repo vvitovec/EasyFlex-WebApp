@@ -1,9 +1,14 @@
 *.db
 settings.ini
 .env
+.env*.local
 __pycache__/
 *.pyc
 .pytest_cache/
+.playwright-cli/
+output/
+docs/visual-reference/
+EasyFlex_popis_pro_seminarni_praci.txt
 .venv/
 .coverage
 .coverage.*

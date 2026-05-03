@@ -129,6 +129,7 @@ class InvoiceData(BaseModel):
 			extra = "allow"
 
 	# Původní pole pro zpětnou kompatibilitu
+	document_type: Optional[str] = None
 	cislo_dokladu: Optional[str] = None
 	variabilni_symbol: Optional[str] = None
 	dodavatel_jmeno: Optional[str] = None
@@ -158,4 +159,5 @@ class InvoiceData(BaseModel):
 	položky: Optional[List[InvoiceItem]] = None
 	souhrny_dph: Optional[List[VATSummary]] = None
 	mena: Optional[str] = None
+	popis: Optional[str] = None
 	upozorneni: Optional[str] = None

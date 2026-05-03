@@ -1,29 +1,43 @@
 {% extends "base.html" %}
 
 {% block content %}
-<div class="card">
-	<h2>Nahrát PDF faktury</h2>
-	<p>Vyberte jedno nebo více PDF s fakturami nebo rovnou celou složku. Extrakce poběží na pozadí a výsledky se budou průběžně doplňovat.</p>
-	<p class="muted">Po odeslání budete přesměrováni na stránku výsledků, kde uvidíte stav dávky v reálném čase.</p>
-	<p><strong>Cena:</strong> 1 kredit za každou fakturu z PDF. Aktuální zůstatek: {{ current_user.credits or 0 }} kreditů.</p>
+<section class="page-intro" aria-labelledby="upload-pdf-title">
+	<a class="back-link" href="{{ url_for('dashboard') }}">← Zpět na výběr</a>
+	<p class="eyebrow">{% if selected_document_type == 'receipt' %}Účtenky{% else %}Faktury{% endif %}</p>
+	<h1 id="upload-pdf-title">{% if selected_document_type == 'receipt' %}Nahrání účtenek{% else %}Nahrání faktur z PDF/foto{% endif %}</h1>
+	<p>Vyberte soubory nebo složku. EasyFlex bude pokračovat ve zvoleném typu dokladů.</p>
+</section>
+
+<section class="upload-workspace" aria-label="Nahrání PDF nebo fotografií">
 	{% if error %}
 		<div class="flash danger">{{ error }}</div>
 	{% endif %}
 	<form method="post" enctype="multipart/form-data" class="form show-loading" data-loading-message="Zakládám dávku pro zpracování na pozadí…">
-		<label for="pdfs">PDF soubory</label>
-		<input id="pdfs" name="pdfs" type="file" accept="application/pdf" multiple required>
-		<label class="checkbox-inline">
-			<input id="pick-folder" type="checkbox">
-			Nahrát celou složku s PDF
-		</label>
-		<label class="checkbox-inline">
-			<input type="checkbox" name="enable_multi_invoice_segmentation" value="1" {% if cfg.enable_multi_invoice_segmentation %}checked{% endif %}>
-			Povolit segmentaci více faktur v jednom PDF
-		</label>
-		<p class="muted">Výběr složky funguje v moderních prohlížečích (Chrome, Edge). Pokud jej zapnete, vyprázdní se případně zvolený soubor.</p>
-		<button type="submit">Odeslat</button>
+		<input type="hidden" name="document_type" value="{{ selected_document_type }}">
+		<div class="form-line">
+			<label for="pdfs">{% if selected_document_type == 'receipt' %}Účtenky{% else %}Faktury{% endif %}</label>
+			<input id="pdfs" name="pdfs" type="file" accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png" multiple required>
+			<p class="field-help">PDF, JPG nebo PNG. Cena: 1 kredit za každý vytěžený doklad.</p>
+		</div>
+		<div class="option-stack">
+			<label class="checkbox-inline">
+				<input id="pick-folder" type="checkbox">
+				Nahrát celou složku s dokumenty
+			</label>
+			{% if selected_document_type != 'receipt' %}
+				<label class="checkbox-inline">
+					<input type="checkbox" name="enable_multi_invoice_segmentation" value="1" {% if cfg.enable_multi_invoice_segmentation %}checked{% endif %}>
+					Povolit rozdělení více faktur v jednom PDF
+				</label>
+			{% endif %}
+			<p class="field-help">Výběr složky funguje v Chrome a Edge. Po přepnutí se aktuální výběr souborů vyprázdní.</p>
+		</div>
+		<div class="submit-row">
+			<span>Zůstatek: {{ current_user.credits or 0 }} kreditů</span>
+			<button type="submit">Spustit extrakci</button>
+		</div>
 	</form>
-</div>
+</section>
 <script>
 	(function() {
 		const input = document.getElementById('pdfs');
@@ -46,7 +60,7 @@
 			if (!form) return;
 			const count = input.files ? input.files.length : 0;
 			if (count > 1) {
-				form.dataset.loadingMessage = `Zakládám dávku pro ${count} PDF…`;
+				form.dataset.loadingMessage = `Zakládám dávku pro ${count} dokumentů…`;
 			} else {
 				form.dataset.loadingMessage = "Zakládám dávku pro zpracování na pozadí…";
 			}

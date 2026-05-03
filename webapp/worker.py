@@ -132,18 +132,18 @@ def _import_to_abra(payload: dict[str, Any], cfg):
 	return import_to_abra(payload, cfg=cfg)
 
 
-def _run_extraction(extractor, pdf_path: Path, *, on_result: Optional[Callable[[Any], None]] = None):
+def _run_extraction(extractor, document_path: Path, *, on_result: Optional[Callable[[Any], None]] = None):
 	try:
-		return asyncio.run(extractor.extract_auto(str(pdf_path), on_result=on_result))
+		return asyncio.run(extractor.extract_auto(str(document_path), on_result=on_result))
 	except RuntimeError:
 		loop = asyncio.new_event_loop()
 		try:
-			return loop.run_until_complete(extractor.extract_auto(str(pdf_path), on_result=on_result))
+			return loop.run_until_complete(extractor.extract_auto(str(document_path), on_result=on_result))
 		finally:
 			loop.close()
 
 
-def _extract_file_with_retry(extractor, pdf_path: Path, display_name: str, *, on_result=None, max_attempts: int = 2):
+def _extract_file_with_retry(extractor, document_path: Path, display_name: str, *, on_result=None, max_attempts: int = 2):
 	last_results: list[Any] = []
 	for attempt in range(1, max_attempts + 1):
 		attempt_results: list[Any] = []
@@ -165,9 +165,9 @@ def _extract_file_with_retry(extractor, pdf_path: Path, display_name: str, *, on
 			on_result(res)
 
 		try:
-			file_results = _run_extraction(extractor, pdf_path, on_result=_collect_result)
+			file_results = _run_extraction(extractor, document_path, on_result=_collect_result)
 		except Exception as exc:  # noqa: BLE001
-			logger.exception("Chyba při extrakci PDF %s (pokus %s/%s)", display_name, attempt, max_attempts)
+			logger.exception("Chyba při extrakci dokumentu %s (pokus %s/%s)", display_name, attempt, max_attempts)
 			from EasyFlex.extractor import ExtractResult
 
 			file_results = [ExtractResult(file_path=display_name, data=None, error=str(exc))]
@@ -183,7 +183,7 @@ def _extract_file_with_retry(extractor, pdf_path: Path, display_name: str, *, on
 				on_result(res)
 		if has_success or attempt >= max_attempts:
 			return file_results
-		logger.warning("PDF %s selhalo bez výsledku, opakuji pokus %s/%s", display_name, attempt + 1, max_attempts)
+		logger.warning("Dokument %s selhal bez výsledku, opakuji pokus %s/%s", display_name, attempt + 1, max_attempts)
 	return last_results
 
 
@@ -201,6 +201,13 @@ def _merge_warning_text(invoice_obj: Any, warnings: Optional[list[str]]) -> Opti
 
 
 def _has_minimal_invoice_data(inv: dict[str, object]) -> bool:
+	if str(inv.get("document_type") or "").strip().lower() == "receipt":
+		return bool(
+			inv.get("cislo_dokladu")
+			or inv.get("variabilni_symbol")
+			or inv.get("dodavatel_jmeno")
+			or inv.get("celkova_cena")
+		)
 	return bool(inv.get("cislo_dokladu") or inv.get("variabilni_symbol") or inv.get("odberatel_jmeno"))
 
 
@@ -239,6 +246,7 @@ def _persist_extract_result(
 	invoice_payload: dict[str, Any],
 	warning_text: Optional[str],
 	row_error: Optional[str],
+	document_type: str = "invoice",
 ) -> tuple[int, bool]:
 	job = db.session.get(BatchJob, job_id)
 	batch = db.session.get(InvoiceBatch, batch_id)
@@ -265,6 +273,8 @@ def _persist_extract_result(
 		return next_row_index, False
 
 	local_invoice = dict(invoice_payload or {})
+	if local_invoice:
+		local_invoice["document_type"] = document_type if document_type == "receipt" else local_invoice.get("document_type") or "invoice"
 	local_error = (row_error or "").strip() or None
 	credits_exhausted = False
 	marked_for_import = False
@@ -327,7 +337,7 @@ def _mark_file_processed(*, job_id: int, batch_id: int, processed_files_target: 
 	batch.last_heartbeat_at = utcnow()
 	batch.current_phase = "extracting"
 	batch.summary_message = (
-		f"Hotovo {int(batch.processed_files or 0)}/{int(batch.total_files or 0)} PDF, "
+		f"Hotovo {int(batch.processed_files or 0)}/{int(batch.total_files or 0)} dokumentů, "
 		f"uloženo {int(batch.processed_invoices or 0)} faktur."
 	)
 	job.resume_cursor = {
@@ -369,7 +379,7 @@ def _finalize_extract_job(
 		status = JOB_STATUS_COMPLETED
 
 	summary = (
-		f"PDF dávka: {int(batch.processed_files or 0)}/{int(batch.total_files or 0)} PDF, "
+		f"Dávka dokumentů: {int(batch.processed_files or 0)}/{int(batch.total_files or 0)} dokumentů, "
 		f"{int(batch.success_count or 0)} úspěšných faktur, {int(batch.error_count or 0)} chyb."
 	)
 	if stop_reason == "timeout":
@@ -481,11 +491,15 @@ def _process_extract_job(job_id: int, worker_id: str) -> None:
 		lambda: _set_batch_extract_running(db.session.get(InvoiceBatch, batch_id)),
 	)
 	cfg = get_user_config_for_user_id(user_id)
-	extractor = _build_extractor(cfg)
 	payload = dict(initial_payload or load_batch_payload(batch_id))
+	document_type = str(payload.get("document_type") or "invoice").strip().lower()
+	if document_type not in {"invoice", "receipt"}:
+		document_type = "invoice"
+	setattr(cfg, "document_type", document_type)
+	extractor = _build_extractor(cfg)
 	files = list(payload.get("files") or [])
 	if not files:
-		finalize_job(job_id=job_id, status=JOB_STATUS_FAILED, summary_message="Chybí seznam PDF souborů.", last_error="Missing files payload")
+		finalize_job(job_id=job_id, status=JOB_STATUS_FAILED, summary_message="Chybí seznam dokumentů.", last_error="Missing files payload")
 		db.session.commit()
 		return
 	cursor = dict(initial_resume_cursor)
@@ -514,8 +528,8 @@ def _process_extract_job(job_id: int, worker_id: str) -> None:
 		file_meta = files[file_index]
 		display_name = str(file_meta.get("display_name") or f"upload-{file_index + 1}.pdf")
 		rel_path = str(file_meta.get("relative_path") or "")
-		pdf_path = batch_storage_root(batch_id) / rel_path
-		if not pdf_path.exists():
+		document_path = batch_storage_root(batch_id) / rel_path
+		if not document_path.exists():
 			stop_reason = "failed"
 			last_error = f"Chybí soubor {display_name}."
 			break
@@ -559,6 +573,7 @@ def _process_extract_job(job_id: int, worker_id: str) -> None:
 					invoice_payload=invoice_payload,
 					warning_text=warning_text,
 					row_error=row_error,
+					document_type=document_type,
 				)
 			next_row_index_local, credits_exhausted = run_db_write_with_retry(
 				f"job {job_id} persist file {file_index} invoice {group_index}",
@@ -568,7 +583,7 @@ def _process_extract_job(job_id: int, worker_id: str) -> None:
 			if credits_exhausted:
 				stop_reason = "credits"
 
-		file_results = _extract_file_with_retry(extractor, pdf_path, display_name, on_result=_persist_stream_result, max_attempts=2)
+		file_results = _extract_file_with_retry(extractor, document_path, display_name, on_result=_persist_stream_result, max_attempts=2)
 		if not file_results:
 			from EasyFlex.extractor import ExtractResult
 
@@ -630,6 +645,9 @@ def _process_import_job(job_id: int, worker_id: str) -> None:
 	)
 	cfg = get_user_config_for_user_id(user_id)
 	apply_context_to_config(cfg, payload.get("company_code"), payload.get("direction"), payload.get("doc_type_code"))
+	document_type = str(payload.get("document_type") or "").strip().lower()
+	if document_type == "receipt":
+		setattr(cfg, "document_type", "receipt")
 	row_ids = [
 		int(row_id)
 		for (row_id,) in (
@@ -680,6 +698,7 @@ def _process_import_job(job_id: int, worker_id: str) -> None:
 				payload_dict = payload_obj.model_dump()
 			except Exception:
 				payload_dict = inv_dict
+			payload_dict["easyflex_row_id"] = row_id
 			resp = _import_to_abra(payload_dict, cfg)
 			import_status, error_text, status_text = _resolve_import_outcome(resp)
 		except Exception as exc:  # noqa: BLE001

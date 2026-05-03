@@ -16,6 +16,7 @@ from .constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 
 DISPLAY_COLUMNS: List[str] = [
 	"soubor",
+	"document_type",
 	"cislo_dokladu",
 	"variabilni_symbol",
 	"dodavatel_jmeno",
@@ -45,6 +46,7 @@ DISPLAY_COLUMNS: List[str] = [
 
 COLUMN_LABELS: Dict[str, str] = {
 	"soubor": "Soubor",
+	"document_type": "Typ",
 	"cislo_dokladu": "Číslo dokladu",
 	"variabilni_symbol": "Variabilní symbol",
 	"dodavatel_jmeno": "Dodavatel – název",
