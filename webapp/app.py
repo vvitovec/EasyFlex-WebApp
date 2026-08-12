@@ -37,6 +37,7 @@ from EasyFlex.models import InvoiceData
 from .models import init_db, db, User, UserSettings, InvoiceBatch, InvoiceRow, BatchJob
 from .auth import init_auth
 from .config_utils import EXTRACTOR_OVERRIDE_KEYS, get_user_config, get_user_config_for_user, get_user_config_for_user_id
+from .company_work import CompanyWorkAbraClient, CompanyWorkError
 from .invoice_batches import (
 	DISPLAY_COLUMNS,
 	COLUMN_LABELS,
@@ -630,12 +631,33 @@ def _batch_file_unit_label(batch: InvoiceBatch) -> str:
 	return "soubor"
 
 
+def _batch_file_sprite_kind(batch: InvoiceBatch) -> str:
+	source_type = (batch.source_type or "").strip().lower()
+	suffix = Path((batch.source_label or "").strip()).suffix.lower()
+	if source_type == "receipt":
+		return "receipt"
+	if suffix == ".pdf" or source_type == "pdf":
+		return "pdf"
+	if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+		return "image"
+	if suffix == ".csv":
+		return "csv"
+	if suffix in {".xlsx", ".xls"}:
+		return "xls"
+	if suffix == ".xml":
+		return "xml"
+	if source_type == "table":
+		return "spreadsheet"
+	return "document"
+
+
 def _serialize_batch_summary(batch: InvoiceBatch) -> dict[str, Any]:
 	progress = _batch_progress_payload(batch)
 	return {
 		"id": batch.id,
 		"source_label": batch.source_label or f"Dávka {batch.id}",
 		"file_unit_label": _batch_file_unit_label(batch),
+		"file_sprite_kind": _batch_file_sprite_kind(batch),
 		"created_at": batch.created_at.isoformat() if batch.created_at else None,
 		"status": progress["status"],
 		"status_label": progress["status_label"],
@@ -1562,6 +1584,105 @@ def create_app() -> Flask:
 			recent_batches_preview_limit=3,
 			problem_jobs_preview_limit=3,
 		)
+
+	@app.route("/company-work")
+	@login_required
+	def company_work():
+		return render_template("company_work.html")
+
+	def _company_work_client() -> CompanyWorkAbraClient:
+		return CompanyWorkAbraClient(get_user_config())
+
+	def _company_work_error_response(exc: Exception, *, status_code: int = 400):
+		logger.warning("Práce s firmami: %s", exc)
+		return jsonify({"ok": False, "error": str(exc)}), status_code
+
+	@app.get("/company-work/api/companies")
+	@login_required
+	def company_work_companies():
+		try:
+			client = _company_work_client()
+			companies = client.list_companies()
+			for company in companies:
+				store_company(current_user, company["code"], company["name"])
+			return jsonify({"ok": True, "companies": companies})
+		except CompanyWorkError as exc:
+			return _company_work_error_response(exc)
+		except Exception as exc:  # noqa: BLE001
+			logger.exception("Nepodařilo se načíst firmy z ABRA.")
+			return _company_work_error_response(RuntimeError("Nepodařilo se načíst firmy z ABRA."), status_code=500)
+
+	@app.get("/company-work/api/employees")
+	@login_required
+	def company_work_employees():
+		company_code = (request.args.get("company_code") or "").strip()
+		if not company_code:
+			return jsonify({"ok": False, "error": "Vyberte firmu."}), 400
+		try:
+			client = _company_work_client()
+			employees = client.list_employees(company_code)
+			return jsonify({"ok": True, "employees": employees})
+		except CompanyWorkError as exc:
+			return _company_work_error_response(exc)
+		except Exception as exc:  # noqa: BLE001
+			logger.exception("Nepodařilo se načíst zaměstnance z ABRA.")
+			return _company_work_error_response(RuntimeError("Nepodařilo se načíst zaměstnance z ABRA."), status_code=500)
+
+	@app.get("/company-work/api/employments")
+	@login_required
+	def company_work_employments():
+		company_code = (request.args.get("company_code") or "").strip()
+		employee_ref = (request.args.get("employee_ref") or "").strip()
+		if not company_code or not employee_ref:
+			return jsonify({"ok": False, "error": "Vyberte firmu a zaměstnance."}), 400
+		try:
+			client = _company_work_client()
+			employments = client.list_employments(company_code, employee_ref)
+			return jsonify({"ok": True, "employments": employments})
+		except CompanyWorkError as exc:
+			return _company_work_error_response(exc)
+		except Exception as exc:  # noqa: BLE001
+			logger.exception("Nepodařilo se načíst pracovní poměry z ABRA.")
+			return _company_work_error_response(RuntimeError("Nepodařilo se načíst pracovní poměry z ABRA."), status_code=500)
+
+	@app.post("/company-work/api/employments/preview-duplicate")
+	@login_required
+	def company_work_preview_duplicate():
+		payload = request.get_json(silent=True) or {}
+		company_code = str(payload.get("company_code") or "").strip()
+		employment_ref = str(payload.get("employment_ref") or "").strip()
+		if not company_code or not employment_ref:
+			return jsonify({"ok": False, "error": "Vyberte pracovní poměr."}), 400
+		try:
+			client = _company_work_client()
+			preview = client.preview_duplicate(company_code, employment_ref, payload.get("overrides") or {})
+			return jsonify({"ok": True, **preview})
+		except CompanyWorkError as exc:
+			return _company_work_error_response(exc)
+		except Exception as exc:  # noqa: BLE001
+			logger.exception("Nepodařilo se připravit duplikaci pracovního poměru.")
+			return _company_work_error_response(RuntimeError("Nepodařilo se připravit duplikaci pracovního poměru."), status_code=500)
+
+	@app.post("/company-work/api/employments/duplicate")
+	@login_required
+	def company_work_duplicate():
+		payload = request.get_json(silent=True) or {}
+		company_code = str(payload.get("company_code") or "").strip()
+		employment_ref = str(payload.get("employment_ref") or "").strip()
+		confirmed = bool(payload.get("confirmed"))
+		if not company_code or not employment_ref:
+			return jsonify({"ok": False, "error": "Vyberte pracovní poměr."}), 400
+		if not confirmed:
+			return jsonify({"ok": False, "error": "Duplikaci je potřeba nejdřív potvrdit."}), 400
+		try:
+			client = _company_work_client()
+			result = client.duplicate_employment(company_code, employment_ref, payload.get("overrides") or {})
+			return jsonify({"ok": True, **result})
+		except CompanyWorkError as exc:
+			return _company_work_error_response(exc)
+		except Exception as exc:  # noqa: BLE001
+			logger.exception("Nepodařilo se duplikovat pracovní poměr v ABRA.")
+			return _company_work_error_response(RuntimeError("Nepodařilo se duplikovat pracovní poměr v ABRA."), status_code=500)
 
 	@app.post("/jobs/<int:job_id>/dismiss")
 	@login_required

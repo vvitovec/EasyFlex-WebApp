@@ -667,6 +667,7 @@ a.choice-option {
 	min-width: 0;
 }
 
+.file-thumb,
 .pdf-thumb {
 	display: inline-flex;
 	width: 44px;
@@ -674,6 +675,7 @@ a.choice-option {
 	flex: 0 0 auto;
 }
 
+.file-thumb svg,
 .pdf-thumb svg {
 	width: 100%;
 	height: 100%;
@@ -700,6 +702,137 @@ a.choice-option {
 .attention-strip {
 	border-top: 1px solid var(--line);
 	padding-top: 26px;
+}
+
+.company-work-page {
+	width: min(100%, 980px);
+	margin: 0 auto;
+}
+
+.compact-hero {
+	display: block;
+}
+
+.compact-hero h1 {
+	font-size: clamp(38px, 5vw, 54px);
+}
+
+.company-work-shell {
+	margin-top: 28px;
+	display: grid;
+	gap: 28px;
+}
+
+.company-work-toolbar {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 22px;
+	align-items: end;
+}
+
+.field-block {
+	display: grid;
+	gap: 9px;
+	min-width: 0;
+}
+
+.inline-control {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	gap: 10px;
+	align-items: center;
+}
+
+.inline-control button {
+	white-space: nowrap;
+}
+
+.company-work-status {
+	min-height: 24px;
+	color: var(--muted);
+	font-weight: 700;
+}
+
+.company-work-status[data-tone="success"] {
+	color: var(--success);
+}
+
+.company-work-status[data-tone="danger"] {
+	color: var(--danger);
+}
+
+.company-work-status[data-tone="info"] {
+	color: var(--accent);
+}
+
+.employment-area,
+.duplicate-review {
+	border-top: 1px solid var(--line);
+	padding-top: 24px;
+}
+
+.employment-list {
+	display: grid;
+	gap: 14px;
+}
+
+.employment-row {
+	display: grid;
+	grid-template-columns: minmax(180px, .9fr) minmax(0, 1.8fr) auto;
+	gap: 18px;
+	align-items: end;
+	padding: 16px 0;
+	border-bottom: 1px solid var(--line);
+}
+
+.employment-main {
+	min-width: 0;
+}
+
+.employment-main strong,
+.employment-main small {
+	display: block;
+}
+
+.employment-main small {
+	margin-top: 4px;
+	color: var(--muted);
+	font-size: 14px;
+}
+
+.employment-fields {
+	display: grid;
+	grid-template-columns: repeat(4, minmax(96px, 1fr));
+	gap: 10px;
+	align-items: end;
+}
+
+.employment-fields label {
+	display: grid;
+	gap: 6px;
+	font-size: 13px;
+}
+
+.employment-fields .wide-field {
+	grid-column: 1 / -1;
+}
+
+.employment-actions {
+	display: flex;
+	justify-content: flex-end;
+}
+
+.duplicate-review pre {
+	max-height: 420px;
+	overflow: auto;
+	margin: 0;
+	padding: 16px;
+	border: 1px solid var(--line);
+	border-radius: var(--radius);
+	background: #1f2529;
+	color: #f6f3eb;
+	font-size: 13px;
+	line-height: 1.45;
 }
 
 .form {
@@ -1653,8 +1786,24 @@ input[type="radio"] {
 	.import-destination,
 	.results-toolbar,
 	.progress-pair,
-	.destination-fields {
+	.destination-fields,
+	.company-work-toolbar,
+	.employment-row {
 		grid-template-columns: 1fr;
+	}
+
+	.inline-control {
+		grid-template-columns: 1fr;
+	}
+
+	.inline-control button,
+	.employment-actions,
+	.employment-actions button {
+		width: 100%;
+	}
+
+	.employment-fields {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
 	}
 
 	.destination-actions {
@@ -1795,7 +1944,8 @@ input[type="radio"] {
 
 	.settings-grid.two,
 	.settings-inline-form,
-	.settings-inline-form.doc-type-form {
+	.settings-inline-form.doc-type-form,
+	.employment-fields {
 		grid-template-columns: 1fr;
 	}
 

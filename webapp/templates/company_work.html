@@ -1,0 +1,305 @@
+{% extends "base.html" %}
+
+{% block content %}
+{% import "_icons.html" as icons %}
+<div class="company-work-page" data-company-work-root>
+	<section class="workspace-hero compact-hero" aria-labelledby="company-work-title">
+		<p class="eyebrow">ABRA personalistika</p>
+		<h1 id="company-work-title">Práce s firmami</h1>
+	</section>
+
+	<section class="company-work-shell" aria-label="Duplikace pracovních poměrů">
+		<div class="company-work-toolbar">
+			<div class="field-block">
+				<label for="company-select">Firma</label>
+				<div class="inline-control">
+					<select id="company-select" data-company-select disabled>
+						<option value="">Nejdřív načtěte firmy</option>
+					</select>
+					<button type="button" data-load-companies>
+						<span class="nav-icon">{{ icons.users() }}</span>
+						<span>Načíst firmy</span>
+					</button>
+				</div>
+			</div>
+			<div class="field-block">
+				<label for="employee-select">Zaměstnanec</label>
+				<div class="inline-control">
+					<select id="employee-select" data-employee-select disabled>
+						<option value="">Vyberte firmu</option>
+					</select>
+					<button type="button" class="secondary" data-load-employees disabled>Načíst zaměstnance</button>
+				</div>
+			</div>
+		</div>
+
+		<div class="company-work-status" data-status role="status" aria-live="polite"></div>
+
+		<div class="employment-area" data-employment-area hidden>
+			<div class="section-heading">
+				<div>
+					<p class="eyebrow">Pracovní poměry</p>
+					<h2 data-employment-heading>Vybraný zaměstnanec</h2>
+				</div>
+				<button type="button" class="secondary" data-load-employments disabled>Načíst pracovní poměry</button>
+			</div>
+			<div class="employment-list" data-employment-list></div>
+		</div>
+
+		<div class="duplicate-review" data-duplicate-review hidden>
+			<div class="section-heading">
+				<div>
+					<p class="eyebrow">Kontrola před zápisem</p>
+					<h2>Připravená kopie</h2>
+				</div>
+				<button type="button" data-confirm-duplicate>Zapsat kopii do ABRA</button>
+			</div>
+			<pre data-preview-payload></pre>
+		</div>
+	</section>
+</div>
+
+<template id="employment-row-template">
+	<form class="employment-row" data-employment-form>
+		<div class="employment-main">
+			<strong data-employment-name></strong>
+			<small data-employment-meta></small>
+		</div>
+		<div class="employment-fields">
+			<label>
+				<span>Nový kód</span>
+				<input name="kod" type="text" autocomplete="off" placeholder="Volitelné">
+			</label>
+			<label>
+				<span>Název</span>
+				<input name="nazev" type="text" autocomplete="off" placeholder="Volitelné">
+			</label>
+			<label>
+				<span>Od</span>
+				<input name="datumOd" type="date">
+			</label>
+			<label>
+				<span>Do</span>
+				<input name="datumDo" type="date">
+			</label>
+			<label class="wide-field">
+				<span>Poznámka</span>
+				<input name="poznam" type="text" autocomplete="off" placeholder="Volitelné">
+			</label>
+		</div>
+		<div class="employment-actions">
+			<button type="button" class="secondary" data-preview-button>Připravit kopii</button>
+		</div>
+	</form>
+</template>
+
+<script>
+	(function() {
+		const root = document.querySelector('[data-company-work-root]');
+		if (!root) return;
+
+		const companySelect = root.querySelector('[data-company-select]');
+		const employeeSelect = root.querySelector('[data-employee-select]');
+		const loadCompaniesButton = root.querySelector('[data-load-companies]');
+		const loadEmployeesButton = root.querySelector('[data-load-employees]');
+		const loadEmploymentsButton = root.querySelector('[data-load-employments]');
+		const employmentArea = root.querySelector('[data-employment-area]');
+		const employmentList = root.querySelector('[data-employment-list]');
+		const employmentHeading = root.querySelector('[data-employment-heading]');
+		const statusEl = root.querySelector('[data-status]');
+		const review = root.querySelector('[data-duplicate-review]');
+		const previewPayload = root.querySelector('[data-preview-payload]');
+		const confirmButton = root.querySelector('[data-confirm-duplicate]');
+		const template = document.getElementById('employment-row-template');
+		let pendingDuplicate = null;
+
+		function setStatus(message, tone) {
+			statusEl.textContent = message || '';
+			statusEl.dataset.tone = tone || '';
+		}
+
+		function setBusy(button, busy) {
+			if (!button) return;
+			button.disabled = busy;
+			button.dataset.busy = busy ? 'true' : 'false';
+		}
+
+		async function apiGet(url) {
+			const response = await fetch(url, { headers: { 'Accept': 'application/json' } });
+			const payload = await response.json().catch(() => ({}));
+			if (!response.ok || payload.ok === false) throw new Error(payload.error || 'Požadavek selhal.');
+			return payload;
+		}
+
+		async function apiPost(url, body) {
+			const response = await fetch(url, {
+				method: 'POST',
+				headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+				body: JSON.stringify(body),
+			});
+			const payload = await response.json().catch(() => ({}));
+			if (!response.ok || payload.ok === false) throw new Error(payload.error || 'Požadavek selhal.');
+			return payload;
+		}
+
+		function fillSelect(select, rows, placeholder) {
+			select.innerHTML = '';
+			const first = document.createElement('option');
+			first.value = '';
+			first.textContent = placeholder;
+			select.appendChild(first);
+			rows.forEach((row) => {
+				const option = document.createElement('option');
+				option.value = row.ref || row.code || row.id;
+				option.dataset.code = row.code || '';
+				option.dataset.name = row.name || row.label || '';
+				option.textContent = row.label || `${row.name} (${row.code})`;
+				select.appendChild(option);
+			});
+			select.disabled = rows.length === 0;
+		}
+
+		function overridesFromForm(form) {
+			const data = new FormData(form);
+			return {
+				kod: data.get('kod') || '',
+				nazev: data.get('nazev') || '',
+				datumOd: data.get('datumOd') || '',
+				datumDo: data.get('datumDo') || '',
+				poznam: data.get('poznam') || '',
+			};
+		}
+
+		function renderEmployments(rows) {
+			employmentList.innerHTML = '';
+			review.hidden = true;
+			pendingDuplicate = null;
+			if (!rows.length) {
+				const empty = document.createElement('p');
+				empty.className = 'empty-state';
+				empty.textContent = 'ABRA pro vybraného zaměstnance nevrátila žádný pracovní poměr.';
+				employmentList.appendChild(empty);
+				return;
+			}
+			rows.forEach((row) => {
+				const node = template.content.firstElementChild.cloneNode(true);
+				node.dataset.employmentRef = row.ref;
+				node.querySelector('[data-employment-name]').textContent = row.name || row.code || row.id;
+				const dates = [row.date_from || 'bez začátku', row.date_to || 'bez konce'].join(' → ');
+				node.querySelector('[data-employment-meta]').textContent = `${row.code || row.id} · ${dates}`;
+				node.querySelector('[data-preview-button]').addEventListener('click', async () => {
+					const companyCode = companySelect.value;
+					const employmentRef = node.dataset.employmentRef;
+					setStatus('Připravuji kopii pracovního poměru...', 'info');
+					try {
+						const payload = await apiPost('/company-work/api/employments/preview-duplicate', {
+							company_code: companyCode,
+							employment_ref: employmentRef,
+							overrides: overridesFromForm(node),
+						});
+						pendingDuplicate = {
+							company_code: companyCode,
+							employment_ref: employmentRef,
+							overrides: overridesFromForm(node),
+						};
+						previewPayload.textContent = JSON.stringify(payload.payload, null, 2);
+						review.hidden = false;
+						setStatus(`Kopie je připravená. Počet přenášených polí: ${payload.field_count}.`, 'success');
+					} catch (err) {
+						setStatus(err.message, 'danger');
+					}
+				});
+				employmentList.appendChild(node);
+			});
+		}
+
+		loadCompaniesButton.addEventListener('click', async () => {
+			setBusy(loadCompaniesButton, true);
+			setStatus('Načítám firmy z ABRA...', 'info');
+			try {
+				const payload = await apiGet('/company-work/api/companies');
+				fillSelect(companySelect, payload.companies || [], 'Vyberte firmu');
+				loadEmployeesButton.disabled = true;
+				setStatus(`Načteno firem: ${(payload.companies || []).length}.`, 'success');
+			} catch (err) {
+				setStatus(err.message, 'danger');
+			} finally {
+				setBusy(loadCompaniesButton, false);
+			}
+		});
+
+		companySelect.addEventListener('change', () => {
+			loadEmployeesButton.disabled = !companySelect.value;
+			fillSelect(employeeSelect, [], 'Nejdřív načtěte zaměstnance');
+			loadEmploymentsButton.disabled = true;
+			employmentArea.hidden = true;
+			review.hidden = true;
+		});
+
+		loadEmployeesButton.addEventListener('click', async () => {
+			if (!companySelect.value) return;
+			setBusy(loadEmployeesButton, true);
+			setStatus('Načítám zaměstnance z ABRA...', 'info');
+			try {
+				const params = new URLSearchParams({ company_code: companySelect.value });
+				const payload = await apiGet(`/company-work/api/employees?${params}`);
+				fillSelect(employeeSelect, payload.employees || [], 'Vyberte zaměstnance');
+				loadEmploymentsButton.disabled = true;
+				employmentArea.hidden = false;
+				employmentList.innerHTML = '';
+				setStatus(`Načteno zaměstnanců: ${(payload.employees || []).length}.`, 'success');
+			} catch (err) {
+				setStatus(err.message, 'danger');
+			} finally {
+				setBusy(loadEmployeesButton, false);
+			}
+		});
+
+		employeeSelect.addEventListener('change', () => {
+			const selected = employeeSelect.selectedOptions[0];
+			employmentHeading.textContent = selected?.dataset.name || 'Vybraný zaměstnanec';
+			loadEmploymentsButton.disabled = !employeeSelect.value;
+			review.hidden = true;
+		});
+
+		loadEmploymentsButton.addEventListener('click', async () => {
+			if (!companySelect.value || !employeeSelect.value) return;
+			setBusy(loadEmploymentsButton, true);
+			setStatus('Načítám pracovní poměry z ABRA...', 'info');
+			try {
+				const params = new URLSearchParams({
+					company_code: companySelect.value,
+					employee_ref: employeeSelect.value,
+				});
+				const payload = await apiGet(`/company-work/api/employments?${params}`);
+				renderEmployments(payload.employments || []);
+				setStatus(`Načteno pracovních poměrů: ${(payload.employments || []).length}.`, 'success');
+			} catch (err) {
+				setStatus(err.message, 'danger');
+			} finally {
+				setBusy(loadEmploymentsButton, false);
+			}
+		});
+
+		confirmButton.addEventListener('click', async () => {
+			if (!pendingDuplicate) return;
+			if (!window.confirm('Zapsat připravenou kopii pracovního poměru do ABRA?')) return;
+			setBusy(confirmButton, true);
+			setStatus('Zapisuji kopii pracovního poměru do ABRA...', 'info');
+			try {
+				const payload = await apiPost('/company-work/api/employments/duplicate', {
+					...pendingDuplicate,
+					confirmed: true,
+				});
+				setStatus(`Pracovní poměr byl odeslán do ABRA${payload.created?.id ? ` (${payload.created.id})` : ''}.`, 'success');
+				review.hidden = true;
+				pendingDuplicate = null;
+			} catch (err) {
+				setStatus(err.message, 'danger');
+			} finally {
+				setBusy(confirmButton, false);
+			}
+		});
+	})();
+</script>
+{% endblock %}

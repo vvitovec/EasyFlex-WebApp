@@ -84,6 +84,8 @@ services:
     image: caddy:2-alpine
     container_name: easyflex-caddy
     restart: unless-stopped
+    profiles:
+      - caddy
     depends_on:
       - web
     env_file:

@@ -31,6 +31,10 @@
 					<span class="nav-icon">{{ icons.receipt() }}</span>
 					<span>Účtenky</span>
 				</a>
+				<a class="nav-item{% if request.endpoint and request.endpoint.startswith('company_work') %} is-active{% endif %}" href="{{ url_for('company_work') }}">
+					<span class="nav-icon">{{ icons.users() }}</span>
+					<span>Práce s firmami</span>
+				</a>
 			</div>
 		{% endif %}
 		{% if current_user.is_authenticated %}
