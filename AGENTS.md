@@ -29,3 +29,12 @@ curl -fsS https://easyflex.vvitovec.com/readyz
 ```
 
 Run tests in the application image with `PYTHONPATH=/app pytest -q`.
+
+## September 2026 maintenance
+
+- PostgreSQL is pinned to `17.11-alpine`; web dependencies are constrained by `webapp/requirements.lock`. Refresh the lock deliberately after testing dependency updates.
+- `invoice_row.source` uses TEXT. Startup widens legacy PostgreSQL VARCHAR under the existing migration lock, retaining source labels and invoice data.
+- PostgreSQL upload regression: set `EASYFLEX_TEST_POSTGRES_URL` to an isolated database named `easyflex_regression`, then run `PYTHONPATH=/app pytest tests/test_upload_postgres.py -q`. Never point it at production. Ordinary test runs skip these two tests when the URL is absent.
+- User systemd `easyflex-backup.timer` runs nightly at 03:15 plus up to ten minutes. Linger is enabled for `viktoor`. Units are in `~/.config/systemd/user/`; source copies are in `scripts/selfhost/systemd/`.
+- Backups: `/srv/projects/easyflex-webapp/backups/easyflex_snapshot_<UTC timestamp>/`, retention 14 days, permissions 700/600. Includes DB, instance files, environment configuration, revision, and checksums. Backups are local to Baller, not offsite; avoid concurrent imports when taking a coordinated pre-deploy snapshot.
+- Check backup runs with `systemctl --user status easyflex-backup.service` and `journalctl --user -u easyflex-backup.service`. Restore-check only in an isolated PostgreSQL database with no worker attached.

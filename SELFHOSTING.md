@@ -248,40 +248,37 @@ Záloha se uloží do:
 ~/EasyFlex-WebApp/backups/
 ```
 
-Záloha se teď komprimuje do `.sql.gz` a staré backupy se automaticky mažou podle `BACKUP_RETENTION_DAYS`.
+Každý dokončený snapshot je adresář `easyflex_snapshot_<UTC čas>` obsahující:
+- `database.dump` (PostgreSQL custom dump),
+- `instance.tar.gz` (nahrané soubory),
+- `environment.env` (tajná konfigurace),
+- `revision.txt` a `SHA256SUMS`.
 
-Pro automatickou noční zálohu si můžete přidat cron:
+Adresáře mají oprávnění 700 a soubory 600. Snapshoty obsahují citlivá data;
+neukládejte je do Gitu ani veřejného úložiště. Skript brání souběhu pomocí
+`flock` a zveřejní snapshot až po ověření všech částí. Uchovává 14 dní
+(`BACKUP_RETENTION_DAYS`). Starší samostatné SQL zálohy nemění.
 
-```bash
-crontab -e
-```
-
-A vložit například:
-
-```bash
-15 3 * * * cd ~/EasyFlex-WebApp && bash scripts/selfhost/backup_postgres.sh >> ~/easyflex-backup.log 2>&1
-```
-
-Alternativně jsou v repu připravené systemd šablony:
-
-```text
-scripts/selfhost/systemd/easyflex-backup.service
-scripts/selfhost/systemd/easyflex-backup.timer
-```
-
-Na serveru je můžete zkopírovat do:
-
-```text
-/etc/systemd/system/
-```
-
-A potom aktivovat:
+Na Balleru je projekt v `/srv/projects/easyflex-webapp`. Uživatelský systemd
+timer spouští zálohu denně v 03:15 se zpožděním do 10 minut a dožene
+vynechaný běh. Při instalaci na jinou cestu upravte cesty v service souboru.
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now easyflex-backup.timer
-sudo systemctl list-timers easyflex-backup.timer
+mkdir -p ~/.config/systemd/user
+cp scripts/selfhost/systemd/easyflex-backup.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now easyflex-backup.timer
+systemctl --user start easyflex-backup.service
+systemctl --user list-timers easyflex-backup.timer
+journalctl --user -u easyflex-backup.service
 ```
+
+Pro běh bez přihlášení musí být zapnutý linger (`loginctl enable-linger`).
+Tyto zálohy jsou na stejném disku jako aplikace; nechrání před ztrátou serveru.
+Databáze má konzistentní snapshot. Soubory se zálohují za běhu, takže pro
+časově sladěnou obnovovací kopii před migrací zastavte worker a blokujte nové
+uploady. Obnovu ověřujte v izolované databázi přes `pg_restore --no-owner
+--no-privileges`; nikdy neověřujte obnovu přepsáním produkce.
 
 ## 12b. Co se teď udržuje automaticky
 

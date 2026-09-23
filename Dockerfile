@@ -10,9 +10,9 @@ RUN apt-get update \
 	&& apt-get install -y --no-install-recommends poppler-utils \
 	&& rm -rf /var/lib/apt/lists/*
 
-COPY webapp/requirements.txt /tmp/requirements.txt
+COPY webapp/requirements.txt webapp/requirements.lock /tmp/
 RUN pip install --upgrade pip \
-	&& pip install -r /tmp/requirements.txt
+	&& pip install -r /tmp/requirements.txt -c /tmp/requirements.lock
 
 COPY . .
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=Nightly EasyFlex PostgreSQL backup
+Description=Nightly EasyFlex backup
 
 [Timer]
 OnCalendar=*-*-* 03:15:00

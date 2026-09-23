@@ -1,10 +1,10 @@
 [Unit]
-Description=EasyFlex PostgreSQL backup
-Wants=docker.service
-After=docker.service
+Description=EasyFlex database, uploads and configuration backup
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/EasyFlex-WebApp
-ExecStart=/usr/bin/env bash %h/EasyFlex-WebApp/scripts/selfhost/backup_postgres.sh
-
+WorkingDirectory=/srv/projects/easyflex-webapp
+ExecStart=/usr/bin/env bash /srv/projects/easyflex-webapp/scripts/selfhost/backup_postgres.sh
+UMask=0077
+Nice=10
+TimeoutStartSec=15min

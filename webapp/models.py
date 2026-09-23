@@ -348,7 +348,9 @@ class InvoiceRow(db.Model):
 	row_index = db.Column(db.Integer, nullable=False)
 	source_file_index = db.Column(db.Integer, nullable=True)
 	source_invoice_index = db.Column(db.Integer, nullable=True)
-	source = db.Column(db.String(255), nullable=True)
+	# Table sources append a row number to a valid (up to 255-byte) filename.
+	# Keep the full label instead of rejecting the entire upload at commit time.
+	source = db.Column(db.Text, nullable=True)
 	invoice_data = db.Column(db.JSON, nullable=True)
 	warning = db.Column(db.Text, nullable=True)
 	error = db.Column(db.Text, nullable=True)
@@ -464,6 +466,10 @@ def init_db(app) -> None:
 			if "active_job_type" not in batch_columns:
 				_execute_migration_sql(engine, "ALTER TABLE invoice_batch ADD COLUMN active_job_type VARCHAR(64)")
 			row_columns = {col["name"] for col in insp.get_columns("invoice_row")}
+			if engine.dialect.name == "postgresql":
+				source_column = next(col for col in insp.get_columns("invoice_row") if col["name"] == "source")
+				if getattr(source_column["type"], "length", None) is not None:
+					_execute_migration_sql(engine, "ALTER TABLE invoice_row ALTER COLUMN source TYPE TEXT")
 			if "source_file_index" not in row_columns:
 				_execute_migration_sql(engine, "ALTER TABLE invoice_row ADD COLUMN source_file_index INTEGER")
 			if "source_invoice_index" not in row_columns:

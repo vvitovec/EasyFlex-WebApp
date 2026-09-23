@@ -1,54 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
-
-if [[ ! -f "$ROOT_DIR/.env" ]]; then
-	echo "Chybí $ROOT_DIR/.env"
-	exit 1
-fi
-
-if ! command -v docker >/dev/null 2>&1; then
-	echo "Chybí docker v PATH."
-	exit 1
-fi
-
-set -a
-source "$ROOT_DIR/.env"
-set +a
-
-if [[ -z "${POSTGRES_USER:-}" || -z "${POSTGRES_DB:-}" ]]; then
-	echo "V .env chybí POSTGRES_USER nebo POSTGRES_DB."
-	exit 1
-fi
-
-mkdir -p "$ROOT_DIR/backups"
-RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
-TIMESTAMP="$(date +%F_%H-%M-%S)"
-BACKUP_FILE="$ROOT_DIR/backups/easyflex_${TIMESTAMP}.sql.gz"
-TMP_FILE="$(mktemp "$ROOT_DIR/backups/easyflex_${TIMESTAMP}.XXXXXX.sql")"
-cleanup_tmp() {
-	rm -f "$TMP_FILE" "${TMP_FILE}.gz"
-}
-trap cleanup_tmp EXIT
-
 cd "$ROOT_DIR"
-if [[ -z "$(docker compose ps -q db)" ]]; then
-	echo "Služba db neběží. Spusťte nejdřív docker compose up -d."
-	exit 1
-fi
+mkdir -p backups
+chmod 700 backups
+exec 9>backups/.backup.lock
+flock -n 9 || { echo "EasyFlex backup is already running."; exit 0; }
 
-docker compose exec -T db pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" > "$TMP_FILE"
-gzip -f "$TMP_FILE"
-gzip -t "${TMP_FILE}.gz"
-mv "${TMP_FILE}.gz" "$BACKUP_FILE"
+[[ -f .env ]] || { echo "Missing EasyFlex .env"; exit 1; }
+set -a
+source .env
+set +a
+: "${POSTGRES_USER:?POSTGRES_USER is required}"
+: "${POSTGRES_DB:?POSTGRES_DB is required}"
+RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
+[[ "$RETENTION_DAYS" =~ ^[0-9]+$ && "$RETENTION_DAYS" -ge 1 ]] || { echo "Invalid retention"; exit 1; }
 
-if [[ ! -s "$BACKUP_FILE" ]]; then
-	echo "Záloha se nevytvořila správně: $BACKUP_FILE"
-	exit 1
-fi
+TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+STAGING="$(mktemp -d "$ROOT_DIR/backups/.pending.XXXXXX")"
+trap 'rm -rf -- "$STAGING"' EXIT
 
-find "$ROOT_DIR/backups" -type f -name 'easyflex_*.sql.gz' -mtime +"$RETENTION_DAYS" -delete
+docker compose exec -T db pg_dump -Fc -U "$POSTGRES_USER" -d "$POSTGRES_DB" > "$STAGING/database.dump"
+docker compose exec -T db pg_restore --list < "$STAGING/database.dump" > /dev/null
+# Fail instead of publishing a partial snapshot if an upload changes during tar.
+docker compose exec -T web tar -czf - -C /app/instance . > "$STAGING/instance.tar.gz"
+gzip -t "$STAGING/instance.tar.gz"
+cp .env "$STAGING/environment.env"
+git rev-parse HEAD > "$STAGING/revision.txt"
+(
+ cd "$STAGING"
+ sha256sum database.dump instance.tar.gz environment.env revision.txt > SHA256SUMS
+)
+DESTINATION="$ROOT_DIR/backups/easyflex_snapshot_$TIMESTAMP"
+[[ ! -e "$DESTINATION" ]] || { echo "Backup destination already exists"; exit 1; }
+mv -- "$STAGING" "$DESTINATION"
+trap - EXIT
 
-echo "Záloha hotová: $BACKUP_FILE"
+# Only expire snapshots created by this script after publishing a valid new one.
+find "$ROOT_DIR/backups" -mindepth 1 -maxdepth 1 -type d -name 'easyflex_snapshot_*' -mtime +"$RETENTION_DAYS" -exec rm -rf -- {} +
+echo "EasyFlex backup complete: $DESTINATION"
