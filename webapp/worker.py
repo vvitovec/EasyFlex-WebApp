@@ -10,12 +10,13 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from flask import Flask
+from flask import Flask, current_app
 
 from EasyFlex.invoice_warnings import get_warning, set_warning
 from EasyFlex.models import InvoiceData
 
 from .abra_context import apply_context_to_config, current_context_for_user
+from .invoice_batches import selectable_rows_query, count_selected_rows
 from .batch_jobs import (
 	active_job_for_batch,
 	batch_storage_root,
@@ -285,10 +286,13 @@ def _persist_extract_result(
 			local_error = "Extrakce zastavena: došly kredity pro další faktury v dávce."
 			credits_exhausted = True
 		else:
-			batch.success_count = int(batch.success_count or 0) + 1
+			if not local_error:
+				batch.success_count = int(batch.success_count or 0) + 1
 			batch.credits_charged = int(batch.credits_charged or 0) + 1
 			user.credits = max(0, int(user.credits or 0) - 1)
-			marked_for_import = True
+			marked_for_import = local_error is None
+			if local_error:
+				batch.error_count = int(batch.error_count or 0) + 1
 
 	if not local_invoice:
 		if local_error is None:
@@ -414,6 +418,8 @@ def _finalize_extract_job(
 
 
 def _resolve_import_outcome(resp: Any) -> tuple[str, Optional[str], str]:
+	if isinstance(resp, dict) and resp.get("__status") == "failed":
+		return ROW_IMPORT_STATUS_FAILED, resp.get("error") or "Import ABRA selhal.", ""
 	if isinstance(resp, dict) and resp.get("__status") == "skipped-duplicate":
 		return ROW_IMPORT_STATUS_SKIPPED, None, "Přeskočeno (duplicitní kód)"
 	if isinstance(resp, dict) and resp.get("__status") == "skipped-duplicate-foreign":
@@ -648,10 +654,24 @@ def _process_import_job(job_id: int, worker_id: str) -> None:
 	document_type = str(payload.get("document_type") or "").strip().lower()
 	if document_type == "receipt":
 		setattr(cfg, "document_type", "receipt")
+	if cfg.abra_server and cfg.abra_username and cfg.abra_password:
+		from EasyFlex.abra import validate_import_context
+		try:
+			validate_import_context(cfg, document_type=document_type)
+		except ValueError as exc:
+			def _fail_context():
+				batch = db.session.get(InvoiceBatch, batch_id)
+				batch.processing_status = BATCH_STATUS_COMPLETED_WITH_ERRORS
+				batch.current_phase = "done"
+				batch.active_job_type = None
+				batch.summary_message = str(exc)
+				return finalize_job(job_id=job_id, status=JOB_STATUS_FAILED, summary_message=str(exc), last_error=str(exc))
+			run_db_write_with_retry(f"job {job_id} invalid context", _fail_context)
+			return
 	row_ids = [
 		int(row_id)
 		for (row_id,) in (
-			db.session.query(InvoiceRow.id)
+			selectable_rows_query(db.session.query(InvoiceRow.id))
 			.filter(InvoiceRow.batch_id == batch_id, InvoiceRow.marked_for_import.is_(True))
 			.order_by(InvoiceRow.row_index.asc())
 			.all()
@@ -687,6 +707,8 @@ def _process_import_job(job_id: int, worker_id: str) -> None:
 				return False
 			row.import_status = ROW_IMPORT_STATUS_RUNNING
 			row.import_attempts = int(row.import_attempts or 0) + 1
+			if row.error and row.error == row.last_import_error:
+				row.error = None
 			row.last_import_error = None
 			batch.last_heartbeat_at = utcnow()
 			batch.summary_message = f"Importuji řádek {row_index + 1} do ABRA."
@@ -711,10 +733,14 @@ def _process_import_job(job_id: int, worker_id: str) -> None:
 				return False
 			row.import_status = import_status
 			row.status = status_text or None
-			row.error = error_text
+			# Import failures must not be classified as extraction failures.
+			if row.error == row.last_import_error or not row.error:
+				row.error = None
 			row.last_import_error = error_text
 			if import_status == ROW_IMPORT_STATUS_IMPORTED:
 				row.imported_at = utcnow()
+				row.marked_for_import = False
+			batch.selected_count = count_selected_rows(batch_id)
 			batch.last_heartbeat_at = utcnow()
 			return True
 		run_db_write_with_retry(f"job {job_id} finalize row {row_id}", _finish_row)
@@ -730,6 +756,24 @@ def process_job(job_id: int, worker_id: str) -> None:
 	job = db.session.get(BatchJob, job_id)
 	if job is None:
 		return
+	app = current_app._get_current_object()
+	stop_lease = threading.Event()
+	def _renew_lease():
+		interval = max(1, min(20, _env_int("JOB_STALE_AFTER_S", DEFAULT_STALE_JOB_SECONDS, minimum=15) // 3))
+		while not stop_lease.wait(interval):
+			with app.app_context():
+				try:
+					updated = db.session.query(BatchJob).filter_by(id=job_id, status="running", claimed_by=worker_id).update({"last_heartbeat_at": utcnow()}, synchronize_session=False)
+					db.session.commit()
+					if not updated:
+						return
+				except Exception:
+					db.session.rollback()
+					logger.exception("Nelze obnovit heartbeat úlohy %s", job_id)
+				finally:
+					db.session.remove()
+	lease = threading.Thread(target=_renew_lease, daemon=True)
+	lease.start()
 	try:
 		if job.job_type == JOB_TYPE_EXTRACT_PDF:
 			_process_extract_job(job_id, worker_id)
@@ -765,6 +809,9 @@ def process_job(job_id: int, worker_id: str) -> None:
 				next_attempt_at=next_attempt_at,
 			),
 		)
+	finally:
+		stop_lease.set()
+		lease.join(timeout=5)
 
 
 def _run_maintenance_cycle(app: Flask) -> None:

@@ -190,7 +190,7 @@ def invalidate_config_cache() -> None:
 def get_errors_dir() -> Path:
 	"""Return a user-writable directory for error JSON dumps."""
 	project_errors = Path(__file__).resolve().parent.parent / "errors"
-	err_dir = project_errors if project_errors.exists() else _settings_path().parent / "errors"
+	err_dir = Path(os.environ["EASYFLEX_ERRORS_DIR"]) if os.environ.get("EASYFLEX_ERRORS_DIR") else (project_errors if project_errors.exists() else _settings_path().parent / "errors")
 	err_dir.mkdir(parents=True, exist_ok=True)
 	return err_dir
 

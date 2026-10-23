@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Union, Tuple
 import re
 import unicodedata
 import hashlib
+from decimal import Decimal
 
 import requests
 
@@ -21,6 +22,65 @@ logger = logging.getLogger(__name__)
 
 RECEIPT_DOCUMENT_TYPE = "receipt"
 RECEIPT_ENDPOINT = "pokladni-pohyb"
+
+
+def validate_import_context(cfg: AppConfig, *, document_type: str = "invoice") -> None:
+	"""Validate a company's selected document type before sending any invoices."""
+	if document_type == "receipt":
+		return
+	endpoint = cfg.abra_doc_endpoint or "faktura-prijata"
+	if endpoint not in {"faktura-prijata", "faktura-vydana"} or not cfg.abra_company:
+		raise ValueError("Neplatná firma nebo směr importu ABRA.")
+	type_code = cfg.abra_doc_type_code or ("FAKTURA" if endpoint == "faktura-vydana" else "FAKTP")
+	evidence = "typ-faktury-vydane" if endpoint == "faktura-vydana" else "typ-faktury-prijate"
+	url = f"{_build_base_url(cfg.abra_server, cfg.abra_port)}/c/{cfg.abra_company}/{evidence}.json?detail=custom:kod&limit=0"
+	resp = _request_with_retry("GET", url, auth=(cfg.abra_username, cfg.abra_password), timeout_s=cfg.abra_timeout_s, verify=cfg.abra_verify_tls)
+	if resp.status_code != 200:
+		raise ValueError(f"Nelze ověřit typ dokladu ABRA (HTTP {resp.status_code}).")
+	entries = resp.json().get("winstrom", {}).get(evidence, [])
+	if not any(entry.get("kod") == type_code for entry in entries):
+		raise ValueError(f"Typ dokladu '{type_code}' neexistuje ve zvolené firmě. Vyberte platný typ.")
+
+
+def _apply_verified_source_totals(body: dict, invoice: dict) -> None:
+	"""Use explicit per-rate tax amounts for text-verified summary invoices."""
+	if invoice.get("validation_errors"):
+		raise ValueError(" | ".join(invoice["validation_errors"]))
+	suffix = "Men" if normalize_currency(invoice.get("mena")) != "CZK" else ""
+	fields = {"sumOsv": "zaklad_dane_0", "sumZklSniz": "zaklad_dane_12", "sumDphSniz": "vyse_dph_12",
+		"sumZklZakl": "zaklad_dane_21", "sumDphZakl": "vyse_dph_21"}
+	body.pop("polozkyDokladu", None)
+	body["bezPolozek"] = True
+	for target, source in fields.items():
+		if invoice.get(source) is None:
+			raise ValueError(f"Chybí ověřená částka {source}.")
+		body[target + suffix] = float(invoice[source])
+	# The explicit total is a check in ABRA; an authorised rounding difference
+	# is sent separately and verified in the dry-run and persisted document.
+	total = Decimal(str(invoice["celkova_cena"]))
+	parts = sum(Decimal(str(invoice[source])) for source in fields.values())
+	delta = total - parts
+	if delta and not invoice.get("source_rounding_authorized"):
+		raise ValueError("Rozpis DPH nesouhlasí s celkovou částkou; je nutné ověřit zaokrouhlení.")
+	if abs(delta) > Decimal('.02'):
+		raise ValueError("Nepovolený rozdíl souhrnných částek.")
+	body["sumCelkem" + suffix] = float(total)
+	if delta:
+		# A separate accounting position preserves the source tax breakdown.
+		# Header sums are otherwise cross-recalculated by ABRA.
+		for target in fields:
+			body.pop(target + suffix, None)
+		body["bezPolozek"] = False
+		positions = []
+		for rate, code in [(0, "dphOsv"), (12, "dphSniz"), (21, "dphZakl")]:
+			base = float(invoice.get(f"zaklad_dane_{rate}") or 0)
+			tax = float(invoice.get(f"vyse_dph_{rate}") or 0) if rate else 0
+			if base or tax:
+				positions.append({"nazev": f"Souhrn {rate}% DPH", "typPolozkyK": "typPolozky.ucetni",
+					"typSzbDphK": "typSzbDph." + code, "sumZkl" + suffix: base, "sumDph" + suffix: tax})
+		positions.append({"nazev": "Zaokrouhlení dle původního PDF", "typPolozkyK": "typPolozky.ucetni",
+			"typSzbDphK": "typSzbDph.dphOsv", "sumZkl" + suffix: float(delta), "sumDph" + suffix: 0})
+		body["polozkyDokladu"] = positions
 
 
 def _build_base_url(server: str, port: Optional[int]) -> str:
@@ -241,10 +301,9 @@ def _extract_partner_details(faktura: Dict[str, Any], doc_endpoint: str) -> Dict
 		secondary = "dodavatel"
 
 	def get_val(key: str, fallback: bool = True) -> Optional[str]:
-		val = faktura.get(f"{primary}_{key}")
-		if not val and fallback:
-			val = faktura.get(f"{secondary}_{key}")
-		return val
+		# Missing buyer information must never be taken from the supplier (or
+		# vice versa). It can link an issued invoice to its own issuer.
+		return faktura.get(f"{primary}_{key}")
 
 	partner_name = get_val("jmeno", fallback=False)
 	match_name = get_val("jmeno", fallback=True)
@@ -869,7 +928,8 @@ def _ensure_partner_ext_id(base_url: str, auth: tuple[str, str], timeout_s: int,
 		scored = sorted(((_score_candidate(c), c) for c in cands), key=lambda t: t[0], reverse=True)
 		best_score, best = scored[0]
 		if len(scored) > 1 and best_score == scored[1][0]:
-			logger.warning("ABRA: více shod v adresáři pro %s, vybírám první: %s", reason, best["ref"])
+			logger.warning("ABRA: nejednoznačná shoda adresáře pro %s; použiji údaje přímo z dokladu.", reason)
+			return None
 		else:
 			logger.info("ABRA: více shod v adresáři pro %s, vybrána nejlepší shoda: %s", reason, best["ref"])
 		return best["ref"]
@@ -1176,6 +1236,8 @@ def _build_invoice_payload(
 	else:
 		logger.info("Používám původní logiku pro ABRA export")
 		body["polozkyDokladu"] = _build_positions_from_totals(faktura_dict)
+	if faktura_dict.get("source_amounts_verified"):
+		_apply_verified_source_totals(body, faktura_dict)
 	# Kurz neposíláme; měna je mapována přes relation "mena".
 	body.pop("kurz", None)
 	body.pop("kurzMnozstvi", None)
@@ -1320,6 +1382,8 @@ def import_to_abra(faktura_data: Union[Dict[str, Any], InvoiceData], cfg: Option
 	resp = _request_with_retry("POST", url, auth=auth, timeout_s=cfg.abra_timeout_s, json_body=payload, verify=cfg.abra_verify_tls)
 	if resp.status_code in (200, 201):
 		data = resp.json()
+		if str(data.get("winstrom", {}).get("success", "true")).lower() == "false":
+			return {"__status": "failed", "error": _abra_error_message(data)}
 		logger.info("ABRA import OK ext=%s id=%s", ext_identifier, data.get("id"))
 		data["__status"] = "created"
 		return data
@@ -1377,7 +1441,17 @@ def import_to_abra(faktura_data: Union[Dict[str, Any], InvoiceData], cfg: Option
 	# Write errors to a user-writable location
 	_err_dir = get_errors_dir()
 	_err_dir.mkdir(parents=True, exist_ok=True)
-	error_id = ext_identifier or 'unknown'
+	error_id = f"{ext_identifier or 'unknown'}_row-{faktura_data.get('easyflex_row_id', 'unknown') if isinstance(faktura_data, dict) else 'unknown'}_{time.time_ns()}"
 	with open(os.path.join(_err_dir, f"abra_error_{error_id}.json"), "w", encoding="utf-8") as f:
 		json.dump({"request": payload, "response_status": resp.status_code, "response_text": resp.text}, f, ensure_ascii=False, indent=2)
-	return None
+	try:
+		error = _abra_error_message(resp.json())
+	except (ValueError, TypeError):
+		error = resp.text[:1000]
+	return {"__status": "failed", "error": f"ABRA HTTP {resp.status_code}: {error}"}
+
+
+def _abra_error_message(data: dict) -> str:
+	winstrom = data.get("winstrom", {})
+	messages = [error.get("message", "") for result in winstrom.get("results", []) for error in result.get("errors", [])]
+	return " | ".join(m for m in messages if m) or winstrom.get("message") or "ABRA odmítla doklad."

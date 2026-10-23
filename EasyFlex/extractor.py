@@ -242,6 +242,25 @@ class InvoiceExtractor:
 				on_result(res)
 			return [res]
 		cfg = self._config
+		if str(getattr(cfg, "document_type", "invoice") or "invoice") != "receipt":
+			from .pdf_text import extract_text_invoices
+			payloads = await asyncio.to_thread(
+				extract_text_invoices, file_path, poppler_path=self.poppler_path,
+				infer_dates=cfg.infer_missing_dates, doc_number_as_vs=cfg.use_doc_number_as_variable_symbol,
+			)
+			if payloads is not None:
+				results = []
+				for index, payload in enumerate(payloads, 1):
+					invoice = process_invoice_data(InvoiceData.model_validate(payload))
+					res = ExtractResult(file_path=file_path, data=invoice,
+						error=" | ".join(payload.get("validation_errors") or []) or None,
+						warnings=[payload["upozorneni"]] if payload.get("upozorneni") else [])
+					setattr(res, "_invoice_group_index", index)
+					setattr(res, "_invoice_group_total", len(payloads))
+					results.append(res)
+					if on_result is not None:
+						on_result(res)
+				return results
 		if getattr(cfg, "enable_multi_invoice_segmentation", False):
 			return await self.extract_from_pdf_multi_segmented(file_path, on_result=on_result)
 		else:
@@ -852,7 +871,15 @@ class InvoiceExtractor:
 
 		# Sloučení triviálních chyb: negativní nebo prázdné rozsahy odfiltruj
 		cleaned = [(s, e, k) for (s, e, k) in groups if 0 <= s <= e]
-		return cleaned
+		merged = []
+		for start, end, key in cleaned:
+			normalized = re.sub(r"[^A-Z0-9]", "", str(key or "").upper())
+			previous = re.sub(r"[^A-Z0-9]", "", str(merged[-1][2] or "").upper()) if merged else ""
+			if normalized and normalized == previous and merged[-1][1] + 1 == start:
+				merged[-1] = (merged[-1][0], end, merged[-1][2])
+			else:
+				merged.append((start, end, key))
+		return merged
 
 	async def batch_extract_with_tqdm(self, pdf_folder: str) -> List[ExtractResult]:
 		"""Batch process with a console progress bar using tqdm and retry failed files.
@@ -1069,12 +1096,12 @@ class InvoiceExtractor:
 		for field in ZERO_DEFAULT_FIELDS:
 			value = payload.get(field)
 			if value in (None, "", "null"):
-				payload[field] = 0.0
+				payload[field] = None
 				continue
 			try:
 				payload[field] = float(value)
 			except (TypeError, ValueError):
-				payload[field] = 0.0
+				payload[field] = None
 
 	def _normalize_dates(self, payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str], Set[str]]:
 		invalid_fields: List[str] = []

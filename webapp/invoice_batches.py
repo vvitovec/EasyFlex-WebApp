@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from sqlalchemy import Float, String, cast, func
+from sqlalchemy import Float, String, cast, func, and_, or_
 
 from EasyFlex.date_helpers import domysleni_chybejicich_datumu
 from EasyFlex.invoice_warnings import get_warning, set_warning
@@ -287,7 +287,7 @@ def query_rows_for_batch(
 ):
 	page = max(1, int(page or 1))
 	page_size = max(1, min(MAX_PAGE_SIZE, int(page_size or DEFAULT_PAGE_SIZE)))
-	query = InvoiceRow.query.filter(InvoiceRow.batch_id == batch.id)
+	query = InvoiceRow.query.filter(InvoiceRow.batch_id == batch.id, InvoiceRow.import_status != "merged")
 	query = _apply_row_filter(query, filter_name)
 	total_count = query.with_entities(func.count(InvoiceRow.id)).scalar() or 0
 	sort_expr = _resolve_sort_expression(sort_key)
@@ -299,9 +299,22 @@ def query_rows_for_batch(
 	return rows, int(total_count)
 
 
+def selectable_rows_query(query):
+	return query.filter(
+		InvoiceRow.import_status.notin_(["imported", "running", "skipped", "merged"]),
+		or_(InvoiceRow.error.is_(None), and_(InvoiceRow.import_status == "failed", InvoiceRow.error == InvoiceRow.last_import_error)),
+	)
+
+
+def row_is_selectable(row: InvoiceRow) -> bool:
+	return row.import_status not in {"imported", "running", "skipped", "merged"} and (
+		not row.error or (row.import_status == "failed" and row.error == row.last_import_error)
+	)
+
+
 def count_selected_rows(batch_id: int) -> int:
 	return (
-		db.session.query(func.count(InvoiceRow.id))
+		selectable_rows_query(db.session.query(func.count(InvoiceRow.id)))
 		.filter(InvoiceRow.batch_id == batch_id, InvoiceRow.marked_for_import.is_(True))
 		.scalar()
 		or 0
@@ -322,7 +335,8 @@ def rows_for_display(batch: InvoiceBatch, row_items: Optional[Iterable[InvoiceRo
 			"source": row.source or batch.source_label or "",
 			"invoice": invoice_dict,
 			"warning": warning_text or "bez problému",
-			"error": row.error,
+			"error": row.error or row.last_import_error,
+			"selectable": row_is_selectable(row),
 			"status": row.status,
 			"import_status": row.import_status,
 			"marked_for_import": bool(row.marked_for_import),

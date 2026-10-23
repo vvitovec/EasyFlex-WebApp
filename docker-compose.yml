@@ -33,6 +33,7 @@ services:
       EASYFLEX_ENV: production
       DATABASE_URL: postgresql://${POSTGRES_USER:-easyflex}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-easyflex}
       PORT: 10000
+      EASYFLEX_ERRORS_DIR: /app/instance/errors
       JOB_STALE_AFTER_S: ${JOB_STALE_AFTER_S:-120}
     volumes:
       - easyflex_instance:/app/instance
@@ -65,6 +66,7 @@ services:
       EASYFLEX_ENV: production
       DATABASE_URL: postgresql://${POSTGRES_USER:-easyflex}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-easyflex}
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      EASYFLEX_ERRORS_DIR: /app/instance/errors
       JOB_POLL_INTERVAL_S: ${JOB_POLL_INTERVAL_S:-2}
       WORKER_IDLE_BACKOFF_MAX_S: ${WORKER_IDLE_BACKOFF_MAX_S:-10}
       JOB_STALE_AFTER_S: ${JOB_STALE_AFTER_S:-120}

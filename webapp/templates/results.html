@@ -164,7 +164,7 @@
 							<input id="doc_type_code" name="doc_type_code" type="hidden" value="STANDARD">
 							<strong>STANDARD</strong>
 						{% else %}
-							<select id="doc_type_code" name="doc_type_code">
+							<select id="doc_type_code" name="doc_type_code" required>
 								<option value="">Vyberte</option>
 								{% for dt in doc_types %}
 									<option value="{{ dt.code }}" {% if dt.code == selected_doc_type %}selected{% endif %}>
@@ -222,8 +222,8 @@
 										data-import-checkbox
 										data-row-id="{{ row.id }}"
 										aria-label="Označit řádek {{ loop.index }} k importu"
-										{% if row.marked_for_import and not row.error %}checked{% endif %}
-										{% if row.error %}disabled{% endif %}
+										{% if row.marked_for_import and row.selectable %}checked{% endif %}
+										{% if not row.selectable %}disabled{% endif %}
 									>
 								</td>
 								<td><a class="button small" href="{{ url_for('edit_invoice', row_id=row.id) }}">Upravit</a></td>

@@ -48,6 +48,8 @@ from .invoice_batches import (
 	load_batch_for_user,
 	query_rows_for_batch,
 	rows_for_display,
+	row_is_selectable,
+	selectable_rows_query,
 )
 from .batch_jobs import (
 	active_job_for_batch,
@@ -2106,7 +2108,7 @@ def create_app() -> Flask:
 		batch = InvoiceBatch.query.filter_by(id=batch_id, user_id=current_user.id).first()
 		if batch is None:
 			abort(404)
-		row_count = db.session.query(db.func.count(InvoiceRow.id)).filter(InvoiceRow.batch_id == batch.id).scalar() or 0
+		row_count = db.session.query(db.func.count(InvoiceRow.id)).filter(InvoiceRow.batch_id == batch.id, InvoiceRow.import_status != "merged").scalar() or 0
 		return jsonify(_batch_progress_payload(batch, row_count=int(row_count)))
 
 	@app.route("/results/<int:batch_id>/selection", methods=["POST"])
@@ -2123,7 +2125,7 @@ def create_app() -> Flask:
 		marked_raw = payload.get("marked", False)
 		marked = marked_raw if isinstance(marked_raw, bool) else str(marked_raw).strip().lower() in {"1", "true", "yes", "on"}
 		row = InvoiceRow.query.filter_by(id=row_id, batch_id=batch.id).first_or_404()
-		if row.error:
+		if not row_is_selectable(row):
 			marked = False
 		row.marked_for_import = bool(marked)
 		batch.selected_count = count_selected_rows(batch.id)
@@ -2141,7 +2143,7 @@ def create_app() -> Flask:
 		marked = marked_raw if isinstance(marked_raw, bool) else str(marked_raw).strip().lower() in {"1", "true", "yes", "on"}
 		scope = (payload.get("scope") or "page").strip().lower()
 		updated = 0
-		query = InvoiceRow.query.filter(InvoiceRow.batch_id == batch.id, InvoiceRow.error.is_(None))
+		query = selectable_rows_query(InvoiceRow.query.filter(InvoiceRow.batch_id == batch.id))
 		if scope == "filtered":
 			filter_name = (payload.get("filter") or "all").strip().lower()
 			query = _apply_row_filter(query, filter_name)
@@ -2395,6 +2397,9 @@ def create_app() -> Flask:
 		if not company_code:
 			flash("Vyberte prosím firmu pro import do ABRA.", "warning")
 			return redirect(url_for("view_results", batch_id=batch.id))
+		if not is_receipt_batch and (not doc_type_code or not any(dt.code == doc_type_code for dt in list_doc_types(current_user, company_code, direction))):
+			flash("Vyberte platný typ dokladu pro zvolenou firmu a směr importu.", "warning")
+			return redirect(url_for("view_results", batch_id=batch.id, company_code=company_code, direction=direction))
 		if is_receipt_batch:
 			current_user.settings.abra_company = company_code
 			db.session.commit()

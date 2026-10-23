@@ -117,11 +117,10 @@ def persist_context(settings: UserSettings, company_code: Optional[str], directi
 			overrides["abra_doc_endpoint"] = direction
 		else:
 			overrides.pop("abra_doc_endpoint", None)
-	if doc_type_code is not None:
-		if doc_type_code:
-			overrides["abra_doc_type_code"] = doc_type_code
-		else:
-			overrides.pop("abra_doc_type_code", None)
+	if doc_type_code:
+		overrides["abra_doc_type_code"] = doc_type_code
+	else:
+		overrides.pop("abra_doc_type_code", None)
 	# Assign a fresh dict so SQLAlchemy registers the JSON change
 	settings.config_overrides = dict(overrides)
 	db.session.commit()
@@ -158,8 +157,9 @@ def apply_context_to_config(cfg, company_code: Optional[str], direction: Optiona
 		cfg.abra_company = company_code
 	if direction:
 		cfg.abra_doc_endpoint = direction
-	if doc_type_code:
-		cfg.abra_doc_type_code = doc_type_code
+	# None is an explicit empty choice in the immutable job context. Never
+	# inherit a type left over from another company or a later settings change.
+	cfg.abra_doc_type_code = doc_type_code
 
 
 def delete_company(user: User, company_id: int) -> bool:
